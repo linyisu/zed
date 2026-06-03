@@ -20,7 +20,8 @@ pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_OLD_FOOTNOTES)
     .union(Options::ENABLE_GFM)
     .union(Options::ENABLE_SUPERSCRIPT)
-    .union(Options::ENABLE_SUBSCRIPT);
+    .union(Options::ENABLE_SUBSCRIPT)
+    .union(Options::ENABLE_MATH);
 
 #[derive(Default)]
 struct ParseState {
@@ -629,7 +630,12 @@ pub(crate) fn parse_markdown_with_options(
             pulldown_cmark::Event::TaskListMarker(checked) => {
                 state.push_event(range, MarkdownEvent::TaskListMarker(checked))
             }
-            pulldown_cmark::Event::InlineMath(_) | pulldown_cmark::Event::DisplayMath(_) => {}
+            pulldown_cmark::Event::InlineMath(_) => {
+                state.push_event(range, MarkdownEvent::InlineMath)
+            }
+            pulldown_cmark::Event::DisplayMath(_) => {
+                state.push_event(range, MarkdownEvent::DisplayMath)
+            }
         }
     }
 
@@ -748,6 +754,10 @@ pub enum MarkdownEvent {
     Rule,
     /// A task list marker, rendered as a checkbox in HTML. Contains a true when it is checked.
     TaskListMarker(bool),
+    /// An inline math node.
+    InlineMath,
+    /// A display math node.
+    DisplayMath,
     /// Start of a root-level block (a top-level structural element like a paragraph, heading, list, etc.).
     RootStart,
     /// End of a root-level block. Contains the root block index.
@@ -905,9 +915,8 @@ mod tests {
     use super::*;
 
     const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
-        .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS);
+    const UNWANTED_OPTIONS: Options =
+        Options::ENABLE_DEFINITION_LIST.union(Options::ENABLE_WIKILINKS);
 
     #[test]
     fn all_options_considered() {

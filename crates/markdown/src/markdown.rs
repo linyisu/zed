@@ -1,4 +1,5 @@
 pub mod html;
+mod math;
 mod mermaid;
 pub mod parser;
 mod path_range;
@@ -11,6 +12,7 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
+use math::{MathState, ParsedMathExpression, extract_math_expressions, render_math1};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
@@ -335,6 +337,7 @@ pub struct Markdown {
     fallback_code_block_language: Option<LanguageName>,
     options: MarkdownOptions,
     mermaid_state: MermaidState,
+    math_state: MathState,
     _mermaid_theme_subscription: Option<Subscription>,
     mermaid_showing_code: HashSet<usize>,
     copied_code_blocks: HashSet<ElementId>,
@@ -346,13 +349,27 @@ pub struct Markdown {
     active_search_highlight: Option<usize>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct MarkdownOptions {
     pub parse_links_only: bool,
     pub parse_html: bool,
     pub render_mermaid_diagrams: bool,
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
+    pub render_math: bool,
+}
+
+impl Default for MarkdownOptions {
+    fn default() -> Self {
+        Self {
+            parse_links_only: false,
+            parse_html: false,
+            render_mermaid_diagrams: false,
+            parse_heading_slugs: false,
+            render_metadata_blocks: false,
+            render_math: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -526,6 +543,7 @@ impl Markdown {
             language_registry,
             fallback_code_block_language,
             options,
+            math_state: MathState::default(),
             mermaid_state: MermaidState::default(),
             _mermaid_theme_subscription: theme_subscription,
             mermaid_showing_code: HashSet::default(),
@@ -831,6 +849,7 @@ impl Markdown {
             self.active_root_block = None;
             self.images_by_source_offset.clear();
             self.mermaid_state.clear();
+            self.math_state.clear();
             cx.notify();
             cx.refresh_windows();
             return;
@@ -866,6 +885,7 @@ impl Markdown {
                         html_blocks: BTreeMap::default(),
                         metadata_blocks: BTreeMap::default(),
                         mermaid_diagrams: BTreeMap::default(),
+                        math_expressions: BTreeMap::default(),
                         heading_slugs: HashMap::default(),
                         footnote_definitions: HashMap::default(),
                     },
@@ -892,6 +912,7 @@ impl Markdown {
             } else {
                 BTreeMap::default()
             };
+            let math_expressions = extract_math_expressions(&source, &events);
             let mut images_by_source_offset = HashMap::default();
             let mut languages_by_name = TreeMap::default();
             let mut languages_by_path = TreeMap::default();
@@ -954,6 +975,7 @@ impl Markdown {
                     html_blocks,
                     metadata_blocks,
                     mermaid_diagrams,
+                    math_expressions,
                     heading_slugs,
                     footnote_definitions,
                 },
@@ -980,6 +1002,12 @@ impl Markdown {
                 } else {
                     this.mermaid_state.clear();
                     this.mermaid_showing_code.clear();
+                }
+                if this.options.render_math {
+                    let parsed_markdown = this.parsed_markdown.clone();
+                    this.math_state.update(&parsed_markdown, cx);
+                } else {
+                    this.math_state.clear();
                 }
                 this.pending_parse.take();
                 if this.should_reparse {
@@ -1083,6 +1111,7 @@ pub struct ParsedMarkdown {
     pub(crate) html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
     pub(crate) metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
     pub(crate) mermaid_diagrams: BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
+    pub(crate) math_expressions: BTreeMap<usize, ParsedMathExpression>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
 }
@@ -1909,7 +1938,15 @@ impl Element for MarkdownElement {
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
         );
-        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
+        let (
+            parsed_markdown,
+            images,
+            active_root_block,
+            render_mermaid_diagrams,
+            mermaid_state,
+            render_math,
+            math_state,
+        ) = {
             let markdown = self.markdown.read(cx);
             (
                 markdown.parsed_markdown.clone(),
@@ -1917,6 +1954,8 @@ impl Element for MarkdownElement {
                 markdown.active_root_block,
                 markdown.options.render_mermaid_diagrams,
                 markdown.mermaid_state.clone(),
+                markdown.options.render_math,
+                markdown.math_state.clone(),
             )
         };
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
@@ -2577,6 +2616,27 @@ impl Element for MarkdownElement {
                     builder.push_text_style(self.style.link.clone());
                     builder.push_text(&format!("[{label}]"), range.clone());
                     builder.pop_text_style();
+                }
+
+                MarkdownEvent::InlineMath | MarkdownEvent::DisplayMath => {
+                    if render_math {
+                        if let Some(expr) = parsed_markdown.math_expressions.get(&range.start) {
+                            builder.push_sourced_element(
+                                range.clone(),
+                                render_math1(
+                                    expr,
+                                    &math_state,
+                                    self.style
+                                        .base_text_style
+                                        .font_size
+                                        .to_pixels(window.rem_size()),
+                                    &self.style,
+                                ),
+                            );
+                        }
+                    } else {
+                        builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                    }
                 }
             }
         }

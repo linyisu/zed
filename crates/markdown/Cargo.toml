@@ -13,10 +13,7 @@ path = "src/markdown.rs"
 doctest = false
 
 [features]
-test-support = [
-    "gpui/test-support",
-    "util/test-support"
-]
+test-support = ["gpui/test-support", "util/test-support"]
 
 [dependencies]
 anyhow.workspace = true
@@ -31,6 +28,11 @@ log.workspace = true
 markup5ever_rcdom.workspace = true
 mermaid_render = { path = "../mermaid_render" }
 pulldown-cmark.workspace = true
+ratex-font.workspace = true
+ratex-katex-fonts.workspace = true
+ratex-layout.workspace = true
+ratex-parser.workspace = true
+ratex-types.workspace = true
 settings.workspace = true
 stacksafe.workspace = true
 sum_tree.workspace = true
@@ -42,7 +44,7 @@ util.workspace = true
 [dev-dependencies]
 assets.workspace = true
 env_logger.workspace = true
-fs = {workspace = true, features = ["test-support"]}
+fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 gpui_platform.workspace = true
 language = { workspace = true, features = ["test-support"] }
