@@ -392,10 +392,9 @@ fn paint_display_item(
             color,
         } => {
             let rect_origin = display_point(*x, *y);
-            let bounds = Bounds::new(
-                rect_origin,
-                gpui::size(display_offset(*width), display_offset(*height)),
-            );
+            let width = px(display_offset(*width).as_f32().max(1.0));
+            let height = px(display_offset(*height).as_f32().max(1.0));
+            let bounds = Bounds::new(rect_origin, gpui::size(width, height));
             window.paint_quad(fill(bounds, ratex_color_to_hsla(color)));
         }
         DisplayItem::Path {
@@ -407,45 +406,62 @@ fn paint_display_item(
         } => {
             let path_point =
                 |command_x: f64, command_y: f64| display_point(*x + command_x, *y + command_y);
-            let mut builder = if *fill {
-                PathBuilder::fill().with_style(PathStyle::Fill(
-                    FillOptions::default().with_fill_rule(FillRule::EvenOdd),
-                ))
-            } else {
-                // NOTE: define const
-                PathBuilder::stroke(px(1.5))
-            };
-            for cmd in commands {
-                match cmd {
-                    PathCommand::MoveTo { x, y } => {
-                        builder.move_to(path_point(*x, *y));
+            let mut paint_path_commands = |commands: &[PathCommand]| {
+                let mut builder = if *fill {
+                    PathBuilder::fill().with_style(PathStyle::Fill(
+                        FillOptions::default().with_fill_rule(FillRule::EvenOdd),
+                    ))
+                } else {
+                    // NOTE: define const
+                    PathBuilder::stroke(px(1.5))
+                };
+                for cmd in commands {
+                    match cmd {
+                        PathCommand::MoveTo { x, y } => {
+                            builder.move_to(path_point(*x, *y));
+                        }
+                        PathCommand::LineTo { x, y } => {
+                            builder.line_to(path_point(*x, *y));
+                        }
+                        PathCommand::QuadTo { x1, y1, x, y } => {
+                            builder.curve_to(path_point(*x, *y), path_point(*x1, *y1));
+                        }
+                        PathCommand::CubicTo {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            x,
+                            y,
+                        } => {
+                            builder.cubic_bezier_to(
+                                path_point(*x, *y),
+                                path_point(*x1, *y1),
+                                path_point(*x2, *y2),
+                            );
+                        }
+                        PathCommand::Close => builder.close(),
                     }
-                    PathCommand::LineTo { x, y } => {
-                        builder.line_to(path_point(*x, *y));
-                    }
-                    PathCommand::QuadTo { x1, y1, x, y } => {
-                        builder.curve_to(path_point(*x, *y), path_point(*x1, *y1));
-                    }
-                    PathCommand::CubicTo {
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        x,
-                        y,
-                    } => {
-                        builder.cubic_bezier_to(
-                            path_point(*x, *y),
-                            path_point(*x1, *y1),
-                            path_point(*x2, *y2),
-                        );
-                    }
-                    PathCommand::Close => builder.close(),
                 }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, ratex_color_to_hsla(color));
+                }
+            };
+
+            if *fill {
+                let mut start = 0;
+                for index in 1..commands.len() {
+                    if matches!(commands[index], PathCommand::MoveTo { .. }) {
+                        paint_path_commands(&commands[start..index]);
+                        start = index;
+                    }
+                }
+                if start < commands.len() {
+                    paint_path_commands(&commands[start..]);
+                }
+            } else {
+                paint_path_commands(commands);
             }
-            //NOTE: We ignore path building errors here, as they can be caused by invalid font glyphs, and we don't want to crash the entire rendering because of that.
-            let path = builder.build().unwrap();
-            window.paint_path(path, ratex_color_to_hsla(color));
         }
     }
 }
