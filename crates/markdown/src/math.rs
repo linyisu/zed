@@ -285,10 +285,13 @@ fn resolved_font_matches(window: &Window, font_id: gpui::FontId, expected: &gpui
 fn paint_display_item(
     item: &DisplayItem,
     origin: gpui::Point<Pixels>,
-    baseline_y: Pixels,
     font_size: Pixels,
     window: &mut Window,
 ) {
+    let display_offset = |value: f64| px(value as f32 * font_size.as_f32());
+    let display_point =
+        |x: f64, y: f64| gpui::point(origin.x + display_offset(x), origin.y + display_offset(y));
+
     match item {
         DisplayItem::GlyphPath {
             x,
@@ -298,10 +301,8 @@ fn paint_display_item(
             char_code,
             color,
         } => {
-            let x_px = *x as f32 * font_size;
-            let y_px = *y as f32 * font_size;
-            let mut origin = gpui::point(origin.x + x_px, origin.y + baseline_y - y_px);
-            let em = font_size * *scale as f32;
+            let mut origin = display_point(*x, *y);
+            let em = display_offset(*scale);
 
             let font_id = FontId::parse(font).unwrap_or(FontId::MainRegular);
             let (ch, font, require_katex_font) = if is_system_fallback_font(font_id) {
@@ -362,22 +363,24 @@ fn paint_display_item(
             color,
             dashed,
         } => {
-            let x_px = *x as f32 * font_size;
-            let y_px = *y as f32 * font_size;
-            let line_origin = gpui::point(origin.x + x_px, origin.y + baseline_y - y_px);
+            let thickness_px = px((*thickness as f32 * font_size.as_f32()).max(1.0));
+            let line_center = display_point(*x, *y);
+            let line_top_left = gpui::point(
+                line_center.x,
+                line_center.y - px(thickness_px.as_f32() / 2.0),
+            );
             if *dashed {
-                let end = gpui::point(line_origin.x + *width as f32 * font_size, line_origin.y);
-                let thickness_px = px((*thickness as f32 * font_size.as_f32()).max(1.0));
+                let end = display_point(*x + *width, *y);
                 let mut builder = PathBuilder::stroke(thickness_px).dash_array(&[px(4.), px(2.)]);
-                builder.move_to(line_origin);
+                builder.move_to(line_center);
                 builder.line_to(end);
                 if let Ok(path) = builder.build() {
                     window.paint_path(path, ratex_color_to_hsla(color));
                 }
             }
             let bounds = Bounds::new(
-                line_origin,
-                gpui::size(*width as f32 * font_size, *thickness as f32 * font_size),
+                line_top_left,
+                gpui::size(display_offset(*width), thickness_px),
             );
             window.paint_quad(fill(bounds, ratex_color_to_hsla(color)));
         }
@@ -388,12 +391,10 @@ fn paint_display_item(
             height,
             color,
         } => {
-            let x_px = *x as f32 * font_size;
-            let y_px = *y as f32 * font_size;
-            let rect_origin = gpui::point(origin.x + x_px, origin.y + baseline_y - y_px);
+            let rect_origin = display_point(*x, *y);
             let bounds = Bounds::new(
                 rect_origin,
-                gpui::size(*width as f32 * font_size, *height as f32 * font_size),
+                gpui::size(display_offset(*width), display_offset(*height)),
             );
             window.paint_quad(fill(bounds, ratex_color_to_hsla(color)));
         }
@@ -404,9 +405,8 @@ fn paint_display_item(
             fill,
             color,
         } => {
-            let x_px = *x as f32 * font_size;
-            let y_px = *y as f32 * font_size;
-            let path_offset = gpui::point(origin.x + x_px, origin.y + baseline_y - y_px);
+            let path_point =
+                |command_x: f64, command_y: f64| display_point(*x + command_x, *y + command_y);
             let mut builder = if *fill {
                 PathBuilder::fill().with_style(PathStyle::Fill(
                     FillOptions::default().with_fill_rule(FillRule::EvenOdd),
@@ -418,21 +418,13 @@ fn paint_display_item(
             for cmd in commands {
                 match cmd {
                     PathCommand::MoveTo { x, y } => {
-                        let to =
-                            path_offset + gpui::point(*x as f32 * font_size, *y as f32 * font_size);
-                        builder.move_to(to);
+                        builder.move_to(path_point(*x, *y));
                     }
                     PathCommand::LineTo { x, y } => {
-                        let to =
-                            path_offset + gpui::point(*x as f32 * font_size, *y as f32 * font_size);
-                        builder.line_to(to);
+                        builder.line_to(path_point(*x, *y));
                     }
                     PathCommand::QuadTo { x1, y1, x, y } => {
-                        let ctrl = path_offset
-                            + gpui::point(*x1 as f32 * font_size, *y1 as f32 * font_size);
-                        let to =
-                            path_offset + gpui::point(*x as f32 * font_size, *y as f32 * font_size);
-                        builder.curve_to(to, ctrl);
+                        builder.curve_to(path_point(*x, *y), path_point(*x1, *y1));
                     }
                     PathCommand::CubicTo {
                         x1,
@@ -442,15 +434,13 @@ fn paint_display_item(
                         x,
                         y,
                     } => {
-                        let ctrl1 = path_offset
-                            + gpui::point(*x1 as f32 * font_size, *y1 as f32 * font_size);
-                        let ctrl2 = path_offset
-                            + gpui::point(*x2 as f32 * font_size, *y2 as f32 * font_size);
-                        let to =
-                            path_offset + gpui::point(*x as f32 * font_size, *y as f32 * font_size);
-                        builder.cubic_bezier_to(to, ctrl1, ctrl2);
+                        builder.cubic_bezier_to(
+                            path_point(*x, *y),
+                            path_point(*x1, *y1),
+                            path_point(*x2, *y2),
+                        );
                     }
-                    PathCommand::Close => {}
+                    PathCommand::Close => builder.close(),
                 }
             }
             //NOTE: We ignore path building errors here, as they can be caused by invalid font glyphs, and we don't want to crash the entire rendering because of that.
@@ -478,11 +468,9 @@ pub(crate) fn render_math_expression(
 
             canvas(
                 move |_bounds, _window, _cx| (dl, font_size),
-                move |bounds, (dl, font_size), window, cx| {
-                    let baseline_y = px(dl.height as f32 * font_size.as_f32());
-                    let text_system = cx.text_system().clone();
+                move |bounds, (dl, font_size), window, _cx| {
                     for item in &dl.items {
-                        paint_display_item(item, bounds.origin, baseline_y, font_size, window);
+                        paint_display_item(item, bounds.origin, font_size, window);
                     }
                 },
             )
