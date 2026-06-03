@@ -349,7 +349,7 @@ pub struct Markdown {
     active_search_highlight: Option<usize>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct MarkdownOptions {
     pub parse_links_only: bool,
     pub parse_html: bool,
@@ -357,19 +357,6 @@ pub struct MarkdownOptions {
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
     pub render_math: bool,
-}
-
-impl Default for MarkdownOptions {
-    fn default() -> Self {
-        Self {
-            parse_links_only: false,
-            parse_html: false,
-            render_mermaid_diagrams: false,
-            parse_heading_slugs: false,
-            render_metadata_blocks: false,
-            render_math: true,
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
