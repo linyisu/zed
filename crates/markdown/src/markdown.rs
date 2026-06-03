@@ -12,7 +12,7 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
-use math::{MathState, ParsedMathExpression, extract_math_expressions, render_math1};
+use math::{MathState, ParsedMathExpression, extract_math_expressions, render_math_expression};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
@@ -1556,6 +1556,31 @@ impl MarkdownElement {
         builder.push_div(div().flex_1().w_0(), range, markdown_end);
     }
 
+    fn push_markdown_display_math(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        range: Range<usize>,
+        expr: &ParsedMathExpression,
+        math_state: &MathState,
+        window: &Window,
+    ) {
+        let font_size = self
+            .style
+            .base_text_style
+            .font_size
+            .to_pixels(window.rem_size());
+
+        let math = render_math_expression(expr, math_state, font_size, &self.style);
+        builder.push_sourced_element(
+            range,
+            div()
+                .w_full()
+                .my_2()
+                .child(div().flex().justify_center().child(math))
+                .into_any_element(),
+        );
+    }
+
     fn pop_markdown_list_item(&self, builder: &mut MarkdownElementBuilder) {
         builder.pop_div();
         builder.pop_div();
@@ -2605,21 +2630,22 @@ impl Element for MarkdownElement {
                     builder.pop_text_style();
                 }
 
-                MarkdownEvent::InlineMath | MarkdownEvent::DisplayMath => {
+                MarkdownEvent::InlineMath => {
+                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                }
+                MarkdownEvent::DisplayMath => {
                     if render_math {
                         if let Some(expr) = parsed_markdown.math_expressions.get(&range.start) {
-                            builder.push_sourced_element(
+                            self.push_markdown_display_math(
+                                &mut builder,
                                 range.clone(),
-                                render_math1(
-                                    expr,
-                                    &math_state,
-                                    self.style
-                                        .base_text_style
-                                        .font_size
-                                        .to_pixels(window.rem_size()),
-                                    &self.style,
-                                ),
+                                expr,
+                                &math_state,
+                                window,
                             );
+                        } else {
+                            builder
+                                .push_text(&parsed_markdown.source[range.clone()], range.clone());
                         }
                     } else {
                         builder.push_text(&parsed_markdown.source[range.clone()], range.clone());

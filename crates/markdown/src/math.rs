@@ -84,10 +84,9 @@ fn register_katex_fonts(text_system: &TextSystem) {
         return;
     }
 
-    text_system
-        .add_fonts(fonts)
-        .map_err(|error| anyhow::anyhow!("{error}"))
-        .is_ok();
+    if let Err(error) = text_system.add_fonts(fonts) {
+        log::debug!("failed to register KaTeX fonts: {error}");
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -288,7 +287,6 @@ fn paint_display_item(
     origin: gpui::Point<Pixels>,
     baseline_y: Pixels,
     font_size: Pixels,
-    text_system: &TextSystem,
     window: &mut Window,
 ) {
     match item {
@@ -462,7 +460,7 @@ fn paint_display_item(
     }
 }
 
-pub(crate) fn render_math1(
+pub(crate) fn render_math_expression(
     expr: &ParsedMathExpression,
     math_state: &MathState,
     font_size: Pixels,
@@ -484,14 +482,7 @@ pub(crate) fn render_math1(
                     let baseline_y = px(dl.height as f32 * font_size.as_f32());
                     let text_system = cx.text_system().clone();
                     for item in &dl.items {
-                        paint_display_item(
-                            item,
-                            bounds.origin,
-                            baseline_y,
-                            font_size,
-                            &text_system,
-                            window,
-                        );
+                        paint_display_item(item, bounds.origin, baseline_y, font_size, window);
                     }
                 },
             )
