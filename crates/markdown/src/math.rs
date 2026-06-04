@@ -507,6 +507,31 @@ pub(crate) fn math_layout_metrics(
     Some(display_list_metrics(&display_list, font_size))
 }
 
+pub(crate) fn paint_math_expression_at(
+    contents: &ParsedMathExpressionContents,
+    math_state: &MathState,
+    bounds: Bounds<Pixels>,
+    font_size: Pixels,
+    default_color: Hsla,
+    window: &mut Window,
+) {
+    let Some(cached) = math_state.cache.get(contents) else {
+        return;
+    };
+    let display_list = cached
+        .display_list
+        .get()
+        .and_then(|result| result.as_ref().ok().cloned())
+        .or_else(|| cached.fallback.clone());
+    let Some(display_list) = display_list else {
+        return;
+    };
+
+    for item in &display_list.items {
+        paint_display_item(item, bounds.origin, font_size, default_color, window);
+    }
+}
+
 pub(crate) fn render_math_expression(
     expr: &ParsedMathExpression,
     math_state: &MathState,

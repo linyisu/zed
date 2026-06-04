@@ -14,7 +14,8 @@ use language::LanguageName;
 use log::Level;
 use math::{
     MathLayoutMetrics, MathState, ParsedMathExpression, ParsedMathExpressionContents,
-    extract_math_expressions, math_layout_metrics, render_math_expression,
+    extract_math_expressions, math_layout_metrics, paint_math_expression_at,
+    render_math_expression,
 };
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
@@ -38,8 +39,8 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
+    ImageFormat, ImageSource, InlineReplacement, KeyContext, Length, MouseButton, MouseDownEvent,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, actions, img, point, quad,
 };
@@ -2634,7 +2635,28 @@ impl Element for MarkdownElement {
                 }
 
                 MarkdownEvent::InlineMath => {
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                    if render_math {
+                        if let Some(expr) = parsed_markdown.math_expressions.get(&range.start) {
+                            let font_size =
+                                builder.text_style().font_size.to_pixels(window.rem_size());
+                            if !builder.push_inline_math(
+                                range.clone(),
+                                expr,
+                                &math_state,
+                                font_size,
+                            ) {
+                                builder.push_text(
+                                    &parsed_markdown.source[range.clone()],
+                                    range.clone(),
+                                );
+                            }
+                        } else {
+                            builder
+                                .push_text(&parsed_markdown.source[range.clone()], range.clone());
+                        }
+                    } else {
+                        builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                    }
                 }
                 MarkdownEvent::DisplayMath => {
                     if render_math {
@@ -2724,6 +2746,10 @@ impl Element for MarkdownElement {
 
         self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
         rendered_markdown.element.paint(window, cx);
+        let math_state = self.markdown.read(cx).math_state.clone();
+        rendered_markdown
+            .text
+            .paint_inline_math(&math_state, window);
         self.paint_search_highlights(&rendered_markdown.text, window, cx);
         self.paint_selection(&rendered_markdown.text, window, cx);
     }
@@ -3009,6 +3035,8 @@ struct PendingInlineObject {
     source_range: Range<usize>,
     kind: InlineObjectKind,
     metrics: MathLayoutMetrics,
+    font_size: Pixels,
+    default_color: Hsla,
 }
 
 #[derive(Clone)]
@@ -3024,6 +3052,8 @@ struct RenderedInlineObject {
     source_range: Range<usize>,
     kind: InlineObjectKind,
     metrics: MathLayoutMetrics,
+    font_size: Pixels,
+    default_color: Hsla,
 }
 
 struct ListStackEntry {
@@ -3234,9 +3264,11 @@ impl MarkdownElementBuilder {
         });
         self.pending_line.text.push(INLINE_OBJECT_REPLACEMENT);
         let rendered_end = self.pending_line.text.len();
+        let mut placeholder_style = self.text_style();
+        placeholder_style.color = Hsla::transparent_black();
         self.pending_line
             .runs
-            .push(self.text_style().to_run(rendered_end - rendered_start));
+            .push(placeholder_style.to_run(rendered_end - rendered_start));
         self.pending_line.inline_objects.push(PendingInlineObject {
             rendered_range: rendered_start..rendered_end,
             source_range: source_range.clone(),
@@ -3244,6 +3276,8 @@ impl MarkdownElementBuilder {
                 expression: expr.contents.clone(),
             },
             metrics,
+            font_size,
+            default_color: self.text_style().color,
         });
         self.current_source_index = source_range.end;
         true
@@ -3392,7 +3426,19 @@ impl MarkdownElementBuilder {
             return;
         }
 
-        let text = StyledText::new(line.text).with_runs(line.runs);
+        let inline_replacements = line
+            .inline_objects
+            .iter()
+            .map(|object| InlineReplacement {
+                range: object.rendered_range.clone(),
+                width: object.metrics.width,
+                ascent: object.metrics.ascent,
+                descent: object.metrics.descent,
+            })
+            .collect::<Vec<_>>();
+        let text = StyledText::new(line.text)
+            .with_runs(line.runs)
+            .with_inline_replacements(inline_replacements);
         self.rendered_lines.push(RenderedLine {
             layout: text.layout().clone(),
             source_mappings: line.source_mappings,
@@ -3407,6 +3453,8 @@ impl MarkdownElementBuilder {
                     source_range: object.source_range,
                     kind: object.kind,
                     metrics: object.metrics,
+                    font_size: object.font_size,
+                    default_color: object.default_color,
                 })
                 .collect(),
         });
@@ -3513,6 +3561,71 @@ impl RenderedLine {
             TextAlign::Center => ((available_width - segment_width) / 2.).max(px(0.)),
             TextAlign::Right => (available_width - segment_width).max(px(0.)),
         }
+    }
+
+    fn bounds_for_rendered_range(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
+        let mut all_bounds = Vec::new();
+        let layout = &self.layout;
+        let line_bounds = layout.bounds();
+        let line_height = layout.line_height();
+        let rendered_start = range.start;
+        let rendered_end = range.end;
+
+        let mut wrapped_line_start = 0;
+        let mut row_top = line_bounds.top();
+
+        while wrapped_line_start < rendered_end {
+            let Some(wrapped_line) = layout.line_layout_for_index(wrapped_line_start) else {
+                break;
+            };
+
+            let unwrapped_layout = &wrapped_line.unwrapped_layout;
+            let wrapped_line_end = wrapped_line_start + wrapped_line.len();
+
+            let row_ends = wrapped_line
+                .wrap_boundaries()
+                .iter()
+                .map(|wrap_boundary| {
+                    let glyph =
+                        &unwrapped_layout.runs[wrap_boundary.run_ix].glyphs[wrap_boundary.glyph_ix];
+                    (wrapped_line_start + glyph.index, glyph.position.x)
+                })
+                .chain([(wrapped_line_end, unwrapped_layout.width)]);
+
+            let mut row_start = wrapped_line_start;
+            let mut row_start_x = Pixels::ZERO;
+
+            for (row_end, row_end_x) in row_ends {
+                let selection_start = rendered_start.max(row_start);
+                let selection_end = rendered_end.min(row_end);
+
+                if selection_start < selection_end {
+                    let alignment_offset = self.alignment_offset_for_segment(
+                        line_bounds.size.width,
+                        row_start_x,
+                        row_end_x,
+                    );
+                    let x_for_index = |index| {
+                        line_bounds.left()
+                            + alignment_offset
+                            + unwrapped_layout.x_for_index(index - wrapped_line_start)
+                            - row_start_x
+                    };
+                    all_bounds.push(Bounds::from_corners(
+                        point(x_for_index(selection_start), row_top),
+                        point(x_for_index(selection_end), row_top + line_height),
+                    ));
+                }
+
+                row_start = row_end;
+                row_start_x = row_end_x;
+                row_top += line_height;
+            }
+
+            wrapped_line_start = wrapped_line_end + 1;
+        }
+
+        all_bounds
     }
 
     fn source_index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
@@ -3637,6 +3750,39 @@ struct RenderedFootnoteRef {
 }
 
 impl RenderedText {
+    fn paint_inline_math(&self, math_state: &MathState, window: &mut Window) {
+        for line in self.lines.iter() {
+            for inline_object in &line.inline_objects {
+                let InlineObjectKind::Math { expression } = &inline_object.kind;
+                let mut bounds =
+                    line.bounds_for_rendered_range(inline_object.rendered_range.clone());
+                for mut bounds in bounds.drain(..) {
+                    let Some(wrapped_line) = line
+                        .layout
+                        .line_layout_for_index(inline_object.rendered_range.start)
+                    else {
+                        continue;
+                    };
+                    let line_height = line.layout.line_height();
+                    let padding_top =
+                        (line_height - wrapped_line.ascent() - wrapped_line.descent()) / 2.;
+                    let baseline_y = bounds.top() + padding_top + wrapped_line.ascent();
+                    bounds.origin.y = baseline_y - inline_object.metrics.ascent;
+                    bounds.size.height =
+                        inline_object.metrics.ascent + inline_object.metrics.descent;
+                    paint_math_expression_at(
+                        expression,
+                        math_state,
+                        bounds,
+                        inline_object.font_size,
+                        inline_object.default_color,
+                        window,
+                    );
+                }
+            }
+        }
+    }
+
     fn bounds_for_source_range(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         let mut all_bounds = Vec::new();
 
