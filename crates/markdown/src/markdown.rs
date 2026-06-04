@@ -1579,7 +1579,7 @@ impl MarkdownElement {
             range,
             div()
                 .w_full()
-                .my_2()
+                .my_3()
                 .child(div().flex().justify_center().child(math))
                 .into_any_element(),
         );
@@ -1953,6 +1953,7 @@ impl Element for MarkdownElement {
             &self.style.container_style,
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
+            window.rem_size(),
         );
         let (
             parsed_markdown,
@@ -3017,6 +3018,7 @@ struct MarkdownElementBuilder {
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
+    rem_size: Pixels,
 }
 
 const INLINE_OBJECT_REPLACEMENT: char = '\u{fffc}';
@@ -3065,6 +3067,7 @@ impl MarkdownElementBuilder {
         container_style: &StyleRefinement,
         base_text_style: TextStyle,
         syntax_theme: Arc<SyntaxTheme>,
+        rem_size: Pixels,
     ) -> Self {
         Self {
             div_stack: vec![{
@@ -3086,6 +3089,7 @@ impl MarkdownElementBuilder {
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
+            rem_size,
         }
     }
 
@@ -3436,29 +3440,84 @@ impl MarkdownElementBuilder {
                 descent: object.metrics.descent,
             })
             .collect::<Vec<_>>();
+
+        // If the line carries an inline math expression that would clip when
+        // baseline-aligned with the surrounding text, grow the line height to
+        // fit it. The math itself is painted at its natural size in
+        // `paint_inline_math`; here we only ensure the line is tall enough.
+        let line_height_override = {
+            let max_math_ascent = line
+                .inline_objects
+                .iter()
+                .map(|object| object.metrics.ascent)
+                .fold(Pixels::ZERO, Pixels::max);
+            let max_math_descent = line
+                .inline_objects
+                .iter()
+                .map(|object| object.metrics.descent)
+                .fold(Pixels::ZERO, Pixels::max);
+            if max_math_ascent > Pixels::ZERO || max_math_descent > Pixels::ZERO {
+                let text_style = self.text_style();
+                let font_size = text_style.font_size.to_pixels(self.rem_size);
+                let default_line_height = text_style
+                    .line_height
+                    .to_pixels(font_size.into(), self.rem_size);
+                // We don't know the exact text ascent/descent at build time, so
+                // approximate the typical 80/20 split. The actual values come
+                // from the text layout at paint time.
+                let text_ascent_approx = font_size * 0.8;
+                let text_descent_approx = font_size * 0.2;
+                // Required line height for the math baseline to align with the
+                // text baseline without clipping at the top or bottom.
+                let top_needed = max_math_ascent * 2. - text_ascent_approx + text_descent_approx;
+                let bottom_needed =
+                    text_ascent_approx - text_descent_approx + max_math_descent * 2.;
+                let padding = font_size * 0.15;
+                let required = top_needed.max(bottom_needed) + padding;
+                if required > default_line_height {
+                    Some(required)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
         let text = StyledText::new(line.text)
             .with_runs(line.runs)
             .with_inline_replacements(inline_replacements);
+        let layout = text.layout().clone();
+        let text_any = text.into_any();
+        let rendered_inline_objects = line
+            .inline_objects
+            .into_iter()
+            .map(|object| RenderedInlineObject {
+                rendered_range: object.rendered_range,
+                source_range: object.source_range,
+                kind: object.kind,
+                metrics: object.metrics,
+                font_size: object.font_size,
+                default_color: object.default_color,
+            })
+            .collect();
         self.rendered_lines.push(RenderedLine {
-            layout: text.layout().clone(),
+            layout,
             source_mappings: line.source_mappings,
             source_end: self.current_source_index,
             language: self.code_block_stack.last().cloned().flatten(),
             text_align,
-            inline_objects: line
-                .inline_objects
-                .into_iter()
-                .map(|object| RenderedInlineObject {
-                    rendered_range: object.rendered_range,
-                    source_range: object.source_range,
-                    kind: object.kind,
-                    metrics: object.metrics,
-                    font_size: object.font_size,
-                    default_color: object.default_color,
-                })
-                .collect(),
+            inline_objects: rendered_inline_objects,
         });
-        self.div_stack.last_mut().unwrap().extend([text.into_any()]);
+        let element: AnyElement = if let Some(line_height) = line_height_override {
+            div()
+                .line_height(line_height)
+                .child(text_any)
+                .into_any_element()
+        } else {
+            text_any
+        };
+        self.div_stack.last_mut().unwrap().extend([element]);
     }
 
     fn build(mut self) -> RenderedMarkdown {
@@ -3764,12 +3823,19 @@ impl RenderedText {
                         continue;
                     };
                     let line_height = line.layout.line_height();
-                    let padding_top =
-                        (line_height - wrapped_line.ascent() - wrapped_line.descent()) / 2.;
-                    let baseline_y = bounds.top() + padding_top + wrapped_line.ascent();
-                    bounds.origin.y = baseline_y - inline_object.metrics.ascent;
-                    bounds.size.height =
-                        inline_object.metrics.ascent + inline_object.metrics.descent;
+                    let text_ascent = wrapped_line.ascent();
+                    let text_descent = wrapped_line.descent();
+                    let math_ascent = inline_object.metrics.ascent;
+                    let math_descent = inline_object.metrics.descent;
+                    // Align the math's baseline with the surrounding text's
+                    // baseline (the conventional inline-math alignment). The
+                    // line height is grown in `flush_text` so the math still
+                    // fits when the expression is taller than the text.
+                    let baseline_y = bounds.top()
+                        + (line_height - text_ascent - text_descent) / 2.
+                        + text_ascent;
+                    bounds.origin.y = baseline_y - math_ascent;
+                    bounds.size.height = math_ascent + math_descent;
                     paint_math_expression_at(
                         expression,
                         math_state,
