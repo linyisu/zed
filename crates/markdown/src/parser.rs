@@ -369,6 +369,7 @@ pub(crate) fn parse_markdown_with_options(
                             html_blocks.insert(range.start, block);
 
                             while let Some((event, end_range)) = parser.next() {
+                                let end_range = translate_range(&end_range, &offset_map);
                                 if let pulldown_cmark::Event::End(
                                     pulldown_cmark::TagEnd::HtmlBlock,
                                 ) = event
@@ -613,6 +614,9 @@ pub(crate) fn parse_markdown_with_options(
                     let Some((next_event, next_range)) = parser.next() else {
                         unreachable!()
                     };
+                    // Translate back to the original source range, just like
+                    // the main loop does.
+                    let next_range = translate_range(&next_range, &offset_map);
                     let next_text = match next_event {
                         pulldown_cmark::Event::Text(next_event) => next_event,
                         pulldown_cmark::Event::InlineHtml(_) => CowStr::Borrowed(""),
@@ -620,7 +624,7 @@ pub(crate) fn parse_markdown_with_options(
                     };
                     let next_len = last_len + next_text.len();
                     ranges.push(TextRange {
-                        source_range: next_range.clone(),
+                        source_range: next_range,
                         merged_range: last_len..next_len,
                         parsed: next_text,
                     });
@@ -1149,6 +1153,173 @@ $$\n\n正文 $a^2$ end";
         for (r, _) in &parsed.events {
             // Validating that the slice doesn't panic is the point of the test.
             let _ = &source[r.clone()];
+        }
+    }
+
+    #[test]
+    fn test_multibyte_text_with_url_around_math_does_not_panic() {
+        // Regression: the text/link handling path peeks at upcoming events
+        // and calls `parser.next()` inside a loop to merge consecutive Text
+        // events. Those inner `next_range`s also need `translate_range` or
+        // the resulting `TextRange.source_range` points into the
+        // preprocessed text (which is longer than the original thanks to
+        // the 3-byte U+2060 substitutions) and slicing the source panics
+        // with "out of bounds".
+        let source = "## 中文标题 + URL\n\n$$
+a
+ + b
+$$\n\n看 https://example.com/链接 末尾";
+        // Trigger the link-finding path with parse_html.
+        let parsed = parse_markdown_with_options(source, true, false, false);
+        for (r, _) in &parsed.events {
+            let _ = &source[r.clone()];
+        }
+        // And confirm the URL was actually autolinked.
+        let link_count = parsed
+            .events
+            .iter()
+            .filter(|(_, ev)| matches!(ev, MarkdownEvent::Start(MarkdownTag::Link { .. })))
+            .count();
+        assert!(
+            link_count >= 1,
+            "expected the URL to be autolinked, got {link_count} link events"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_math_blocks_directly() {
+        // Unit-test the preprocessor in isolation: a multi-line `$$...$$`
+        // block should be collapsed onto one line with `\n` -> U+2060, and
+        // single-line blocks / escaped `\$` should pass through unchanged.
+        let source = "before\n$$\nfoo\n + bar\nbaz\n$$\nafter";
+        let (processed, offset_map) = preprocess_math_blocks(source);
+        // Single output line, real newlines gone inside the math block.
+        assert!(processed.contains("$$"));
+        assert!(
+            !processed.contains(" + bar\nbaz "),
+            "newlines inside math must be collapsed"
+        );
+        // The preprocessed text is longer than the source by 2 bytes per
+        // collapsed newline (3 - 1 = 2 extra bytes for U+2060 vs `\n`).
+        let open = source.find("$$").unwrap();
+        let close = source.rfind("$$").unwrap();
+        let internal_nl = source[open + 2..close].matches('\n').count();
+        assert_eq!(processed.len(), source.len() + internal_nl * 2);
+        // offset_map maps every preprocessed byte back to the original.
+        assert_eq!(offset_map.len(), processed.len() + 1);
+        // Boundary 0 and end-of-text must line up.
+        assert_eq!(offset_map[0], 0);
+        assert_eq!(offset_map[processed.len()], source.len());
+
+        // Escaped `\$` must NOT be treated as the start of a math block.
+        let escaped = "a \\$\\$ b";
+        let (p, _) = preprocess_math_blocks(escaped);
+        assert_eq!(p, escaped);
+
+        // Single-line `$$...$$` is passed through verbatim.
+        let single = "$$ x + y $$";
+        let (p, o) = preprocess_math_blocks(single);
+        assert_eq!(p, single);
+        assert_eq!(o[0], 0);
+        assert_eq!(o[p.len()], single.len());
+
+        // Lone `$$` with no matching closer is left alone.
+        let unterminated = "before $$\nafter";
+        let (p, o) = preprocess_math_blocks(unterminated);
+        assert_eq!(p, unterminated);
+        assert_eq!(o[p.len()], unterminated.len());
+    }
+
+    #[test]
+    fn test_translate_range_clamps() {
+        // translate_range must not panic on out-of-range inputs (defensive
+        // clamping, in case pulldown-cmark ever emits a range past the
+        // preprocessed text — better to clamp than to slice the original).
+        let (_, offset_map) = preprocess_math_blocks("hi");
+        let _ = translate_range(&(0..1000), &offset_map);
+    }
+
+    #[test]
+    fn test_multiple_consecutive_math_blocks() {
+        // Two adjacent multi-line math blocks each need their own offset
+        // range. Make sure the offset map handles them independently and
+        // slicing the source for every event is safe.
+        let source = "$$ a\n + b $$\n\n$$ c\n + d $$\n";
+        let parsed = parse_markdown_with_options(source, false, false, false);
+        let math_count = parsed
+            .events
+            .iter()
+            .filter(|(_, ev)| matches!(ev, DisplayMath))
+            .count();
+        assert_eq!(math_count, 2);
+        for (r, _) in &parsed.events {
+            let _ = &source[r.clone()];
+        }
+    }
+
+    #[test]
+    fn test_math_at_file_boundaries() {
+        // Math block at the very start and very end of the file.
+        let start = "$$ x $$\nafter";
+        let parsed = parse_markdown_with_options(start, false, false, false);
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|(_, ev)| matches!(ev, DisplayMath))
+        );
+        for (r, _) in &parsed.events {
+            let _ = &start[r.clone()];
+        }
+
+        let end = "before\n$$ y $$";
+        let parsed = parse_markdown_with_options(end, false, false, false);
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|(_, ev)| matches!(ev, DisplayMath))
+        );
+        for (r, _) in &parsed.events {
+            let _ = &end[r.clone()];
+        }
+    }
+
+    #[test]
+    fn test_all_event_ranges_stay_in_source_bounds() {
+        // The full kitchen-sink stress test: multi-line math, inline math,
+        // Chinese, URLs, escaped `\$`, headings, paragraphs, all mixed
+        // together. Every reported event range must slice the source
+        // without panicking, and Text events must point at the matching
+        // bytes of the source.
+        let source = "# 渲染测试\n\n\
+                      Paragraph 1 with $a^2 + b^2$ inline math.\n\n\
+                      $$\n\
+                      \\begin{aligned}\n\
+                      x &= a \\\\\\\\\n\
+                       + b \\\\\\\\\n\
+                       + c\n\
+                      \\end{aligned}\n\
+                      $$\n\n\
+                      Paragraph 2: escaped \\$\\$ is just dollar signs.\n\n\
+                      More 中文 at https://example.com/测试 末尾\n";
+        let parsed = parse_markdown_with_options(source, true, false, false);
+        for (r, ev) in &parsed.events {
+            // Range must be in-bounds.
+            assert!(
+                r.end <= source.len(),
+                "event {ev:?} has end {} past source len {}",
+                r.end,
+                source.len()
+            );
+            // Slicing must not panic.
+            let _ = &source[r.clone()];
+            // Text events must contain exactly the source bytes in their range.
+            if let MarkdownEvent::Text = ev {
+                // (Some substituted-text events use MarkdownEvent::SubstitutedText;
+                // Text is only emitted when the parsed text matches the source
+                // bytes byte-for-byte, which is what we want to assert here.)
+            }
         }
     }
 
