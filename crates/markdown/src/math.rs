@@ -101,6 +101,19 @@ pub(crate) struct ParsedMathExpressionContents {
     pub(crate) display_mode: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MathLayoutMetrics {
+    pub(crate) width: Pixels,
+    pub(crate) ascent: Pixels,
+    pub(crate) descent: Pixels,
+}
+
+impl MathLayoutMetrics {
+    fn height(self) -> Pixels {
+        self.ascent + self.descent
+    }
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct MathState {
     cache: MathExpressionCache,
@@ -471,6 +484,29 @@ fn paint_display_item(
     }
 }
 
+fn display_list_metrics(display_list: &DisplayList, font_size: Pixels) -> MathLayoutMetrics {
+    MathLayoutMetrics {
+        width: px(display_list.width as f32 * font_size.as_f32()),
+        ascent: px(display_list.height as f32 * font_size.as_f32()),
+        descent: px(display_list.depth as f32 * font_size.as_f32()),
+    }
+}
+
+pub(crate) fn math_layout_metrics(
+    expr: &ParsedMathExpression,
+    math_state: &MathState,
+    font_size: Pixels,
+) -> Option<MathLayoutMetrics> {
+    let cached = math_state.cache.get(&expr.contents)?;
+    let display_list = cached
+        .display_list
+        .get()
+        .and_then(|result| result.as_ref().ok().cloned())
+        .or_else(|| cached.fallback.clone())?;
+
+    Some(display_list_metrics(&display_list, font_size))
+}
+
 pub(crate) fn render_math_expression(
     expr: &ParsedMathExpression,
     math_state: &MathState,
@@ -482,9 +518,7 @@ pub(crate) fn render_math_expression(
 
     match display_list {
         Some(dl) => {
-            let total_height = dl.height + dl.depth;
-            let width = px(dl.width as f32 * font_size.as_f32());
-            let height = px(total_height as f32 * font_size.as_f32());
+            let metrics = display_list_metrics(dl, font_size);
             let dl = dl.clone();
             let default_color = style.base_text_style.color;
 
@@ -496,8 +530,8 @@ pub(crate) fn render_math_expression(
                     }
                 },
             )
-            .w(width)
-            .h(height)
+            .w(metrics.width)
+            .h(metrics.height())
             .into_any_element()
         }
         None => {

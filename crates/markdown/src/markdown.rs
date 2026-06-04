@@ -12,7 +12,10 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
-use math::{MathState, ParsedMathExpression, extract_math_expressions, render_math_expression};
+use math::{
+    MathLayoutMetrics, MathState, ParsedMathExpression, ParsedMathExpressionContents,
+    extract_math_expressions, math_layout_metrics, render_math_expression,
+};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
@@ -2990,11 +2993,37 @@ struct MarkdownElementBuilder {
     syntax_theme: Arc<SyntaxTheme>,
 }
 
+const INLINE_OBJECT_REPLACEMENT: char = '\u{fffc}';
+
 #[derive(Default)]
 struct PendingLine {
     text: String,
     runs: Vec<TextRun>,
     source_mappings: Vec<SourceMapping>,
+    inline_objects: Vec<PendingInlineObject>,
+}
+
+#[derive(Clone)]
+struct PendingInlineObject {
+    rendered_range: Range<usize>,
+    source_range: Range<usize>,
+    kind: InlineObjectKind,
+    metrics: MathLayoutMetrics,
+}
+
+#[derive(Clone)]
+enum InlineObjectKind {
+    Math {
+        expression: ParsedMathExpressionContents,
+    },
+}
+
+#[derive(Clone)]
+struct RenderedInlineObject {
+    rendered_range: Range<usize>,
+    source_range: Range<usize>,
+    kind: InlineObjectKind,
+    metrics: MathLayoutMetrics,
 }
 
 struct ListStackEntry {
@@ -3187,6 +3216,39 @@ impl MarkdownElementBuilder {
         });
     }
 
+    fn push_inline_math(
+        &mut self,
+        source_range: Range<usize>,
+        expr: &ParsedMathExpression,
+        math_state: &MathState,
+        font_size: Pixels,
+    ) -> bool {
+        let Some(metrics) = math_layout_metrics(expr, math_state, font_size) else {
+            return false;
+        };
+
+        let rendered_start = self.pending_line.text.len();
+        self.pending_line.source_mappings.push(SourceMapping {
+            rendered_index: rendered_start,
+            source_index: source_range.start,
+        });
+        self.pending_line.text.push(INLINE_OBJECT_REPLACEMENT);
+        let rendered_end = self.pending_line.text.len();
+        self.pending_line
+            .runs
+            .push(self.text_style().to_run(rendered_end - rendered_start));
+        self.pending_line.inline_objects.push(PendingInlineObject {
+            rendered_range: rendered_start..rendered_end,
+            source_range: source_range.clone(),
+            kind: InlineObjectKind::Math {
+                expression: expr.contents.clone(),
+            },
+            metrics,
+        });
+        self.current_source_index = source_range.end;
+        true
+    }
+
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
         self.pending_line.source_mappings.push(SourceMapping {
             rendered_index: self.pending_line.text.len(),
@@ -3312,6 +3374,7 @@ impl MarkdownElementBuilder {
             source_end: source_range.end,
             language: None,
             text_align: TextAlign::Left,
+            inline_objects: Vec::new(),
         });
         div()
             .absolute()
@@ -3336,6 +3399,16 @@ impl MarkdownElementBuilder {
             source_end: self.current_source_index,
             language: self.code_block_stack.last().cloned().flatten(),
             text_align,
+            inline_objects: line
+                .inline_objects
+                .into_iter()
+                .map(|object| RenderedInlineObject {
+                    rendered_range: object.rendered_range,
+                    source_range: object.source_range,
+                    kind: object.kind,
+                    metrics: object.metrics,
+                })
+                .collect(),
         });
         self.div_stack.last_mut().unwrap().extend([text.into_any()]);
     }
@@ -3360,6 +3433,7 @@ struct RenderedLine {
     source_end: usize,
     language: Option<Arc<Language>>,
     text_align: TextAlign,
+    inline_objects: Vec<RenderedInlineObject>,
 }
 
 impl RenderedLine {
