@@ -261,13 +261,17 @@ fn strip_math_delimiters(tex: &str, display_mode: bool) -> String {
     .to_string()
 }
 
-fn ratex_color_to_hsla(color: &RatexColor) -> Hsla {
-    Hsla::from(Rgba {
-        r: color.r,
-        g: color.g,
-        b: color.b,
-        a: color.a,
-    })
+fn math_color_to_hsla(color: &RatexColor, default_color: Hsla) -> Hsla {
+    if *color == RatexColor::BLACK {
+        default_color
+    } else {
+        Hsla::from(Rgba {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+            a: color.a,
+        })
+    }
 }
 
 fn resolved_font_matches(window: &Window, font_id: gpui::FontId, expected: &gpui::Font) -> bool {
@@ -286,6 +290,7 @@ fn paint_display_item(
     item: &DisplayItem,
     origin: gpui::Point<Pixels>,
     font_size: Pixels,
+    default_color: Hsla,
     window: &mut Window,
 ) {
     let display_offset = |value: f64| px(value as f32 * font_size.as_f32());
@@ -319,7 +324,7 @@ fn paint_display_item(
             let run = TextRun {
                 len: text.len(),
                 font: font.clone(),
-                color: ratex_color_to_hsla(color),
+                color: math_color_to_hsla(color, default_color),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -349,7 +354,7 @@ fn paint_display_item(
                         run.font_id,
                         glyph.id,
                         em,
-                        ratex_color_to_hsla(color),
+                        math_color_to_hsla(color, default_color),
                     )
                     .unwrap();
             }
@@ -375,14 +380,14 @@ fn paint_display_item(
                 builder.move_to(line_center);
                 builder.line_to(end);
                 if let Ok(path) = builder.build() {
-                    window.paint_path(path, ratex_color_to_hsla(color));
+                    window.paint_path(path, math_color_to_hsla(color, default_color));
                 }
             }
             let bounds = Bounds::new(
                 line_top_left,
                 gpui::size(display_offset(*width), thickness_px),
             );
-            window.paint_quad(fill(bounds, ratex_color_to_hsla(color)));
+            window.paint_quad(fill(bounds, math_color_to_hsla(color, default_color)));
         }
         DisplayItem::Rect {
             x,
@@ -395,7 +400,7 @@ fn paint_display_item(
             let width = px(display_offset(*width).as_f32().max(1.0));
             let height = px(display_offset(*height).as_f32().max(1.0));
             let bounds = Bounds::new(rect_origin, gpui::size(width, height));
-            window.paint_quad(fill(bounds, ratex_color_to_hsla(color)));
+            window.paint_quad(fill(bounds, math_color_to_hsla(color, default_color)));
         }
         DisplayItem::Path {
             x,
@@ -444,7 +449,7 @@ fn paint_display_item(
                     }
                 }
                 if let Ok(path) = builder.build() {
-                    window.paint_path(path, ratex_color_to_hsla(color));
+                    window.paint_path(path, math_color_to_hsla(color, default_color));
                 }
             };
 
@@ -470,7 +475,7 @@ pub(crate) fn render_math_expression(
     expr: &ParsedMathExpression,
     math_state: &MathState,
     font_size: Pixels,
-    _style: &MarkdownStyle,
+    style: &MarkdownStyle,
 ) -> AnyElement {
     let cached = math_state.cache.get(&expr.contents);
     let display_list = cached.and_then(|c| c.display_list.get()?.as_ref().ok());
@@ -481,12 +486,13 @@ pub(crate) fn render_math_expression(
             let width = px(dl.width as f32 * font_size.as_f32());
             let height = px(total_height as f32 * font_size.as_f32());
             let dl = dl.clone();
+            let default_color = style.base_text_style.color;
 
             canvas(
-                move |_bounds, _window, _cx| (dl, font_size),
-                move |bounds, (dl, font_size), window, _cx| {
+                move |_bounds, _window, _cx| (dl, font_size, default_color),
+                move |bounds, (dl, font_size, default_color), window, _cx| {
                     for item in &dl.items {
-                        paint_display_item(item, bounds.origin, font_size, window);
+                        paint_display_item(item, bounds.origin, font_size, default_color, window);
                     }
                 },
             )
