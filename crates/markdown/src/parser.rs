@@ -30,6 +30,116 @@ struct ParseState {
     depth: usize,
 }
 
+/// Find the byte position just past the next unescaped `$$` after `start`.
+/// Returns `None` if no closing delimiter is found.
+fn find_display_math_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1] == b'$' {
+            // Skip escaped `\$$`.
+            if i > 0 && bytes[i - 1] == b'\\' {
+                i += 1;
+                continue;
+            }
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Append `c` (a character already known to live at `original_offset` in the
+/// source text) to `out` and record the offset mapping in `offset_map`.
+///
+/// `offset_map` has one entry per preprocessed-text boundary, where the
+/// `p`-th entry is the offset in the original text that corresponds to
+/// preprocessed position `p`. For multi-byte characters the intermediate
+/// entries (boundaries in the middle of the char) all point at the start of
+/// the same original char, and the final entry points one char past it.
+fn push_char(c: char, original_offset: usize, out: &mut String, offset_map: &mut Vec<usize>) {
+    let char_len = c.len_utf8();
+    out.push(c);
+    for k in 1..=char_len {
+        offset_map.push(if k < char_len {
+            original_offset
+        } else {
+            original_offset + char_len
+        });
+    }
+}
+
+/// Collapse multi-line `$$...$$` display math blocks into single-line form so
+/// `pulldown-cmark` can recognise them. Block-level constructs (lists, block
+/// quotes, ...) take precedence over inline math in `pulldown-cmark`, so a
+/// `+` at the start of a line inside `$$\n...\n$$` would otherwise tear the
+/// block apart and the inner lines would be parsed as list items. We replace
+/// the inner `\n` with U+2060 (WORD JOINER) — invisible to markdown parsing —
+/// and return an offset map so every event range reported by pulldown-cmark
+/// can be translated back to the original source positions.
+fn preprocess_math_blocks(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(text.len());
+    let mut offset_map: Vec<usize> = vec![0];
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+            // Skip escaped `\$$`.
+            if i > 0 && bytes[i - 1] == b'\\' {
+                push_char('$', i, &mut out, &mut offset_map);
+                i += 1;
+                continue;
+            }
+            if let Some(orig_end) = find_display_math_end(bytes, i + 2) {
+                let orig_start = i;
+                let contains_newline = text[orig_start..orig_end].contains('\n');
+                if contains_newline {
+                    // Push opening "$$".
+                    push_char('$', orig_start, &mut out, &mut offset_map);
+                    push_char('$', orig_start + 1, &mut out, &mut offset_map);
+                    // Push content, replacing newlines with U+2060.
+                    let mut j = orig_start + 2;
+                    while j < orig_end - 2 {
+                        let c = text[j..].chars().next().unwrap();
+                        if c == '\n' {
+                            push_char('\u{2060}', j, &mut out, &mut offset_map);
+                        } else {
+                            push_char(c, j, &mut out, &mut offset_map);
+                        }
+                        j += c.len_utf8();
+                    }
+                    // Push closing "$$".
+                    push_char('$', orig_end - 2, &mut out, &mut offset_map);
+                    push_char('$', orig_end - 1, &mut out, &mut offset_map);
+                    i = orig_end;
+                    continue;
+                }
+                // Single-line `$$...$$`: copy verbatim.
+                let mut j = orig_start;
+                while j < orig_end {
+                    let c = text[j..].chars().next().unwrap();
+                    push_char(c, j, &mut out, &mut offset_map);
+                    j += c.len_utf8();
+                }
+                i = orig_end;
+                continue;
+            }
+        }
+        let c = text[i..].chars().next().unwrap();
+        push_char(c, i, &mut out, &mut offset_map);
+        i += c.len_utf8();
+    }
+    (out, offset_map)
+}
+
+/// Translate a byte range from preprocessed text back to the original text
+/// using the offset map produced by `preprocess_math_blocks`.
+fn translate_range(range: &Range<usize>, offset_map: &[usize]) -> Range<usize> {
+    let len = offset_map.len();
+    let start = range.start.min(len.saturating_sub(1));
+    let end = range.end.min(len.saturating_sub(1));
+    offset_map[start]..offset_map[end]
+}
+
 #[derive(Debug, Default)]
 #[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct ParsedMarkdownData {
@@ -229,10 +339,14 @@ pub(crate) fn parse_markdown_with_options(
     } else {
         PARSE_OPTIONS
     };
-    let mut parser = Parser::new_ext(text, parse_options)
+    let (parsed_text, offset_map) = preprocess_math_blocks(text);
+    let mut parser = Parser::new_ext(&parsed_text, parse_options)
         .into_offset_iter()
         .peekable();
     while let Some((pulldown_event, range)) = parser.next() {
+        // All ranges from pulldown-cmark are in the preprocessed text; translate
+        // them back to the original text before pushing events.
+        let range = translate_range(&range, &offset_map);
         if within_metadata && !parse_metadata_blocks {
             if let pulldown_cmark::Event::End(pulldown_cmark::TagEnd::MetadataBlock(_)) =
                 pulldown_event
@@ -938,6 +1052,104 @@ mod tests {
                 .intersection(UNWANTED_OPTIONS),
             Options::empty()
         );
+    }
+
+    #[test]
+    fn test_multiline_display_math_with_list_marker() {
+        // Regression: pulldown-cmark parses block-level constructs (lists,
+        // block quotes) before math, so a `+` at the start of a line inside
+        // a multi-line `$$...$$` block used to split the block in two and
+        // the inner lines were emitted as list items. We pre-collapse the
+        // newlines so pulldown-cmark sees a single-line `$$...$$` and
+        // emit a single `DisplayMath` event with the original range.
+        let source = "$$\n\\begin{aligned}\n\\nabla f(x,y,z)\n&= a\n + b\n + c\n\\end{aligned}\n$$";
+        let parsed = parse_markdown_with_options(source, false, false, false);
+        let math_events: Vec<_> = parsed
+            .events
+            .iter()
+            .filter(|(_, ev)| {
+                matches!(
+                    ev,
+                    DisplayMath
+                        | InlineMath
+                        | MarkdownEvent::Text
+                        | MarkdownEvent::SubstitutedText(_)
+                )
+            })
+            .collect();
+        assert!(
+            math_events.iter().any(|(_, ev)| matches!(ev, DisplayMath)),
+            "expected a single DisplayMath event, got {math_events:?}"
+        );
+        // The DisplayMath range must cover the entire original `$$...$$`
+        // block (including delimiters).
+        let (range, _) = math_events
+            .iter()
+            .find(|(_, ev)| matches!(ev, DisplayMath))
+            .unwrap();
+        assert_eq!(range.start, 0);
+        assert_eq!(range.end, source.len());
+        // No stray list items should remain inside the math range.
+        for (r, ev) in &parsed.events {
+            if matches!(ev, MarkdownEvent::Start(MarkdownTag::Item)) && r.end <= source.len() {
+                panic!("unexpected list item inside math block: {ev:?} @ {r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_single_line_display_math_still_works() {
+        let source = "$$ a + b + c $$";
+        let parsed = parse_markdown_with_options(source, false, false, false);
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|(_, ev)| matches!(ev, DisplayMath))
+        );
+    }
+
+    #[test]
+    fn test_inline_math_still_works() {
+        let source = "inline $a + b$ math";
+        let parsed = parse_markdown_with_options(source, false, false, false);
+        assert!(parsed.events.iter().any(|(_, ev)| matches!(ev, InlineMath)));
+    }
+
+    #[test]
+    fn test_multibyte_text_around_math_does_not_panic() {
+        // Regression: text ranges from pulldown-cmark are in the preprocessed
+        // text (where math-block `\n` have been swapped for 3-byte U+2060
+        // characters), so they must be translated back to the original byte
+        // offsets. Skipping the translation used to land inside a multi-byte
+        // Chinese character and panic with "not a char boundary".
+        let source = "# 渲染测试中文标题\n\n$$
+\\begin{aligned}
+a
+ + b
+ + c
+\\end{aligned}
+$$\n\n正文 $a^2$ end";
+        let parsed = parse_markdown_with_options(source, false, false, false);
+        // The math block is a single DisplayMath event covering the whole
+        // original `$$...$$` range, including its real newlines.
+        let math: Vec<_> = parsed
+            .events
+            .iter()
+            .filter(|(_, ev)| matches!(ev, DisplayMath))
+            .collect();
+        assert_eq!(math.len(), 1, "expected exactly one DisplayMath event");
+        let (range, _) = math[0];
+        // The math range covers the whole original `$$...$$` block, delimiters
+        // and real newlines included.
+        assert!(source[range.clone()].starts_with("$$"));
+        assert!(source[range.clone()].ends_with("$$"));
+        assert!(source[range.clone()].contains('\n'));
+        // Slicing the source at every reported event range must be safe.
+        for (r, _) in &parsed.events {
+            // Validating that the slice doesn't panic is the point of the test.
+            let _ = &source[r.clone()];
+        }
     }
 
     #[test]
