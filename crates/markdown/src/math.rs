@@ -577,3 +577,140 @@ pub(crate) fn render_math_expression(
             .into_any_element(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::MarkdownEvent;
+
+    #[test]
+    fn strip_math_delimiters_inline() {
+        assert_eq!(strip_math_delimiters("$x + y$", false), "x + y");
+        // Surrounding whitespace is trimmed first.
+        assert_eq!(strip_math_delimiters("  $x$  ", false), "x");
+        // Missing one side of the delimiter leaves the original `s` intact
+        // (the function is defensive — pulldown-cmark only emits matched pairs).
+        assert_eq!(strip_math_delimiters("x + y", false), "x + y");
+        assert_eq!(strip_math_delimiters("$x + y", false), "$x + y");
+        assert_eq!(strip_math_delimiters("x + y$", false), "x + y$");
+    }
+
+    #[test]
+    fn strip_math_delimiters_display() {
+        assert_eq!(strip_math_delimiters("$$x + y$$", true), "x + y");
+        // Trims surrounding whitespace before stripping `$$`.
+        assert_eq!(strip_math_delimiters("\n  $$x$$  \n", true), "x");
+        // Single `$` boundary doesn't match the display delimiter.
+        assert_eq!(strip_math_delimiters("$x$", true), "$x$");
+        assert_eq!(strip_math_delimiters("$$x$", true), "$$x$");
+    }
+
+    #[test]
+    fn extract_math_expressions_collects_inline_and_display() {
+        use crate::parser::parse_markdown_with_options;
+        let source = "before $a + b$ middle\n\n$$
+foo
+ + bar
+$$\n\nafter";
+        let parsed = parse_markdown_with_options(source, true, false, false);
+        let math_events: Vec<_> = parsed
+            .events
+            .iter()
+            .filter(|(_, ev)| matches!(ev, MarkdownEvent::InlineMath | MarkdownEvent::DisplayMath))
+            .cloned()
+            .collect();
+        assert_eq!(math_events.len(), 2, "got events: {:?}", parsed.events);
+
+        let extracted = extract_math_expressions(source, &math_events);
+        assert_eq!(extracted.len(), 2, "got: {extracted:?}");
+
+        // Inline math: `$a + b$` with surrounding spaces/newlines.
+        let inline = extracted
+            .values()
+            .find(|m| !m.contents.display_mode)
+            .expect("inline math should be extracted");
+        assert_eq!(inline.contents.contents.to_string(), "a + b");
+
+        // Display math: the multi-line block.
+        let display = extracted
+            .values()
+            .find(|m| m.contents.display_mode)
+            .expect("display math should be extracted");
+        assert!(display.contents.contents.to_string().contains("foo"));
+        assert!(display.contents.contents.to_string().contains("+ bar"));
+        // The content range must slice back to the original `$$...$$` block.
+        let slice = &source[display.content_range.clone()];
+        assert!(slice.starts_with("$$"));
+        assert!(slice.ends_with("$$"));
+    }
+
+    #[test]
+    fn extract_math_expressions_skips_empty_and_non_math_events() {
+        use crate::parser::parse_markdown_with_options;
+        // A display-math block consisting only of whitespace, and an
+        // inline math that's just a stray `$` (which pulldown-cmark would
+        // not normally emit, so this also covers "all events are not math").
+        let source = "no math here\n\n$$  $$\n\njust text $ $ more";
+        let parsed = parse_markdown_with_options(source, true, false, false);
+        let extracted = extract_math_expressions(source, &parsed.events);
+        // Whatever pulldown-cmark produces for `$$  $$`, the extracted
+        // content must never be empty.
+        for m in extracted.values() {
+            assert!(
+                !m.contents.contents.trim().is_empty(),
+                "extracted math content should not be empty: {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_math_expressions_ignores_other_events() {
+        let source = "text";
+        let events = vec![
+            (0..4, MarkdownEvent::Text),
+            (
+                0..4,
+                MarkdownEvent::Start(crate::parser::MarkdownTag::Paragraph),
+            ),
+        ];
+        let extracted = extract_math_expressions(source, &events);
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn is_system_fallback_font_recognises_cjk_and_emoji() {
+        assert!(is_system_fallback_font(FontId::CjkRegular));
+        assert!(is_system_fallback_font(FontId::CjkFallback));
+        assert!(is_system_fallback_font(FontId::EmojiFallback));
+        assert!(!is_system_fallback_font(FontId::MainRegular));
+        assert!(!is_system_fallback_font(FontId::MathItalic));
+    }
+
+    #[test]
+    fn display_list_metrics_zero_for_empty() {
+        let display_list = DisplayList {
+            width: 0.0,
+            height: 0.0,
+            depth: 0.0,
+            items: vec![],
+        };
+        let metrics = display_list_metrics(&display_list, px(16.0));
+        assert_eq!(metrics.width, Pixels::ZERO);
+        assert_eq!(metrics.ascent, Pixels::ZERO);
+        assert_eq!(metrics.descent, Pixels::ZERO);
+        assert_eq!(metrics.height(), Pixels::ZERO);
+
+        // Non-zero display list: ascent/depth are scaled by font_size in em.
+        let display_list = DisplayList {
+            width: 0.5,
+            height: 0.8,
+            depth: 0.2,
+            items: vec![],
+        };
+        let metrics = display_list_metrics(&display_list, px(10.0));
+        assert_eq!(metrics.width, px(5.0));
+        assert_eq!(metrics.ascent, px(8.0));
+        assert_eq!(metrics.descent, px(2.0));
+        assert_eq!(metrics.height(), px(10.0));
+    }
+}
