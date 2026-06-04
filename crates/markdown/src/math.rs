@@ -559,24 +559,21 @@ pub(crate) fn render_math_expression(
             .h(metrics.height())
             .into_any_element()
         }
-        None => {
-            // 加载中 / 失败 → 显示原始 LaTeX
-            div()
-                .child(SharedString::from(format!(
-                    "{}{}{}",
-                    if expr.contents.display_mode {
-                        "$$"
-                    } else {
-                        "$"
-                    },
-                    expr.contents.contents,
-                    if expr.contents.display_mode {
-                        "$$"
-                    } else {
-                        "$"
-                    }
-                )))
-                .into_any_element()
-        }
+        None => div()
+            .child(SharedString::from(format!(
+                "{}{}{}",
+                if expr.contents.display_mode {
+                    "$$"
+                } else {
+                    "$"
+                },
+                expr.contents.contents,
+                if expr.contents.display_mode {
+                    "$$"
+                } else {
+                    "$"
+                }
+            )))
+            .into_any_element(),
     }
 }
