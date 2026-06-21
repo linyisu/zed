@@ -219,6 +219,9 @@ pub struct SettingsContent {
     /// The URL of the Zed server to connect to.
     pub server_url: Option<String>,
 
+    /// Settings for the Rduel competitive programming prototype.
+    pub rduel: Option<RduelSettingsContent>,
+
     /// The URL used as the key for credential storage.
     ///
     /// When set, credentials are stored under this URL instead of `server_url`.
@@ -286,6 +289,17 @@ pub struct PerformanceProfilerSettingsContent {
     ///
     /// Default: false
     pub enabled: Option<bool>,
+}
+
+/// Settings for the Rduel competitive programming prototype.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct RduelSettingsContent {
+    /// The AtCoder username used for matchmaking and server-side AC polling.
+    pub atcoder_user: Option<String>,
+
+    /// The Rduel matchmaking server URL.
+    pub server_url: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, MergeFrom)]

@@ -22,6 +22,7 @@ use menu::{Cancel, Confirm};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use settings::{RegisterSetting, Settings};
 use text::{LineEnding, Rope};
 use ui::{Button, ButtonSize, ButtonStyle, prelude::*};
 use util::{ResultExt, rel_path::RelPath};
@@ -35,7 +36,28 @@ const DEFAULT_COMMAND_OUTPUT_HEIGHT: f32 = 156.0;
 const MIN_COMMAND_OUTPUT_HEIGHT: f32 = 96.0;
 const MAX_COMMAND_OUTPUT_HEIGHT: f32 = 360.0;
 const PROBLEM_MARKDOWN_FONT_SCALE: f32 = 1.05;
-const RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
+const DEFAULT_RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
+
+#[derive(Clone, Debug, RegisterSetting)]
+pub struct RduelSettings {
+    pub atcoder_user: String,
+    pub server_url: String,
+}
+
+impl Settings for RduelSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let rduel = content.rduel.as_ref();
+        Self {
+            atcoder_user: rduel
+                .and_then(|settings| settings.atcoder_user.clone())
+                .unwrap_or_default(),
+            server_url: rduel
+                .and_then(|settings| settings.server_url.clone())
+                .filter(|server_url| !server_url.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_RDUEL_SERVER_URL.to_string()),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = rduel)]
@@ -58,6 +80,7 @@ pub struct SelectMainRs;
 pub struct SelectCargoToml;
 
 pub fn init(cx: &mut App) {
+    RduelSettings::register(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenRduel, window, cx| {
             open_rduel(workspace, window, cx);
@@ -506,9 +529,16 @@ struct RduelMatchModal {
 
 impl RduelMatchModal {
     fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let settings = RduelSettings::get_global(cx);
+        let configured_atcoder_user = settings.atcoder_user.trim().to_string();
+        let configured_server_url = settings.server_url.trim().to_string();
         let atcoder_user_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("AtCoder username", window, cx);
+            if !configured_atcoder_user.is_empty() {
+                editor.set_text(configured_atcoder_user, window, cx);
+                editor.select_all(&editor::actions::SelectAll, window, cx);
+            }
             editor
         });
         window.focus(&atcoder_user_editor.read(cx).focus_handle(cx), cx);
@@ -517,7 +547,7 @@ impl RduelMatchModal {
             focus_handle: cx.focus_handle(),
             workspace,
             atcoder_user_editor,
-            server_url: RDUEL_SERVER_URL.to_string(),
+            server_url: configured_server_url,
             player_id: None,
             status: "输入 AtCoder 用户名后开始匹配。".into(),
             is_waiting: false,

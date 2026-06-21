@@ -2559,6 +2559,13 @@
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
   "server_url": "https://zed.dev",
+  // Settings for the Rduel competitive programming prototype.
+  "rduel": {
+    // AtCoder username used for matchmaking and server-side AC polling.
+    "atcoder_user": "",
+    // Rduel matchmaking server URL.
+    "server_url": "http://127.0.0.1:8787",
+  },
   // Settings overrides to use when using Zed Preview.
   // Mostly useful for developers who are managing multiple instances of Zed.
   "preview": {

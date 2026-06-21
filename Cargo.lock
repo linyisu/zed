@@ -14825,6 +14825,7 @@ dependencies = [
  "schemars 1.0.4",
  "serde",
  "serde_json",
+ "settings",
  "smol",
  "text",
  "ui",
