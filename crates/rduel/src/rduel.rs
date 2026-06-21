@@ -531,6 +531,10 @@ enum RduelMatchCommand {
         server_url: String,
         room_id: String,
     },
+    Leave {
+        server_url: String,
+        player_id: String,
+    },
 }
 
 enum RduelMatchOutput {
@@ -672,6 +676,22 @@ impl RduelMatchModal {
         .detach_and_log_err(cx);
     }
 
+    fn leave_matchmaking(&mut self, cx: &mut Context<Self>) {
+        let Some(player_id) = self.player_id.take() else {
+            return;
+        };
+        let server_url = self.server_url.clone();
+        self.is_waiting = false;
+        cx.background_spawn(async move {
+            RduelMatchCommand::Leave {
+                server_url,
+                player_id,
+            }
+            .run()
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn handle_match_result(
         &mut self,
         result: anyhow::Result<RduelMatchOutput>,
@@ -789,7 +809,16 @@ impl Focusable for RduelMatchModal {
 }
 
 impl EventEmitter<DismissEvent> for RduelMatchModal {}
-impl ModalView for RduelMatchModal {}
+impl ModalView for RduelMatchModal {
+    fn on_before_dismiss(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> workspace::DismissDecision {
+        self.leave_matchmaking(cx);
+        workspace::DismissDecision::Dismiss(true)
+    }
+}
 
 enum RduelCommand {
     Test {
@@ -988,6 +1017,15 @@ impl RduelMatchCommand {
                 let path = format!("/rooms/{room_id}");
                 let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "GET", &path, None)?;
                 Ok(RduelMatchOutput::RoomStatus { room })
+            }
+            Self::Leave {
+                server_url,
+                player_id,
+            } => {
+                let path = format!("/players/{player_id}/leave");
+                let _: serde_json::Value =
+                    rduel_http_json::<(), _>(&server_url, "POST", &path, None)?;
+                Ok(RduelMatchOutput::Waiting { player_id })
             }
         }
     }

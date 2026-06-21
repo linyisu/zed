@@ -35,7 +35,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
     let address = SocketAddr::new(args.host, args.port);
@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/join", post(join_matchmaking))
         .route("/players/:player_id", get(player_state))
+        .route("/players/:player_id/leave", post(leave_player))
         .route("/rooms/:room_id", get(room_state))
         .route("/rooms/:room_id/atcoder-user", post(set_atcoder_user))
         .with_state(state);
@@ -98,6 +99,14 @@ impl RduelRooms {
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
             name: request.name,
         };
+
+        let removed_count = self.remove_waiting_players_by_name(&player.name);
+        if removed_count > 0 {
+            log::info!(
+                "replaced {removed_count} stale Rduel waiting player(s) for AtCoder user {}",
+                player.name
+            );
+        }
 
         if let Some(location) = self.players.get(&player.id).cloned() {
             return JoinDecision::Respond(match location {
@@ -205,6 +214,34 @@ impl RduelRooms {
                     })
             }
         }
+    }
+
+    fn leave_waiting_player(&mut self, player_id: &str) -> bool {
+        if !matches!(self.players.get(player_id), Some(PlayerLocation::Waiting)) {
+            return false;
+        }
+
+        self.players.remove(player_id);
+        self.waiting_players
+            .retain(|player| player.id.as_str() != player_id);
+        true
+    }
+
+    fn remove_waiting_players_by_name(&mut self, player_name: &str) -> usize {
+        let mut removed_player_ids = Vec::new();
+        self.waiting_players.retain(|player| {
+            if player.name == player_name {
+                removed_player_ids.push(player.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let removed_count = removed_player_ids.len();
+        for player_id in removed_player_ids {
+            self.players.remove(&player_id);
+        }
+        removed_count
     }
 
     fn room_state(&self, room_id: &str) -> Option<Room> {
@@ -413,6 +450,20 @@ async fn player_state(
         .player_state(&player_id)
         .map(Json)
         .ok_or(ApiError::NotFound("player was not found"))
+}
+
+async fn leave_player(
+    State(state): State<ServerState>,
+    Path(player_id): Path<String>,
+) -> Json<serde_json::Value> {
+    let left = {
+        let mut rooms = state.rooms.lock().await;
+        rooms.leave_waiting_player(&player_id)
+    };
+    if left {
+        log::info!("Rduel waiting player {player_id} left matchmaking");
+    }
+    Json(serde_json::json!({ "left": left }))
 }
 
 async fn room_state(
