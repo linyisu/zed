@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::Arc,
@@ -1121,7 +1121,11 @@ where
         body
     );
 
-    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))?;
+    let socket_address = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Rduel server address did not resolve"))?;
+    let mut stream = TcpStream::connect_timeout(&socket_address, Duration::from_secs(3))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     stream.write_all(request.as_bytes())?;

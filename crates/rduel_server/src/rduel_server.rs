@@ -481,6 +481,11 @@ async fn join_matchmaking(
     let response = match decision {
         JoinDecision::Respond(response) => response,
         JoinDecision::CreateRoom { opponent, player } => {
+            log::info!(
+                "selecting Rduel problem for AtCoder users {} and {}",
+                opponent.name,
+                player.name
+            );
             match select_problem_for_server(&state).await {
                 Ok(problem) => {
                     let response = {
@@ -747,13 +752,15 @@ async fn select_problem(problems: &[Problem]) -> anyhow::Result<Problem> {
         !problems.is_empty(),
         "Rduel server must have at least one configured problem"
     );
-    let attempts = problems.len().min(12);
+    let attempts = problems.len().min(3);
     let mut last_error = None;
+    let mut fallback_problem = None;
     for _ in 0..attempts {
         let problem_seed = problems
             .choose(&mut rand::rng())
             .cloned()
             .context("Rduel server must have at least one configured problem")?;
+        fallback_problem = Some(problem_seed.clone());
         match fetch_problem(problem_seed.clone()).await {
             Ok(problem) if !problem.statement_markdown.trim().is_empty() => return Ok(problem),
             Ok(_) => {
@@ -771,12 +778,28 @@ async fn select_problem(problems: &[Problem]) -> anyhow::Result<Problem> {
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no configured problem could be fetched")))
+    let mut problem = fallback_problem
+        .or_else(|| problems.first().cloned())
+        .context("Rduel server must have at least one configured problem")?;
+    if let Some(error) = last_error {
+        log::warn!(
+            "using fallback Rduel problem {} because statement fetch failed: {error:#}",
+            problem.url
+        );
+    }
+    problem.statement_markdown = fallback_statement_markdown(&problem);
+    Ok(problem)
 }
 
 async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
     let statement_url = english_problem_url(&fallback.url);
-    let html = reqwest::get(&statement_url)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("building AtCoder problem HTTP client")?;
+    let html = client
+        .get(&statement_url)
+        .send()
         .await
         .with_context(|| format!("requesting AtCoder problem statement {statement_url}"))?
         .error_for_status()
@@ -805,6 +828,13 @@ async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
         fallback.samples = samples;
     }
     Ok(fallback)
+}
+
+fn fallback_statement_markdown(problem: &Problem) -> String {
+    format!(
+        "## Problem Statement\n\nCould not fetch the AtCoder statement before matchmaking completed.\n\n[Open the problem on AtCoder]({})\n",
+        english_problem_url(&problem.url)
+    )
 }
 
 fn english_problem_url(problem_url: &str) -> String {
