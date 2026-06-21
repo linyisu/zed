@@ -622,12 +622,19 @@ impl RduelMatchModal {
                 })
                 .detach_and_log_err(cx);
                 let workspace = self.workspace.clone();
-                workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.hide_modal(window, cx);
-                    })
-                    .log_err();
-                open_rduel_session(workspace, session, window, cx);
+                let window_handle = window.window_handle();
+                cx.defer(move |cx| {
+                    window_handle
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.hide_modal(window, cx);
+                                })
+                                .log_err();
+                            open_rduel_session(workspace, session, window, cx);
+                        })
+                        .log_err();
+                });
             }
             Ok(RduelMatchOutput::RoomStatus { .. }) => {}
             Err(error) => {
@@ -680,11 +687,19 @@ impl Render for RduelMatchModal {
                 }
             }))
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
-                this.workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.hide_modal(window, cx);
-                    })
-                    .log_err();
+                let workspace = this.workspace.clone();
+                let window_handle = window.window_handle();
+                cx.defer(move |cx| {
+                    window_handle
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.hide_modal(window, cx);
+                                })
+                                .log_err();
+                        })
+                        .log_err();
+                });
             }))
     }
 }
