@@ -931,6 +931,7 @@ async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
     let statement_markdown = convert_html_to_markdown(statement_html.as_bytes(), &mut handlers)
         .context("converting AtCoder statement to Markdown")?;
     let statement_markdown = prefer_english_statement(statement_markdown);
+    let statement_markdown = repair_empty_markdown_list_items(&statement_markdown);
     let samples = extract_markdown_samples(&statement_markdown);
     let samples = if samples.is_empty() {
         extract_html_samples(&statement_html)
@@ -938,6 +939,9 @@ async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
         samples
     };
 
+    if let Some(title) = extract_problem_title(&html) {
+        fallback.title = format_problem_display_title(&fallback.id, &title);
+    }
     fallback.statement_markdown = statement_markdown;
     if !samples.is_empty() {
         fallback.samples = samples;
@@ -967,6 +971,53 @@ fn prefer_english_statement(markdown: String) -> String {
         }
     }
     markdown
+}
+
+fn repair_empty_markdown_list_items(markdown: &str) -> String {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0;
+
+    while index < lines.len() {
+        if lines[index].trim() == "-"
+            && index + 2 < lines.len()
+            && lines[index + 1].trim().is_empty()
+            && !lines[index + 2].trim().is_empty()
+        {
+            output.push(format!("- {}", lines[index + 2].trim_start()));
+            index += 3;
+        } else {
+            output.push(lines[index].to_string());
+            index += 1;
+        }
+    }
+
+    let mut repaired = output.join("\n");
+    if markdown.ends_with('\n') {
+        repaired.push('\n');
+    }
+    repaired
+}
+
+fn extract_problem_title(html: &str) -> Option<String> {
+    let title = extract_html_title(html)?;
+    let title = html_unescape(title.trim());
+    let title = title
+        .split_once(" - ")
+        .map_or(title.as_str(), |(_, title)| title)
+        .trim()
+        .to_string();
+    if title.is_empty() { None } else { Some(title) }
+}
+
+fn format_problem_display_title(problem_id: &str, title: &str) -> String {
+    format!("{problem_id} 「{title}」")
+}
+
+fn extract_html_title(html: &str) -> Option<&str> {
+    let title_start = html.find("<title>")? + "<title>".len();
+    let title_end = html[title_start..].find("</title>")? + title_start;
+    Some(&html[title_start..title_end])
 }
 
 fn wrap_var_tags_as_math(html: &str) -> String {
@@ -1352,5 +1403,47 @@ mod tests {
         assert_eq!(submissions[0].problem_id, "abc001_a");
         assert_eq!(submissions[0].result, "AC");
         assert_eq!(submissions[0].epoch_second, 1782058803);
+    }
+
+    #[test]
+    fn repairs_empty_markdown_list_items() {
+        let markdown = [
+            "The game proceeds as follows:",
+            "- ",
+            "",
+            "$6$ is not written on the sheet.",
+            "- ",
+            "",
+            "$2$ is not written on the sheet.",
+            "",
+        ]
+        .join("\n");
+
+        assert_eq!(
+            repair_empty_markdown_list_items(&markdown),
+            [
+                "The game proceeds as follows:",
+                "- $6$ is not written on the sheet.",
+                "- $2$ is not written on the sheet.",
+                "",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn extracts_problem_title() {
+        assert_eq!(
+            extract_problem_title("<html><head><title>C - Write and Erase</title></head></html>"),
+            Some("Write and Erase".to_string())
+        );
+    }
+
+    #[test]
+    fn formats_problem_display_title() {
+        assert_eq!(
+            format_problem_display_title("abc073_c", "Write and Erase"),
+            "abc073_c 「Write and Erase」"
+        );
     }
 }
