@@ -473,6 +473,7 @@ struct MatchState {
     player_id: Option<String>,
     room_id: Option<String>,
     server_url: String,
+    room_status: ServerRoomStatus,
 }
 
 #[derive(Serialize)]
@@ -1593,6 +1594,7 @@ impl RduelView {
                     player_id: Some(session.player_id),
                     room_id,
                     server_url: session.server_url,
+                    room_status: ServerRoomStatus::Playing,
                 },
             },
             problem,
@@ -1636,9 +1638,6 @@ impl RduelView {
     }
 
     fn run_samples(&mut self, _: &RunSamples, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_match_playing() {
-            return;
-        }
         let Some(rduel_project) = self.rduel_project.clone() else {
             self.command_status = CommandStatus::Failed;
             self.set_command_output(
@@ -1695,9 +1694,6 @@ impl RduelView {
     }
 
     fn submit_solution(&mut self, _: &SubmitSolution, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_match_playing() {
-            return;
-        }
         let Some(rduel_project) = self.rduel_project.clone() else {
             self.command_status = CommandStatus::Failed;
             self.set_command_output(
@@ -1744,6 +1740,9 @@ impl RduelView {
         if self.command_status.is_running() {
             return;
         }
+        if self.room.match_state.room_status != ServerRoomStatus::Playing {
+            return;
+        }
         let (Some(room_id), Some(player_id), server_url) = (
             self.room.match_state.room_id.clone(),
             self.room.match_state.player_id.clone(),
@@ -1769,7 +1768,7 @@ impl RduelView {
                 match result {
                     Ok(RduelMatchOutput::RoomStatus { room }) => {
                         this.command_status = CommandStatus::Succeeded;
-                        this.apply_room_status(room, cx);
+                        this.apply_room_status(room);
                     }
                     Ok(RduelMatchOutput::Waiting { .. } | RduelMatchOutput::Matched { .. }) => {}
                     Err(error) => {
@@ -1891,7 +1890,7 @@ impl RduelView {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(RduelMatchOutput::RoomStatus { room }) => {
-                        if this.apply_room_status(room, cx) {
+                        if this.apply_room_status(room) {
                             this.poll_room_after_delay(cx);
                         }
                     }
@@ -1911,7 +1910,7 @@ impl RduelView {
         .detach_and_log_err(cx);
     }
 
-    fn apply_room_status(&mut self, room: ServerRoom, cx: &mut Context<Self>) -> bool {
+    fn apply_room_status(&mut self, room: ServerRoom) -> bool {
         if room.status != ServerRoomStatus::Finished {
             return true;
         }
@@ -1960,26 +1959,14 @@ impl RduelView {
                 self.room.remote_user = format!("{remote_name}：结束").into();
             }
         }
-        self.lock_match(cx);
+        self.room.match_state.room_status = ServerRoomStatus::Finished;
         false
     }
 
-    fn lock_match(&mut self, cx: &mut Context<Self>) {
-        self.room.match_state.player_id = None;
-        self.room.match_state.room_id = None;
-        self.main_rs_editor.update(cx, |editor, _| {
-            editor.set_read_only(true);
-        });
-        self.cargo_toml_editor.update(cx, |editor, _| {
-            editor.set_read_only(true);
-        });
-    }
-
-    fn is_match_playing(&self) -> bool {
-        self.room.match_state.player_id.is_some() && self.room.match_state.room_id.is_some()
-    }
-
     fn leave_active_match(&mut self, cx: &mut Context<Self>) {
+        if self.room.match_state.room_status != ServerRoomStatus::Playing {
+            return;
+        }
         let Some(player_id) = self.room.match_state.player_id.take() else {
             return;
         };
@@ -2107,7 +2094,6 @@ impl RduelView {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_match_playing = self.is_match_playing();
         let is_command_running = self.command_status.is_running();
         h_flex()
             .w_full()
@@ -2140,7 +2126,7 @@ impl RduelView {
                     .child(
                         Button::new("rduel-run-samples", "Test")
                             .size(ButtonSize::Compact)
-                            .disabled(is_command_running || !is_match_playing)
+                            .disabled(is_command_running)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.run_samples(&RunSamples, window, cx);
                             })),
@@ -2149,7 +2135,7 @@ impl RduelView {
                         Button::new("rduel-submit", "Submit")
                             .size(ButtonSize::Compact)
                             .style(ButtonStyle::Filled)
-                            .disabled(is_command_running || !is_match_playing)
+                            .disabled(is_command_running)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_solution(&SubmitSolution, window, cx);
                             })),
@@ -2157,7 +2143,7 @@ impl RduelView {
                     .child(
                         Button::new("rduel-complete", "Complete")
                             .size(ButtonSize::Compact)
-                            .disabled(is_command_running || !is_match_playing)
+                            .disabled(is_command_running)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.complete_match(&CompleteMatch, window, cx);
                             })),
@@ -2456,7 +2442,7 @@ impl Item for RduelView {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        self.has_unsaved_solution_buffers(cx) || self.is_match_playing()
+        self.has_unsaved_solution_buffers(cx)
     }
 
     fn can_save(&self, _cx: &App) -> bool {
@@ -2464,7 +2450,7 @@ impl Item for RduelView {
     }
 
     fn can_autosave(&self, cx: &App) -> bool {
-        !self.is_match_playing() && self.has_unsaved_solution_buffers(cx)
+        self.has_unsaved_solution_buffers(cx)
     }
 
     fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {

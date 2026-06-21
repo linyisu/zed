@@ -107,14 +107,6 @@ impl RduelRooms {
             name: request.name,
         };
 
-        let removed_count = self.remove_waiting_players_by_name(&player.name);
-        if removed_count > 0 {
-            log::info!(
-                "replaced {removed_count} stale Rduel waiting player(s) for AtCoder user {}",
-                player.name
-            );
-        }
-
         if let Some(location) = self.players.get(&player.id).cloned() {
             return JoinDecision::Respond(match location {
                 PlayerLocation::Waiting => JoinResponse::Waiting {
@@ -139,15 +131,35 @@ impl RduelRooms {
             });
         }
 
+        let removed_count = self.remove_waiting_players_by_name_except(&player.name, &player.id);
+        if removed_count > 0 {
+            log::info!(
+                "replaced {removed_count} stale Rduel waiting player(s) for AtCoder user {}",
+                player.name
+            );
+        }
+
         let Some(opponent) = self.waiting_players.pop_front() else {
             self.players
                 .insert(player.id.clone(), PlayerLocation::Waiting);
             self.waiting_players.push_back(player.clone());
+            log::info!(
+                "Rduel player {} ({}) entered matchmaking queue",
+                player.id,
+                player.name
+            );
             return JoinDecision::Respond(JoinResponse::Waiting {
                 player_id: player.id,
             });
         };
 
+        log::info!(
+            "matching Rduel players {} ({}) and {} ({})",
+            opponent.id,
+            opponent.name,
+            player.id,
+            player.name
+        );
         JoinDecision::CreateRoom { opponent, player }
     }
 
@@ -254,10 +266,14 @@ impl RduelRooms {
         }
     }
 
-    fn remove_waiting_players_by_name(&mut self, player_name: &str) -> usize {
+    fn remove_waiting_players_by_name_except(
+        &mut self,
+        player_name: &str,
+        keep_player_id: &str,
+    ) -> usize {
         let mut removed_player_ids = Vec::new();
         self.waiting_players.retain(|player| {
-            if player.name == player_name {
+            if player.name == player_name && player.id != keep_player_id {
                 removed_player_ids.push(player.id.clone());
                 false
             } else {
@@ -1061,4 +1077,68 @@ fn load_problem_pool(path: &PathBuf) -> anyhow::Result<Vec<Problem>> {
         "Rduel problem config produced no problems"
     );
     Ok(problems)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_rooms() -> RduelRooms {
+        RduelRooms::new(vec![Problem {
+            id: "abc001_a".to_string(),
+            title: "abc001_a".to_string(),
+            url: "https://atcoder.jp/contests/abc001/tasks/abc001_a".to_string(),
+            statement_markdown: String::new(),
+            samples: Vec::new(),
+        }])
+    }
+
+    fn join_request(player_id: &str, name: &str) -> JoinRequest {
+        JoinRequest {
+            name: name.to_string(),
+            player_id: Some(player_id.to_string()),
+        }
+    }
+
+    #[test]
+    fn repeated_join_keeps_waiting_player_queued() {
+        let mut rooms = test_rooms();
+
+        assert!(matches!(
+            rooms.join(join_request("player-1", "atcoder-user-a")),
+            JoinDecision::Respond(JoinResponse::Waiting { player_id }) if player_id == "player-1"
+        ));
+        assert!(matches!(
+            rooms.join(join_request("player-1", "atcoder-user-a")),
+            JoinDecision::Respond(JoinResponse::Waiting { player_id }) if player_id == "player-1"
+        ));
+
+        assert_eq!(rooms.waiting_players.len(), 1);
+        assert_eq!(rooms.waiting_players[0].id, "player-1");
+
+        assert!(matches!(
+            rooms.join(join_request("player-2", "atcoder-user-b")),
+            JoinDecision::CreateRoom { opponent, player }
+                if opponent.id == "player-1" && player.id == "player-2"
+        ));
+    }
+
+    #[test]
+    fn new_connection_replaces_same_atcoder_user_in_queue() {
+        let mut rooms = test_rooms();
+
+        assert!(matches!(
+            rooms.join(join_request("old-player", "atcoder-user-a")),
+            JoinDecision::Respond(JoinResponse::Waiting { .. })
+        ));
+        assert!(matches!(
+            rooms.join(join_request("new-player", "atcoder-user-a")),
+            JoinDecision::Respond(JoinResponse::Waiting { player_id }) if player_id == "new-player"
+        ));
+
+        assert!(!rooms.players.contains_key("old-player"));
+        assert!(rooms.players.contains_key("new-player"));
+        assert_eq!(rooms.waiting_players.len(), 1);
+        assert_eq!(rooms.waiting_players[0].id, "new-player");
+    }
 }

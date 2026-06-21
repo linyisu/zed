@@ -173,19 +173,18 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// Hides or shows the panel layout actions in the command palette based on
-/// whether AI is currently disabled.
+/// Keeps the classic layout action available while hiding the agentic layout
+/// action when AI is disabled.
 fn update_layout_action_filter(cx: &mut App) {
     let disable_ai = project::DisableAiSettings::get_global(cx).disable_ai;
-    let layout_actions = [
-        TypeId::of::<UseClassicLayout>(),
-        TypeId::of::<UseAgenticLayout>(),
-    ];
+    let classic_layout_action = TypeId::of::<UseClassicLayout>();
+    let agentic_layout_action = TypeId::of::<UseAgenticLayout>();
     CommandPaletteFilter::update_global(cx, |filter, _| {
+        filter.show_action_types([classic_layout_action].iter());
         if disable_ai {
-            filter.hide_action_types(&layout_actions);
+            filter.hide_action_types(&[agentic_layout_action]);
         } else {
-            filter.show_action_types(layout_actions.iter());
+            filter.show_action_types([agentic_layout_action].iter());
         }
     });
 }
@@ -1393,35 +1392,38 @@ impl TitleBar {
                         "Extensions",
                         zed_actions::Extensions::default().boxed_clone(),
                     )
-                    .when(ai_enabled, |menu| {
-                        menu.separator()
-                            .submenu("Panel Layout", move |menu, _window, _cx| {
-                                menu.toggleable_entry(
-                                    "Classic",
-                                    is_editor,
-                                    IconPosition::Start,
-                                    Some(UseClassicLayout.boxed_clone()),
-                                    move |window, cx| {
-                                        window.dispatch_action(UseClassicLayout.boxed_clone(), cx);
-                                    },
-                                )
-                                .toggleable_entry(
-                                    "Agentic",
-                                    is_agent,
-                                    IconPosition::Start,
-                                    Some(UseAgenticLayout.boxed_clone()),
-                                    move |window, cx| {
-                                        window.dispatch_action(UseAgenticLayout.boxed_clone(), cx);
-                                    },
-                                )
-                                .when(is_custom, |menu| {
-                                    menu.item(
-                                        ContextMenuEntry::new("Custom")
-                                            .toggleable(IconPosition::Start, true)
-                                            .disabled(true),
-                                    )
-                                })
-                            })
+                    .separator()
+                    .submenu("Panel Layout", move |menu, _window, _cx| {
+                        menu.toggleable_entry(
+                            "Classic",
+                            is_editor,
+                            IconPosition::Start,
+                            Some(UseClassicLayout.boxed_clone()),
+                            move |window, cx| {
+                                window.dispatch_action(UseClassicLayout.boxed_clone(), cx);
+                            },
+                        )
+                        .when(ai_enabled, |menu| {
+                            menu.toggleable_entry(
+                                "Agentic",
+                                is_agent,
+                                IconPosition::Start,
+                                Some(UseAgenticLayout.boxed_clone()),
+                                move |window, cx| {
+                                    window.dispatch_action(UseAgenticLayout.boxed_clone(), cx);
+                                },
+                            )
+                        })
+                        .when(!ai_enabled, |menu| {
+                            menu.item(ContextMenuEntry::new("Agentic").disabled(true))
+                        })
+                        .when(is_custom, |menu| {
+                            menu.item(
+                                ContextMenuEntry::new("Custom")
+                                    .toggleable(IconPosition::Start, true)
+                                    .disabled(true),
+                            )
+                        })
                     })
                     .when(is_signed_in, |this| {
                         this.separator()
