@@ -1,12 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
 
 use anyhow::Context as _;
-use async_compression::futures::bufread::GzipDecoder;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -15,13 +14,14 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use futures_lite::{AsyncReadExt, io::BufReader};
 use html_to_markdown::{TagHandler, convert_html_to_markdown, markdown};
 use rand::prelude::IndexedRandom;
-use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
+use reqwest::header::COOKIE;
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
+use time::{OffsetDateTime, format_description::FormatItem};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, interval};
 use uuid::Uuid;
@@ -34,6 +34,8 @@ struct Args {
     port: u16,
     #[arg(long, default_value = "crates/rduel_server/problems.json")]
     problem_config: PathBuf,
+    #[arg(long)]
+    session_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -42,7 +44,10 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let address = SocketAddr::new(args.host, args.port);
-    let state = ServerState::new(load_problem_pool(&args.problem_config)?);
+    let state = ServerState::new(
+        load_problem_pool(&args.problem_config)?,
+        load_atcoder_revel_session(args.session_file.as_deref())?,
+    );
 
     let app = Router::new()
         .route("/health", get(health))
@@ -72,12 +77,14 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Clone)]
 struct ServerState {
     rooms: Arc<Mutex<RduelRooms>>,
+    atcoder_revel_session: Option<Arc<str>>,
 }
 
 impl ServerState {
-    fn new(problems: Vec<Problem>) -> Self {
+    fn new(problems: Vec<Problem>, atcoder_revel_session: Option<String>) -> Self {
         Self {
             rooms: Arc::new(Mutex::new(RduelRooms::new(problems))),
+            atcoder_revel_session: atcoder_revel_session.map(Arc::from),
         }
     }
 }
@@ -622,8 +629,12 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
             room
         };
 
-        let Some((player_id, submission)) =
-            earliest_ac_submission(&room, &mut last_fetch_errors).await
+        let Some((player_id, submission)) = earliest_ac_submission(
+            &room,
+            state.atcoder_revel_session.as_deref(),
+            &mut last_fetch_errors,
+        )
+        .await
         else {
             continue;
         };
@@ -641,6 +652,7 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
 
 async fn earliest_ac_submission(
     room: &Room,
+    atcoder_revel_session: Option<&str>,
     last_fetch_errors: &mut HashMap<String, String>,
 ) -> Option<(String, AtCoderSubmission)> {
     let mut earliest: Option<(String, AtCoderSubmission)> = None;
@@ -649,8 +661,13 @@ async fn earliest_ac_submission(
         let Some(atcoder_user) = room.atcoder_users.get(&player.id) else {
             continue;
         };
-        let from_second = room.started_at_second.saturating_sub(60);
-        let submissions = match fetch_user_submissions(atcoder_user, from_second).await {
+        let submissions = match fetch_user_submissions(
+            atcoder_user,
+            &room.problem,
+            atcoder_revel_session,
+        )
+        .await
+        {
             Ok(submissions) => {
                 last_fetch_errors.remove(atcoder_user);
                 submissions
@@ -695,40 +712,138 @@ async fn earliest_ac_submission(
 
 async fn fetch_user_submissions(
     atcoder_user: &str,
-    from_second: i64,
+    problem: &Problem,
+    atcoder_revel_session: Option<&str>,
 ) -> anyhow::Result<Vec<AtCoderSubmission>> {
-    let url = format!(
-        "https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={atcoder_user}&from_second={from_second}"
-    );
-    let response = reqwest::Client::new()
-        .get(&url)
-        .header(ACCEPT_ENCODING, "gzip")
-        .send()
-        .await
-        .context("requesting AtCoder submissions")?
-        .error_for_status()
-        .context("AtCoder submissions API returned an error status")?;
-    let content_encoding = response
-        .headers()
-        .get(CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let response = response
-        .bytes()
-        .await
-        .context("reading AtCoder submissions")?;
-    let response = if content_encoding.as_deref() == Some("gzip") {
-        let mut decoder = GzipDecoder::new(BufReader::new(response.as_ref()));
-        let mut decoded = String::new();
-        decoder
-            .read_to_string(&mut decoded)
-            .await
-            .context("decompressing AtCoder submissions")?;
-        decoded
-    } else {
-        String::from_utf8(response.to_vec()).context("decoding AtCoder submissions")?
+    let revel_session = match atcoder_revel_session {
+        Some(revel_session) if !revel_session.trim().is_empty() => revel_session,
+        _ => anyhow::bail!(
+            "AtCoder REVEL_SESSION is not configured; skipping AtCoder submissions fetch"
+        ),
     };
-    Ok(serde_json::from_str(&response).context("parsing AtCoder submissions")?)
+
+    let contest_id = contest_id_from_problem_id(&problem.id)
+        .with_context(|| format!("deriving AtCoder contest from problem {}", problem.id))?;
+    let client = reqwest::Client::builder()
+        .redirect_policy(reqwest::redirect::Policy::none())
+        .user_agent("rduel-server/0.1")
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("building AtCoder submissions HTTP client")?;
+    let mut submissions = Vec::new();
+
+    for page in 1.. {
+        let url = format!(
+            "https://atcoder.jp/contests/{contest_id}/submissions?f.User={atcoder_user}&f.Task={}&page={page}",
+            problem.id
+        );
+        let response = client
+            .get(&url)
+            .header(COOKIE, format!("REVEL_SESSION={}", revel_session.trim()))
+            .send()
+            .await
+            .with_context(|| format!("requesting AtCoder submissions page {url}"))?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("unknown");
+            anyhow::bail!(
+                "AtCoder redirected submissions request to {location}; login session may be invalid"
+            );
+        }
+        let response = response
+            .error_for_status()
+            .context("AtCoder submissions page returned an error status")?;
+        let html = response
+            .text()
+            .await
+            .context("reading AtCoder submissions page")?;
+        let page_submissions = parse_atcoder_submissions_page(&html, &problem.id)?;
+        if page_submissions.is_empty() {
+            break;
+        }
+        submissions.extend(page_submissions);
+        if page >= 20 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    Ok(submissions)
+}
+
+fn contest_id_from_problem_id(problem_id: &str) -> Option<&str> {
+    problem_id.split_once('_').map(|(contest_id, _)| contest_id)
+}
+
+fn parse_atcoder_submissions_page(
+    html: &str,
+    problem_id: &str,
+) -> anyhow::Result<Vec<AtCoderSubmission>> {
+    let document = Html::parse_document(html);
+    let row_selector = html_selector("table.table-bordered tbody tr")?;
+    let time_selector = html_selector("td:first-child time")?;
+    let result_selector = html_selector("td:nth-child(7) span")?;
+    let details_selector = html_selector("td:last-child a.submission-details-link")?;
+    let time_format = time::format_description::parse(
+        "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour][offset_minute]",
+    )
+    .context("building AtCoder submission time parser")?;
+
+    let mut submissions = Vec::new();
+    for row in document.select(&row_selector) {
+        let Some(details) = row.select(&details_selector).next() else {
+            continue;
+        };
+        let Some(href) = details.value().attr("href") else {
+            continue;
+        };
+        let Ok(id) = href
+            .split('/')
+            .next_back()
+            .unwrap_or_default()
+            .parse::<i64>()
+        else {
+            continue;
+        };
+
+        let Some(time) = row.select(&time_selector).next() else {
+            continue;
+        };
+        let time_text = time.text().collect::<String>();
+        let Ok(epoch_second) = parse_atcoder_submission_time(time_text.trim(), &time_format) else {
+            continue;
+        };
+        let result = row
+            .select(&result_selector)
+            .next()
+            .map(|element| element.text().collect::<String>())
+            .unwrap_or_default();
+
+        submissions.push(AtCoderSubmission {
+            id,
+            epoch_second,
+            problem_id: problem_id.to_string(),
+            user_id: String::new(),
+            result,
+        });
+    }
+
+    Ok(submissions)
+}
+
+fn parse_atcoder_submission_time(
+    time_text: &str,
+    time_format: &[FormatItem],
+) -> anyhow::Result<i64> {
+    Ok(OffsetDateTime::parse(time_text, time_format)?.unix_timestamp())
+}
+
+fn html_selector(selector: &str) -> anyhow::Result<Selector> {
+    Selector::parse(selector)
+        .map_err(|error| anyhow::anyhow!("invalid selector {selector}: {error}"))
 }
 
 enum ApiError {
@@ -1081,6 +1196,44 @@ fn html_unescape(text: &str) -> String {
         .replace("&#39;", "'")
 }
 
+fn load_atcoder_revel_session(session_file: Option<&FsPath>) -> anyhow::Result<Option<String>> {
+    if let Ok(revel_session) = std::env::var("ATCODER_REVEL_SESSION")
+        && !revel_session.trim().is_empty()
+    {
+        return Ok(Some(revel_session.trim().to_string()));
+    }
+
+    let path = match session_file {
+        Some(path) => path.to_path_buf(),
+        None => default_atcoder_revel_session_path()
+            .context("could not resolve default AtCoder session file path")?,
+    };
+    if !path.exists() {
+        log::warn!(
+            "AtCoder session file {} does not exist; submission polling will be disabled",
+            path.display()
+        );
+        return Ok(None);
+    }
+
+    let revel_session = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading AtCoder session file {}", path.display()))?
+        .trim()
+        .to_string();
+    if revel_session.is_empty() {
+        log::warn!(
+            "AtCoder session file {} is empty; submission polling will be disabled",
+            path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(revel_session))
+}
+
+fn default_atcoder_revel_session_path() -> Option<PathBuf> {
+    Some(PathBuf::from("crates/rduel_server/atcoder_revel_session"))
+}
+
 fn load_problem_pool(path: &PathBuf) -> anyhow::Result<Vec<Problem>> {
     let config_text = std::fs::read_to_string(path)
         .with_context(|| format!("reading Rduel problem config {}", path.display()))?;
@@ -1170,5 +1323,34 @@ mod tests {
         assert!(rooms.players.contains_key("new-player"));
         assert_eq!(rooms.waiting_players.len(), 1);
         assert_eq!(rooms.waiting_players[0].id, "new-player");
+    }
+
+    #[test]
+    fn parses_atcoder_submissions_page() {
+        let html = r#"
+            <table class="table table-bordered">
+                <tbody>
+                    <tr>
+                        <td><time>2026-06-22 01:20:03+0900</time></td>
+                        <td>user</td>
+                        <td>task</td>
+                        <td><a>Rust</a></td>
+                        <td>200</td>
+                        <td>1024 Byte</td>
+                        <td><span>AC</span></td>
+                        <td>12 ms</td>
+                        <td><a class="submission-details-link" href="/contests/abc001/submissions/12345">Detail</a></td>
+                    </tr>
+                </tbody>
+            </table>
+        "#;
+
+        let submissions = parse_atcoder_submissions_page(html, "abc001_a").unwrap();
+
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].id, 12345);
+        assert_eq!(submissions[0].problem_id, "abc001_a");
+        assert_eq!(submissions[0].result, "AC");
+        assert_eq!(submissions[0].epoch_second, 1782058803);
     }
 }

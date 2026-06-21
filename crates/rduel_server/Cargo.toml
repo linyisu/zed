@@ -23,6 +23,7 @@ html_to_markdown.workspace = true
 log.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+scraper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true

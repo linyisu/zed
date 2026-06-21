@@ -114,10 +114,6 @@ pub struct SubmitSolution;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = rduel)]
-pub struct CompleteMatch;
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
-#[action(namespace = rduel)]
 pub struct ToggleLayout;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
@@ -482,11 +478,6 @@ struct JoinRequest {
     player_id: Option<String>,
 }
 
-#[derive(Serialize)]
-struct CompleteRoomRequest {
-    player_id: String,
-}
-
 #[derive(Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum JoinResponse {
@@ -563,11 +554,6 @@ enum RduelMatchCommand {
     WatchSubmissions {
         server_url: String,
         room_id: String,
-    },
-    Complete {
-        server_url: String,
-        room_id: String,
-        player_id: String,
     },
     Leave {
         server_url: String,
@@ -1069,20 +1055,6 @@ impl RduelMatchCommand {
             } => {
                 let path = format!("/rooms/{room_id}/watch-submissions");
                 let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "POST", &path, None)?;
-                Ok(RduelMatchOutput::RoomStatus { room })
-            }
-            Self::Complete {
-                server_url,
-                room_id,
-                player_id,
-            } => {
-                let path = format!("/rooms/{room_id}/complete");
-                let room: ServerRoom = rduel_http_json(
-                    &server_url,
-                    "POST",
-                    &path,
-                    Some(&CompleteRoomRequest { player_id }),
-                )?;
                 Ok(RduelMatchOutput::RoomStatus { room })
             }
             Self::Leave {
@@ -1740,52 +1712,6 @@ impl RduelView {
         .detach_and_log_err(cx);
     }
 
-    fn complete_match(&mut self, _: &CompleteMatch, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.command_status.is_running() {
-            return;
-        }
-        if self.room.match_state.room_status != ServerRoomStatus::Playing {
-            return;
-        }
-        let (Some(room_id), Some(player_id), server_url) = (
-            self.room.match_state.room_id.clone(),
-            self.room.match_state.player_id.clone(),
-            self.room.match_state.server_url.clone(),
-        ) else {
-            return;
-        };
-
-        self.command_status = CommandStatus::Running("Complete");
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    RduelMatchCommand::Complete {
-                        server_url,
-                        room_id,
-                        player_id,
-                    }
-                    .run()
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(RduelMatchOutput::RoomStatus { room }) => {
-                        this.command_status = CommandStatus::Succeeded;
-                        this.apply_room_status(room);
-                    }
-                    Ok(RduelMatchOutput::Waiting { .. } | RduelMatchOutput::Matched { .. }) => {}
-                    Err(error) => {
-                        this.command_status = CommandStatus::Failed;
-                        log::warn!("failed to manually complete Rduel room: {error:#}");
-                    }
-                }
-                cx.notify();
-            })
-        })
-        .detach_and_log_err(cx);
-    }
-
     fn spawn_rduel_command(
         &mut self,
         label: &'static str,
@@ -2142,14 +2068,6 @@ impl RduelView {
                             .disabled(is_command_running)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_solution(&SubmitSolution, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("rduel-complete", "Complete")
-                            .size(ButtonSize::Compact)
-                            .disabled(is_command_running)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.complete_match(&CompleteMatch, window, cx);
                             })),
                     ),
             )
@@ -2542,7 +2460,6 @@ impl Render for RduelView {
             .bg(cx.theme().colors().editor_background)
             .on_action(cx.listener(Self::run_samples))
             .on_action(cx.listener(Self::submit_solution))
-            .on_action(cx.listener(Self::complete_match))
             .on_action(cx.listener(Self::toggle_layout))
             .on_action(cx.listener(Self::select_main_rs))
             .on_action(cx.listener(Self::select_cargo_toml))
