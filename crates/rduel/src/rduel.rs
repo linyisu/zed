@@ -699,6 +699,10 @@ impl RduelMatchModal {
     }
 
     fn leave_matchmaking(&mut self, cx: &mut Context<Self>) {
+        if !self.is_waiting {
+            self.player_id = None;
+            return;
+        }
         let Some(player_id) = self.player_id.take() else {
             return;
         };
@@ -729,6 +733,7 @@ impl RduelMatchModal {
             Ok(RduelMatchOutput::Matched { player_id, room }) => {
                 self.status = "匹配成功，正在打开 Rduel...".into();
                 self.is_waiting = false;
+                self.player_id = None;
                 let atcoder_user = self
                     .atcoder_user_editor
                     .read(cx)
@@ -940,14 +945,16 @@ async fn run_rduel_submit(
 ) -> anyhow::Result<RduelCommandOutput> {
     let test_output = run_rduel_test(root_path, test_path, target_path).await?;
     if !test_output.success {
-        return Ok(RduelCommandOutput {
-            success: false,
-            rendered: format!(
-                "{}\n\nSubmit was stopped because local tests failed.",
-                test_output.rendered
-            ),
-            submit_ready: None,
-        });
+        if test_output.rendered.starts_with("Build failed.") {
+            return Ok(RduelCommandOutput {
+                success: false,
+                rendered: format!(
+                    "{}\n\nSubmit was stopped because the solution did not build.",
+                    test_output.rendered
+                ),
+                submit_ready: None,
+            });
+        }
     }
 
     let source_path = problem_rs_path;
@@ -958,7 +965,7 @@ async fn run_rduel_submit(
     Ok(RduelCommandOutput {
         success: true,
         rendered: format!(
-            "{}\n\nSubmit: ready\nSource file: {}\nSubmit page: {}\n\nThe task is preselected when AtCoder accepts taskScreenName. Source code was copied to the system clipboard.",
+            "{}\n\nSubmit: ready\nSource file: {}\nSubmit page: {}\n\nLocal sample failures do not block submit because some tasks use special judges. The task is preselected when AtCoder accepts taskScreenName. Source code was copied to the system clipboard.",
             test_output.rendered,
             source_path.display(),
             submit_url,
