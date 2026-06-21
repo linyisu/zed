@@ -47,15 +47,57 @@ pub struct RduelSettings {
 impl Settings for RduelSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let rduel = content.rduel.as_ref();
+        let local_config = LocalRduelConfig::load();
         Self {
             atcoder_user: rduel
                 .and_then(|settings| settings.atcoder_user.clone())
+                .filter(|atcoder_user| !atcoder_user.trim().is_empty())
+                .or_else(|| {
+                    local_config
+                        .as_ref()
+                        .and_then(|config| config.atcoder_user.clone())
+                })
                 .unwrap_or_default(),
             server_url: rduel
                 .and_then(|settings| settings.server_url.clone())
                 .filter(|server_url| !server_url.trim().is_empty())
+                .or_else(|| local_config.and_then(|config| config.server_url))
                 .unwrap_or_else(|| DEFAULT_RDUEL_SERVER_URL.to_string()),
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct LocalRduelConfig {
+    atcoder_user: Option<String>,
+    server_url: Option<String>,
+}
+
+impl LocalRduelConfig {
+    fn path() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        Some(PathBuf::from(home).join(".rduel").join("config.json"))
+    }
+
+    fn load() -> Option<Self> {
+        let path = Self::path()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    fn save_atcoder_user_and_server_url(
+        atcoder_user: &str,
+        server_url: &str,
+    ) -> anyhow::Result<()> {
+        let path = Self::path().ok_or_else(|| anyhow::anyhow!("could not resolve ~/.rduel"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut config = Self::load().unwrap_or_default();
+        config.atcoder_user = Some(atcoder_user.to_string());
+        config.server_url = Some(server_url.to_string());
+        std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
+        Ok(())
     }
 }
 
@@ -81,7 +123,8 @@ pub struct SelectCargoToml;
 
 pub fn init(cx: &mut App) {
     RduelSettings::register(cx);
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+    cx.observe_new(|workspace: &mut Workspace, _window, cx| {
+        cleanup_legacy_rduel_worktree(workspace, cx);
         workspace.register_action(|workspace, _: &OpenRduel, window, cx| {
             open_rduel(workspace, window, cx);
         });
@@ -90,9 +133,23 @@ pub fn init(cx: &mut App) {
 }
 
 fn open_rduel(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    cleanup_legacy_rduel_worktree(workspace, cx);
     let workspace_handle = cx.entity().downgrade();
     workspace.toggle_modal(window, cx, |window, cx| {
         RduelMatchModal::new(workspace_handle, window, cx)
+    });
+}
+
+fn cleanup_legacy_rduel_worktree(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return;
+    };
+    let rduel_path = PathBuf::from(home).join(".rduel");
+    let legacy_problem_path = rduel_path.join("abc001").join("a");
+    let legacy_contest_path = rduel_path.join("abc001");
+    workspace.project().update(cx, |project, cx| {
+        project.remove_worktree_for_main_worktree_path(&legacy_problem_path, cx);
+        project.remove_worktree_for_main_worktree_path(&legacy_contest_path, cx);
     });
 }
 
@@ -133,6 +190,13 @@ fn open_rduel_session(
                 }
             };
 
+            if let (Some(rduel_project), Some(room)) =
+                (rduel_project.as_ref(), session.room.as_ref())
+                && let Err(error) = write_server_problem_to_project(rduel_project, &room.problem)
+            {
+                log::error!("failed to write Rduel server problem: {error:#}");
+            }
+
             let main_rs_buffer = if let Some(rduel_project) = rduel_project.as_ref() {
                 open_rduel_project_buffer(workspace.clone(), rduel_project, "src/main.rs", cx).await
             } else {
@@ -145,13 +209,6 @@ fn open_rduel_session(
             };
             let fallback_rust = language_registry.language_for_name("Rust").await.log_err();
             let fallback_toml = language_registry.language_for_name("TOML").await.log_err();
-
-            if let (Some(rduel_project), Some(room)) =
-                (rduel_project.as_ref(), session.room.as_ref())
-                && let Err(error) = write_server_problem_to_project(rduel_project, &room.problem)
-            {
-                log::error!("failed to write Rduel server problem: {error:#}");
-            }
 
             let session_for_view = session.clone();
             let Some(rduel) = workspace
@@ -410,12 +467,6 @@ struct JoinRequest {
     player_id: Option<String>,
 }
 
-#[derive(Serialize)]
-struct SetAtCoderUserRequest {
-    player_id: String,
-    atcoder_user: String,
-}
-
 #[derive(Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum JoinResponse {
@@ -480,12 +531,6 @@ enum RduelMatchCommand {
         server_url: String,
         room_id: String,
     },
-    SetAtCoderUser {
-        server_url: String,
-        room_id: String,
-        player_id: String,
-        atcoder_user: String,
-    },
 }
 
 enum RduelMatchOutput {
@@ -531,19 +576,20 @@ impl RduelMatchModal {
     fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = RduelSettings::get_global(cx);
         let configured_atcoder_user = settings.atcoder_user.trim().to_string();
+        let editor_atcoder_user = configured_atcoder_user.clone();
         let configured_server_url = settings.server_url.trim().to_string();
         let atcoder_user_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("AtCoder username", window, cx);
-            if !configured_atcoder_user.is_empty() {
-                editor.set_text(configured_atcoder_user, window, cx);
+            if !editor_atcoder_user.is_empty() {
+                editor.set_text(editor_atcoder_user, window, cx);
                 editor.select_all(&editor::actions::SelectAll, window, cx);
             }
             editor
         });
         window.focus(&atcoder_user_editor.read(cx).focus_handle(cx), cx);
 
-        Self {
+        let mut modal = Self {
             focus_handle: cx.focus_handle(),
             workspace,
             atcoder_user_editor,
@@ -551,7 +597,11 @@ impl RduelMatchModal {
             player_id: None,
             status: "输入 AtCoder 用户名后开始匹配。".into(),
             is_waiting: false,
+        };
+        if !configured_atcoder_user.is_empty() {
+            modal.join(window, cx);
         }
+        modal
     }
 
     fn join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -566,6 +616,16 @@ impl RduelMatchModal {
             cx.notify();
             return;
         }
+
+        let server_url = self.server_url.clone();
+        let atcoder_user_for_config = atcoder_user.clone();
+        cx.background_spawn(async move {
+            LocalRduelConfig::save_atcoder_user_and_server_url(
+                &atcoder_user_for_config,
+                &server_url,
+            )
+        })
+        .detach_and_log_err(cx);
 
         self.status = "正在匹配对手...".into();
         self.is_waiting = true;
@@ -633,24 +693,12 @@ impl RduelMatchModal {
                     .text(cx)
                     .trim()
                     .to_string();
-                let room_id = room.id.clone();
                 let session = RduelSession {
                     player_id: player_id.clone(),
                     room: Some(room),
                     server_url: self.server_url.clone(),
                     atcoder_user: atcoder_user.clone(),
                 };
-                let server_url = self.server_url.clone();
-                cx.background_spawn(async move {
-                    RduelMatchCommand::SetAtCoderUser {
-                        server_url,
-                        room_id,
-                        player_id,
-                        atcoder_user,
-                    }
-                    .run()
-                })
-                .detach_and_log_err(cx);
                 let workspace = self.workspace.clone();
                 let window_handle = window.window_handle();
                 cx.defer(move |cx| {
@@ -859,7 +907,7 @@ async fn run_rduel_submit(
     Ok(RduelCommandOutput {
         success: true,
         rendered: format!(
-            "{}\n\nSubmit: ready\nSource file: {}\nSubmit page: {}\n\nSource code was copied to the system clipboard. Paste it into AtCoder and submit from the browser.",
+            "{}\n\nSubmit: ready\nSource file: {}\nSubmit page: {}\n\nThe task is preselected when AtCoder accepts taskScreenName. Source code was copied to the system clipboard.",
             test_output.rendered,
             source_path.display(),
             submit_url,
@@ -886,8 +934,14 @@ fn read_problem_url(cargo_toml_path: &Path) -> Option<String> {
 }
 
 fn atcoder_submit_url(problem_url: &str) -> Option<String> {
-    let (prefix, _) = problem_url.split_once("/tasks/")?;
-    Some(format!("{prefix}/submit"))
+    let (contest_url, task_screen_name) = problem_url.split_once("/tasks/")?;
+    let task_screen_name = task_screen_name
+        .split(['?', '#'])
+        .next()
+        .filter(|task_screen_name| !task_screen_name.is_empty())?;
+    Some(format!(
+        "{contest_url}/submit?taskScreenName={task_screen_name}"
+    ))
 }
 
 impl RduelMatchCommand {
@@ -933,24 +987,6 @@ impl RduelMatchCommand {
             } => {
                 let path = format!("/rooms/{room_id}");
                 let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "GET", &path, None)?;
-                Ok(RduelMatchOutput::RoomStatus { room })
-            }
-            Self::SetAtCoderUser {
-                server_url,
-                room_id,
-                player_id,
-                atcoder_user,
-            } => {
-                let path = format!("/rooms/{room_id}/atcoder-user");
-                let room: ServerRoom = rduel_http_json(
-                    &server_url,
-                    "POST",
-                    &path,
-                    Some(&SetAtCoderUserRequest {
-                        player_id,
-                        atcoder_user,
-                    }),
-                )?;
                 Ok(RduelMatchOutput::RoomStatus { room })
             }
         }

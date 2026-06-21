@@ -91,7 +91,7 @@ impl RduelRooms {
         }
     }
 
-    async fn join(&mut self, request: JoinRequest) -> JoinResponse {
+    fn join(&mut self, request: JoinRequest) -> JoinDecision {
         let player = Player {
             id: request
                 .player_id
@@ -100,32 +100,42 @@ impl RduelRooms {
         };
 
         if let Some(location) = self.players.get(&player.id).cloned() {
-            return match location {
+            return JoinDecision::Respond(match location {
                 PlayerLocation::Waiting => JoinResponse::Waiting {
                     player_id: player.id,
                 },
                 PlayerLocation::Room { room_id } => {
-                    let room = self.rooms.get(&room_id).cloned();
-                    JoinResponse::Matched {
-                        player_id: player.id,
-                        room: room.expect("room location must point to an existing room"),
+                    if let Some(room) = self.rooms.get(&room_id).cloned() {
+                        JoinResponse::Matched {
+                            player_id: player.id,
+                            room,
+                        }
+                    } else {
+                        self.players.remove(&player.id);
+                        self.players
+                            .insert(player.id.clone(), PlayerLocation::Waiting);
+                        self.waiting_players.push_back(player.clone());
+                        JoinResponse::Waiting {
+                            player_id: player.id,
+                        }
                     }
                 }
-            };
+            });
         }
 
         let Some(opponent) = self.waiting_players.pop_front() else {
             self.players
                 .insert(player.id.clone(), PlayerLocation::Waiting);
             self.waiting_players.push_back(player.clone());
-            return JoinResponse::Waiting {
+            return JoinDecision::Respond(JoinResponse::Waiting {
                 player_id: player.id,
-            };
+            });
         };
 
-        let problem = select_problem(&self.problems)
-            .await
-            .expect("configured problem must be available");
+        JoinDecision::CreateRoom { opponent, player }
+    }
+
+    fn create_room(&mut self, opponent: Player, player: Player, problem: Problem) -> JoinResponse {
         let room = Room {
             id: Uuid::new_v4().to_string(),
             players: [opponent.clone(), player.clone()],
@@ -134,9 +144,19 @@ impl RduelRooms {
             status: RoomStatus::Playing,
             winner_player_id: None,
             winning_submission: None,
-            atcoder_users: HashMap::new(),
-            polling_submissions: false,
+            atcoder_users: HashMap::from([
+                (opponent.id.clone(), opponent.name.clone()),
+                (player.id.clone(), player.name.clone()),
+            ]),
+            polling_submissions: true,
         };
+        let room_id = room.id.clone();
+        log::info!(
+            "created Rduel room {room_id} for problem {} with AtCoder users {} and {}",
+            room.problem.id,
+            opponent.name,
+            player.name
+        );
 
         self.players.insert(
             opponent.id.clone(),
@@ -155,6 +175,18 @@ impl RduelRooms {
         JoinResponse::Matched {
             player_id: player.id,
             room,
+        }
+    }
+
+    fn requeue_pair(&mut self, opponent: Player, player: Player) -> JoinResponse {
+        self.players
+            .insert(opponent.id.clone(), PlayerLocation::Waiting);
+        self.waiting_players.push_front(opponent);
+        self.players
+            .insert(player.id.clone(), PlayerLocation::Waiting);
+        self.waiting_players.push_back(player.clone());
+        JoinResponse::Waiting {
+            player_id: player.id,
         }
     }
 
@@ -223,6 +255,11 @@ impl RduelRooms {
         });
         Some(room.clone())
     }
+}
+
+enum JoinDecision {
+    Respond(JoinResponse),
+    CreateRoom { opponent: Player, player: Player },
 }
 
 #[derive(Clone)]
@@ -336,8 +373,35 @@ async fn join_matchmaking(
     State(state): State<ServerState>,
     Json(request): Json<JoinRequest>,
 ) -> Json<JoinResponse> {
-    let mut rooms = state.rooms.lock().await;
-    Json(rooms.join(request).await)
+    let decision = {
+        let mut rooms = state.rooms.lock().await;
+        rooms.join(request)
+    };
+
+    let response = match decision {
+        JoinDecision::Respond(response) => response,
+        JoinDecision::CreateRoom { opponent, player } => {
+            match select_problem_for_server(&state).await {
+                Ok(problem) => {
+                    let response = {
+                        let mut rooms = state.rooms.lock().await;
+                        rooms.create_room(opponent, player, problem)
+                    };
+                    if let JoinResponse::Matched { room, .. } = &response {
+                        tokio::spawn(poll_room_submissions(state, room.id.clone()));
+                    }
+                    response
+                }
+                Err(error) => {
+                    log::error!("failed to select Rduel problem: {error:#}");
+                    let mut rooms = state.rooms.lock().await;
+                    rooms.requeue_pair(opponent, player)
+                }
+            }
+        }
+    };
+
+    Json(response)
 }
 
 async fn player_state(
@@ -381,7 +445,16 @@ async fn set_atcoder_user(
     Ok(Json(room))
 }
 
+async fn select_problem_for_server(state: &ServerState) -> anyhow::Result<Problem> {
+    let problems = {
+        let rooms = state.rooms.lock().await;
+        rooms.problems.clone()
+    };
+    select_problem(&problems).await
+}
+
 async fn poll_room_submissions(state: ServerState, room_id: String) {
+    log::info!("started AtCoder submission polling for Rduel room {room_id}");
     let mut ticker = interval(Duration::from_secs(3));
     loop {
         ticker.tick().await;
@@ -389,9 +462,11 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
         let room = {
             let rooms = state.rooms.lock().await;
             let Some(room) = rooms.room_state(&room_id) else {
+                log::warn!("stopping Rduel polling because room {room_id} no longer exists");
                 return;
             };
             if !matches!(room.status, RoomStatus::Playing) {
+                log::info!("stopping Rduel polling because room {room_id} is finished");
                 return;
             }
             room
@@ -402,7 +477,13 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
         };
 
         let mut rooms = state.rooms.lock().await;
-        rooms.apply_submission_ac(&room_id, &player_id, submission);
+        if let Some(room) = rooms.apply_submission_ac(&room_id, &player_id, submission) {
+            log::info!(
+                "Rduel room {room_id} finished; winner: {:?}, problem: {}",
+                room.winner_player_id,
+                room.problem.id
+            );
+        }
     }
 }
 
@@ -413,7 +494,8 @@ async fn earliest_ac_submission(room: &Room) -> Option<(String, AtCoderSubmissio
         let Some(atcoder_user) = room.atcoder_users.get(&player.id) else {
             continue;
         };
-        let submissions = match fetch_user_submissions(atcoder_user, room.started_at_second).await {
+        let from_second = room.started_at_second.saturating_sub(60);
+        let submissions = match fetch_user_submissions(atcoder_user, from_second).await {
             Ok(submissions) => submissions,
             Err(error) => {
                 log::warn!("failed to fetch submissions for {atcoder_user}: {error:#}");
@@ -429,6 +511,12 @@ async fn earliest_ac_submission(room: &Room) -> Option<(String, AtCoderSubmissio
                 continue;
             }
 
+            log::info!(
+                "found Rduel AC candidate: user={atcoder_user}, problem={}, submission={}, epoch={}",
+                submission.problem_id,
+                submission.id,
+                submission.epoch_second
+            );
             let should_replace = earliest
                 .as_ref()
                 .is_none_or(|(_, earliest)| submission.epoch_second < earliest.epoch_second);
@@ -520,6 +608,7 @@ async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
 
     let statement_html =
         extract_task_statement_html(&html).context("AtCoder task statement was not found")?;
+    let statement_html = rewrite_math_pre_blocks(&statement_html);
     let statement_html = wrap_var_tags_as_math(&statement_html);
     let mut handlers = markdown_handlers();
     let statement_markdown = convert_html_to_markdown(statement_html.as_bytes(), &mut handlers)
@@ -579,6 +668,45 @@ fn wrap_var_tags_as_math(html: &str) -> String {
         output.push_str(&html_unescape(raw_math).replace('$', "\\$"));
         output.push('$');
         remaining = &after_content_start[close_start + "</var>".len()..];
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn rewrite_math_pre_blocks(html: &str) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut remaining = html;
+
+    while let Some(pre_start) = remaining.find("<pre") {
+        output.push_str(&remaining[..pre_start]);
+        let pre_block = &remaining[pre_start..];
+        let Some(open_end) = pre_block.find('>') else {
+            output.push_str(pre_block);
+            return output;
+        };
+        let after_open = &pre_block[open_end + 1..];
+        let Some(close_start) = after_open.find("</pre>") else {
+            output.push_str(pre_block);
+            return output;
+        };
+
+        let raw_content = &after_open[..close_start];
+        let block_end = open_end + 1 + close_start + "</pre>".len();
+        if raw_content.contains("<var") {
+            for line in raw_content.trim_matches('\n').lines() {
+                let line = line.trim_end();
+                if line.is_empty() {
+                    continue;
+                }
+                output.push_str("<p>");
+                output.push_str(line);
+                output.push_str("</p>");
+            }
+        } else {
+            output.push_str(&pre_block[..block_end]);
+        }
+        remaining = &pre_block[block_end..];
     }
 
     output.push_str(remaining);
