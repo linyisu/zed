@@ -14810,6 +14810,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "rduel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "fs",
+ "gpui",
+ "language",
+ "log",
+ "markdown",
+ "project",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "smol",
+ "text",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
+name = "rduel_server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "env_logger 0.11.8",
+ "log",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "read-fonts"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22996,6 +23035,7 @@ dependencies = [
  "prompt_store",
  "proto",
  "rayon",
+ "rduel",
  "recent_projects",
  "release_channel",
  "remote",

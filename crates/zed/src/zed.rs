@@ -157,6 +157,8 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    rduel::init(cx);
+
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &Hide, cx| cx.hide());
     #[cfg(target_os = "macos")]

@@ -20,6 +20,7 @@ use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prel
 use util::ResultExt;
 use zed_actions::{
     Extensions, OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
+    rduel::OpenRduel,
 };
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
@@ -160,7 +161,7 @@ impl SectionEntry {
     }
 }
 
-const CONTENT: (Section<4>, Section<3>) = (
+const CONTENT: (Section<5>, Section<3>) = (
     Section {
         title: "Get Started",
         entries: [
@@ -186,6 +187,12 @@ const CONTENT: (Section<4>, Section<3>) = (
                 icon: IconName::ListCollapse,
                 title: "Open Command Palette",
                 action: &command_palette::Toggle,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::Code,
+                title: "Open Rduel",
+                action: &OpenRduel,
                 visibility_guard: SectionVisibility::Always,
             },
         ],

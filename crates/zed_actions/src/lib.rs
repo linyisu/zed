@@ -236,6 +236,18 @@ pub mod remote_debug {
     );
 }
 
+pub mod rduel {
+    use gpui::actions;
+
+    actions!(
+        rduel,
+        [
+            /// Opens the Rduel contest workspace prototype.
+            OpenRduel
+        ]
+    );
+}
+
 pub mod workspace {
     use gpui::actions;
 
