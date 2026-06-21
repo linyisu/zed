@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/players/:player_id", get(player_state))
         .route("/players/:player_id/leave", post(leave_player))
         .route("/rooms/:room_id", get(room_state))
+        .route("/rooms/:room_id/complete", post(complete_room))
         .route(
             "/rooms/:room_id/watch-submissions",
             post(watch_room_submissions),
@@ -283,6 +284,21 @@ impl RduelRooms {
         Some((room.clone(), should_start_polling))
     }
 
+    fn complete_room(&mut self, room_id: &str, player_id: &str) -> Option<Room> {
+        let room = self.rooms.get_mut(room_id)?;
+        if !room.players.iter().any(|player| player.id == player_id) {
+            return None;
+        }
+        if !matches!(room.status, RoomStatus::Playing) {
+            return Some(room.clone());
+        }
+
+        room.status = RoomStatus::Finished;
+        room.winner_player_id = Some(player_id.to_string());
+        room.finish_reason = Some(RoomFinishReason::ManualComplete);
+        Some(room.clone())
+    }
+
     fn apply_submission_ac(
         &mut self,
         room_id: &str,
@@ -332,6 +348,11 @@ enum PlayerLocation {
 struct JoinRequest {
     name: String,
     player_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompleteRoomRequest {
+    player_id: String,
 }
 
 #[derive(Serialize)]
@@ -420,6 +441,7 @@ enum RoomStatus {
 #[serde(rename_all = "snake_case")]
 enum RoomFinishReason {
     Accepted,
+    ManualComplete,
     PlayerLeft,
 }
 
@@ -511,6 +533,25 @@ async fn room_state(
         .room_state(&room_id)
         .map(Json)
         .ok_or(ApiError::NotFound("room was not found"))
+}
+
+async fn complete_room(
+    State(state): State<ServerState>,
+    Path(room_id): Path<String>,
+    Json(request): Json<CompleteRoomRequest>,
+) -> Result<Json<Room>, ApiError> {
+    let room = {
+        let mut rooms = state.rooms.lock().await;
+        rooms
+            .complete_room(&room_id, &request.player_id)
+            .ok_or(ApiError::NotFound("room or player was not found"))?
+    };
+    log::info!(
+        "Rduel room {room_id} manually completed by {}; winner: {:?}",
+        request.player_id,
+        room.winner_player_id
+    );
+    Ok(Json(room))
 }
 
 async fn watch_room_submissions(
