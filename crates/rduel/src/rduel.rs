@@ -9,22 +9,23 @@ use std::{
 
 use editor::{Editor, MultiBuffer};
 use gpui::{
-    Action, App, ClipboardItem, Context, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, MouseUpEvent, Render, ScrollHandle, SharedString,
-    WeakEntity, Window, div, px,
+    Action, App, ClipboardItem, Context, DismissEvent, DragMoveEvent, Empty, Entity, EventEmitter,
+    FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseUpEvent, Render, ScrollHandle,
+    SharedString, WeakEntity, Window, div, px,
 };
 use language::{Buffer, LanguageRegistry};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle, WrapButtonVisibility,
 };
+use menu::{Cancel, Confirm};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use text::{LineEnding, Rope};
 use ui::{Button, ButtonSize, ButtonStyle, prelude::*};
 use util::{ResultExt, rel_path::RelPath};
-use workspace::{Item, Workspace, item::ItemEvent, item::SaveOptions};
+use workspace::{Item, ModalView, Workspace, item::ItemEvent, item::SaveOptions};
 use zed_actions::rduel::OpenRduel;
 
 const DEFAULT_PROBLEM_WIDTH_FRACTION: f32 = 0.42;
@@ -34,7 +35,6 @@ const DEFAULT_COMMAND_OUTPUT_HEIGHT: f32 = 156.0;
 const MIN_COMMAND_OUTPUT_HEIGHT: f32 = 96.0;
 const MAX_COMMAND_OUTPUT_HEIGHT: f32 = 360.0;
 const PROBLEM_MARKDOWN_FONT_SCALE: f32 = 1.05;
-const PROBLEM_URL: &str = "https://atcoder.jp/contests/abc001/tasks/abc001_1";
 const RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
@@ -44,10 +44,6 @@ pub struct RunSamples;
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = rduel)]
 pub struct SubmitSolution;
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
-#[action(namespace = rduel)]
-pub struct JoinMatch;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = rduel)]
@@ -71,93 +67,125 @@ pub fn init(cx: &mut App) {
 }
 
 fn open_rduel(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let project = workspace.project().clone();
+    let workspace_handle = cx.entity().downgrade();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        RduelMatchModal::new(workspace_handle, window, cx)
+    });
+}
+
+fn open_rduel_session(
+    workspace: WeakEntity<Workspace>,
+    session: RduelSession,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let fs = match workspace
+        .read_with(cx, |workspace, _| workspace.app_state().fs.clone())
+        .log_err()
+    {
+        Some(fs) => fs,
+        None => return,
+    };
+    let project = match workspace
+        .read_with(cx, |workspace, _cx| workspace.project().clone())
+        .log_err()
+    {
+        Some(project) => project,
+        None => return,
+    };
     let language_registry = project.read(cx).languages().clone();
-    let fs = workspace.app_state().fs.clone();
-    cx.spawn_in(window, async move |workspace, cx| {
-        let rduel_project = match RduelProjectFiles::for_current_user() {
-            Ok(rduel_project) => match prepare_rduel_project(fs, rduel_project).await {
-                Ok(rduel_project) => Some(rduel_project),
+    window
+        .spawn(cx, async move |cx| {
+            let rduel_project = match RduelProjectFiles::for_current_user() {
+                Ok(rduel_project) => match prepare_rduel_project(fs, rduel_project).await {
+                    Ok(rduel_project) => Some(rduel_project),
+                    Err(error) => {
+                        log::error!("failed to prepare Rduel Rust project: {error:#}");
+                        None
+                    }
+                },
                 Err(error) => {
-                    log::error!("failed to prepare Rduel Rust project: {error:#}");
+                    log::error!("failed to resolve Rduel root directory: {error:#}");
                     None
                 }
-            },
-            Err(error) => {
-                log::error!("failed to resolve Rduel root directory: {error:#}");
+            };
+
+            let main_rs_buffer = if let Some(rduel_project) = rduel_project.as_ref() {
+                open_rduel_project_buffer(workspace.clone(), rduel_project, "src/main.rs", cx).await
+            } else {
                 None
+            };
+            let cargo_toml_buffer = if let Some(rduel_project) = rduel_project.as_ref() {
+                open_rduel_project_buffer(workspace.clone(), rduel_project, "Cargo.toml", cx).await
+            } else {
+                None
+            };
+            let fallback_rust = language_registry.language_for_name("Rust").await.log_err();
+            let fallback_toml = language_registry.language_for_name("TOML").await.log_err();
+
+            if let (Some(rduel_project), Some(room)) =
+                (rduel_project.as_ref(), session.room.as_ref())
+                && let Err(error) = write_server_problem_to_project(rduel_project, &room.problem)
+            {
+                log::error!("failed to write Rduel server problem: {error:#}");
             }
-        };
 
-        let main_rs_buffer = if let Some(rduel_project) = rduel_project.as_ref() {
-            open_rduel_project_buffer(workspace.clone(), rduel_project, "a/src/main.rs", cx).await
-        } else {
-            None
-        };
-        let cargo_toml_buffer = if let Some(rduel_project) = rduel_project.as_ref() {
-            open_rduel_project_buffer(workspace.clone(), rduel_project, "a/Cargo.toml", cx).await
-        } else {
-            None
-        };
-        let fallback_rust = language_registry.language_for_name("Rust").await.log_err();
-        let fallback_toml = language_registry.language_for_name("TOML").await.log_err();
-
-        let Some(rduel) = workspace
-            .update_in(cx, |workspace, window, cx| {
-                let project = workspace.project().clone();
-                let main_rs_buffer = main_rs_buffer.unwrap_or_else(|| {
-                    let buffer = cx.new(|cx| Buffer::local("", cx));
-                    buffer.update(cx, |buffer, cx| {
-                        if let Some(language) = fallback_rust {
-                            buffer.set_language(Some(language), cx);
-                        }
-                        buffer.edit([(0..0, STARTER_CODE.to_string())], None, cx);
+            let session_for_view = session.clone();
+            let Some(rduel) = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let project = workspace.project().clone();
+                    let main_rs_buffer = main_rs_buffer.unwrap_or_else(|| {
+                        let buffer = cx.new(|cx| Buffer::local("", cx));
+                        buffer.update(cx, |buffer, cx| {
+                            if let Some(language) = fallback_rust {
+                                buffer.set_language(Some(language), cx);
+                            }
+                            buffer.edit([(0..0, STARTER_CODE.to_string())], None, cx);
+                        });
+                        buffer
                     });
-                    buffer
-                });
-                let cargo_toml_buffer = cargo_toml_buffer.unwrap_or_else(|| {
-                    let buffer = cx.new(|cx| Buffer::local("", cx));
-                    buffer.update(cx, |buffer, cx| {
-                        if let Some(language) = fallback_toml {
-                            buffer.set_language(Some(language), cx);
-                        }
-                        buffer.edit([(0..0, STARTER_ACR_PROBLEM_TOML.to_string())], None, cx);
+                    let cargo_toml_buffer = cargo_toml_buffer.unwrap_or_else(|| {
+                        let buffer = cx.new(|cx| Buffer::local("", cx));
+                        buffer.update(cx, |buffer, cx| {
+                            if let Some(language) = fallback_toml {
+                                buffer.set_language(Some(language), cx);
+                            }
+                            buffer.edit([(0..0, STARTER_ACR_PROBLEM_TOML.to_string())], None, cx);
+                        });
+                        buffer
                     });
-                    buffer
-                });
-                Some(cx.new(|cx| {
-                    let view = RduelView::new(
-                        project,
-                        rduel_project.clone(),
-                        language_registry,
-                        main_rs_buffer,
-                        cargo_toml_buffer,
-                        window,
-                        cx,
-                    );
-                    view
-                }))
-            })
-            .log_err()
-            .flatten()
-        else {
-            return;
-        };
+                    Some(cx.new(|cx| {
+                        let view = RduelView::new(
+                            project,
+                            rduel_project.clone(),
+                            language_registry,
+                            session_for_view,
+                            main_rs_buffer,
+                            cargo_toml_buffer,
+                            window,
+                            cx,
+                        );
+                        view
+                    }))
+                })
+                .log_err()
+                .flatten()
+            else {
+                return;
+            };
 
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace.add_item_to_active_pane(Box::new(rduel), None, true, window, cx);
-            })
-            .log_err();
-    })
-    .detach();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.add_item_to_active_pane(Box::new(rduel), None, true, window, cx);
+                })
+                .log_err();
+        })
+        .detach();
 }
 
 #[derive(Clone)]
 struct RduelProjectFiles {
     root_path: PathBuf,
-    contest_path: PathBuf,
-    problem_path: PathBuf,
     problem_rs_path: PathBuf,
     problem_markdown_path: PathBuf,
     cargo_toml_path: PathBuf,
@@ -173,18 +201,14 @@ impl RduelProjectFiles {
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("could not determine current user home directory"))?;
         let root_path = home.join(".rduel");
-        let contest_path = root_path.join("abc001");
-        let problem_path = contest_path.join("a");
-        let target_path = root_path.join("target").join("abc001");
+        let target_path = root_path.join("target");
         Ok(Self {
-            problem_rs_path: problem_path.join("src").join("main.rs"),
-            problem_markdown_path: problem_path.join("problem.md"),
-            cargo_toml_path: problem_path.join("Cargo.toml"),
-            test_path: problem_path.join("tests"),
-            cargo_config_path: contest_path.join(".cargo").join("config.toml"),
+            problem_rs_path: root_path.join("src").join("main.rs"),
+            problem_markdown_path: root_path.join("problem.md"),
+            cargo_toml_path: root_path.join("Cargo.toml"),
+            test_path: root_path.join("tests"),
+            cargo_config_path: root_path.join(".cargo").join("config.toml"),
             target_path,
-            problem_path,
-            contest_path,
             root_path,
         })
     }
@@ -194,21 +218,13 @@ async fn prepare_rduel_project(
     fs: Arc<dyn fs::Fs>,
     rduel_project: RduelProjectFiles,
 ) -> anyhow::Result<RduelProjectFiles> {
-    let src_path = rduel_project.problem_path.join("src");
-    let cargo_config_dir = rduel_project.contest_path.join(".cargo");
+    let src_path = rduel_project.root_path.join("src");
+    let cargo_config_dir = rduel_project.root_path.join(".cargo");
     fs.create_dir(&rduel_project.root_path).await?;
-    fs.create_dir(&rduel_project.contest_path).await?;
-    fs.create_dir(&rduel_project.problem_path).await?;
     fs.create_dir(&src_path).await?;
     fs.create_dir(&cargo_config_dir).await?;
     fs.create_dir(&rduel_project.test_path).await?;
     save_if_missing(&fs, &rduel_project.root_path.join(".acr"), "").await?;
-    save_if_missing(
-        &fs,
-        &rduel_project.contest_path.join("Cargo.toml"),
-        STARTER_ACR_WORKSPACE_TOML,
-    )
-    .await?;
     save_if_missing(
         &fs,
         &rduel_project.cargo_toml_path,
@@ -221,17 +237,12 @@ async fn prepare_rduel_project(
         LineEnding::Unix,
     )
     .await?;
-    save_if_missing(&fs, &rduel_project.problem_rs_path, STARTER_CODE).await?;
-    save_if_missing(
-        &fs,
-        &rduel_project.problem_markdown_path,
-        MockProblem::abc001_a().markdown.as_ref(),
+    fs.save(
+        &rduel_project.problem_rs_path,
+        &Rope::from(STARTER_CODE),
+        LineEnding::Unix,
     )
     .await?;
-    save_if_missing(&fs, &rduel_project.test_path.join("1.in"), "15\n10\n").await?;
-    save_if_missing(&fs, &rduel_project.test_path.join("1.out"), "5\n").await?;
-    save_if_missing(&fs, &rduel_project.test_path.join("2.in"), "0\n0\n").await?;
-    save_if_missing(&fs, &rduel_project.test_path.join("2.out"), "0\n").await?;
     Ok(rduel_project)
 }
 
@@ -261,7 +272,7 @@ async fn open_rduel_project_buffer(
     let worktree = match workspace
         .update(cx, |workspace, cx| {
             workspace.project().update(cx, |project, cx| {
-                project.find_or_create_worktree(&rduel_project.contest_path, false, cx)
+                project.find_or_create_worktree(&rduel_project.root_path, false, cx)
             })
         })
         .log_err()
@@ -289,7 +300,7 @@ struct RduelView {
     focus_handle: FocusHandle,
     project: Entity<Project>,
     room: RoomState,
-    problem: MockProblem,
+    problem: RduelProblem,
     rduel_project: Option<RduelProjectFiles>,
     problem_markdown: Entity<Markdown>,
     main_rs_buffer: Entity<Buffer>,
@@ -336,25 +347,31 @@ impl Render for DraggedRduelOutputDivider {
 }
 
 struct RoomState {
-    local_player: SharedString,
-    remote_player: SharedString,
+    local_user: SharedString,
+    remote_user: SharedString,
     match_state: MatchState,
 }
 
-struct MockProblem {
+struct RduelProblem {
     title: SharedString,
     markdown: SharedString,
-    url: SharedString,
 }
 
-impl MockProblem {
+impl RduelProblem {
     fn from_server(problem: &ServerProblem) -> Self {
         Self {
             title: problem.title.clone().into(),
             markdown: problem.statement_markdown.clone().into(),
-            url: problem.url.clone().into(),
         }
     }
+}
+
+#[derive(Clone)]
+struct RduelSession {
+    player_id: String,
+    room: Option<ServerRoom>,
+    server_url: String,
+    atcoder_user: String,
 }
 
 #[derive(Clone)]
@@ -370,6 +387,12 @@ struct JoinRequest {
     player_id: Option<String>,
 }
 
+#[derive(Serialize)]
+struct SetAtCoderUserRequest {
+    player_id: String,
+    atcoder_user: String,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum JoinResponse {
@@ -382,11 +405,6 @@ enum JoinResponse {
 enum PlayerStateResponse {
     Waiting { player_id: String },
     Matched { player_id: String, room: ServerRoom },
-}
-
-#[derive(Serialize)]
-struct ReportAcRequest {
-    player_id: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -406,7 +424,6 @@ struct ServerPlayer {
 
 #[derive(Clone, Deserialize)]
 struct ServerProblem {
-    id: String,
     title: String,
     url: String,
     statement_markdown: String,
@@ -436,17 +453,22 @@ enum RduelMatchCommand {
         server_url: String,
         player_id: String,
     },
-    ReportAc {
+    PollRoom {
+        server_url: String,
+        room_id: String,
+    },
+    SetAtCoderUser {
         server_url: String,
         room_id: String,
         player_id: String,
+        atcoder_user: String,
     },
 }
 
 enum RduelMatchOutput {
     Waiting { player_id: String },
     Matched { player_id: String, room: ServerRoom },
-    AcReported { room: ServerRoom },
+    RoomStatus { room: ServerRoom },
 }
 
 #[derive(Clone, Copy)]
@@ -472,16 +494,221 @@ impl CommandStatus {
     }
 }
 
+struct RduelMatchModal {
+    focus_handle: FocusHandle,
+    workspace: WeakEntity<Workspace>,
+    atcoder_user_editor: Entity<Editor>,
+    server_url: String,
+    player_id: Option<String>,
+    status: SharedString,
+    is_waiting: bool,
+}
+
+impl RduelMatchModal {
+    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let atcoder_user_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("AtCoder username", window, cx);
+            editor
+        });
+        window.focus(&atcoder_user_editor.read(cx).focus_handle(cx), cx);
+
+        Self {
+            focus_handle: cx.focus_handle(),
+            workspace,
+            atcoder_user_editor,
+            server_url: RDUEL_SERVER_URL.to_string(),
+            player_id: None,
+            status: "输入 AtCoder 用户名后开始匹配。".into(),
+            is_waiting: false,
+        }
+    }
+
+    fn join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let atcoder_user = self
+            .atcoder_user_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_string();
+        if atcoder_user.is_empty() {
+            self.status = "需要先输入 AtCoder 用户名。".into();
+            cx.notify();
+            return;
+        }
+
+        self.status = "正在匹配对手...".into();
+        self.is_waiting = true;
+        let server_url = self.server_url.clone();
+        let player_id = self.player_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    RduelMatchCommand::Join {
+                        server_url,
+                        player_id,
+                        name: atcoder_user,
+                    }
+                    .run()
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.handle_match_result(result, window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(player_id) = self.player_id.clone() else {
+            return;
+        };
+        let server_url = self.server_url.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let result = cx
+                .background_spawn(async move {
+                    RduelMatchCommand::Poll {
+                        server_url,
+                        player_id,
+                    }
+                    .run()
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.handle_match_result(result, window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn handle_match_result(
+        &mut self,
+        result: anyhow::Result<RduelMatchOutput>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(RduelMatchOutput::Waiting { player_id }) => {
+                self.player_id = Some(player_id);
+                self.status = "已进入队列，等待对手...".into();
+                self.poll(window, cx);
+            }
+            Ok(RduelMatchOutput::Matched { player_id, room }) => {
+                self.status = "匹配成功，正在打开 Rduel...".into();
+                self.is_waiting = false;
+                let atcoder_user = self
+                    .atcoder_user_editor
+                    .read(cx)
+                    .text(cx)
+                    .trim()
+                    .to_string();
+                let room_id = room.id.clone();
+                let session = RduelSession {
+                    player_id: player_id.clone(),
+                    room: Some(room),
+                    server_url: self.server_url.clone(),
+                    atcoder_user: atcoder_user.clone(),
+                };
+                let server_url = self.server_url.clone();
+                cx.background_spawn(async move {
+                    RduelMatchCommand::SetAtCoderUser {
+                        server_url,
+                        room_id,
+                        player_id,
+                        atcoder_user,
+                    }
+                    .run()
+                })
+                .detach_and_log_err(cx);
+                let workspace = self.workspace.clone();
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.hide_modal(window, cx);
+                    })
+                    .log_err();
+                open_rduel_session(workspace, session, window, cx);
+            }
+            Ok(RduelMatchOutput::RoomStatus { .. }) => {}
+            Err(error) => {
+                log::warn!("failed to match Rduel player: {error:#}");
+                self.status = "连接失败，请确认 Rduel 服务器已启动后重试。".into();
+                self.is_waiting = false;
+            }
+        }
+        cx.notify();
+    }
+}
+
+impl Render for RduelMatchModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("RduelMatchModal")
+            .track_focus(&self.focus_handle)
+            .elevation_3(cx)
+            .w(rems(32.))
+            .p_4()
+            .gap_3()
+            .child(Label::new("Rduel").size(LabelSize::Large))
+            .child(
+                div()
+                    .h(px(32.))
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_sm()
+                    .px_2()
+                    .child(self.atcoder_user_editor.clone()),
+            )
+            .child(Label::new(self.status.clone()).color(Color::Muted))
+            .child(
+                h_flex().justify_end().gap_2().child(
+                    Button::new("rduel-start-match", "Match")
+                        .size(ButtonSize::Compact)
+                        .style(ButtonStyle::Filled)
+                        .disabled(self.is_waiting)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.join(window, cx);
+                        })),
+                ),
+            )
+            .when(self.is_waiting, |this| {
+                this.child(Label::new("等待服务器匹配并准备题面...").size(LabelSize::Small))
+            })
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                if !this.is_waiting {
+                    this.join(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Cancel, window, cx| {
+                this.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.hide_modal(window, cx);
+                    })
+                    .log_err();
+            }))
+    }
+}
+
+impl Focusable for RduelMatchModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for RduelMatchModal {}
+impl ModalView for RduelMatchModal {}
+
 enum RduelCommand {
     Test {
-        contest_path: PathBuf,
-        problem_path: PathBuf,
+        root_path: PathBuf,
+        test_path: PathBuf,
         target_path: PathBuf,
     },
     Submit {
-        contest_path: PathBuf,
-        problem_path: PathBuf,
+        root_path: PathBuf,
+        problem_rs_path: PathBuf,
         cargo_toml_path: PathBuf,
+        test_path: PathBuf,
         target_path: PathBuf,
     },
 }
@@ -511,32 +738,42 @@ impl RduelCommand {
     async fn run(self) -> anyhow::Result<RduelCommandOutput> {
         match self {
             Self::Test {
-                contest_path,
-                problem_path,
+                root_path,
+                test_path,
                 target_path,
-            } => run_rduel_test(contest_path, problem_path, target_path).await,
+            } => run_rduel_test(root_path, test_path, target_path).await,
             Self::Submit {
-                contest_path,
-                problem_path,
+                root_path,
+                problem_rs_path,
                 cargo_toml_path,
+                test_path,
                 target_path,
-            } => run_rduel_submit(contest_path, problem_path, cargo_toml_path, target_path).await,
+            } => {
+                run_rduel_submit(
+                    root_path,
+                    problem_rs_path,
+                    cargo_toml_path,
+                    test_path,
+                    target_path,
+                )
+                .await
+            }
         }
     }
 }
 
 async fn run_rduel_test(
-    contest_path: PathBuf,
-    problem_path: PathBuf,
+    root_path: PathBuf,
+    test_path: PathBuf,
     target_path: PathBuf,
 ) -> anyhow::Result<RduelCommandOutput> {
     let mut steps = Vec::new();
     steps.push(
         run_process(
             "cargo build",
-            &contest_path,
+            &root_path,
             "cargo",
-            &["build", "--release", "-p", "abc001-a"],
+            &["build", "--release"],
             Some(&target_path),
         )
         .await?,
@@ -546,17 +783,18 @@ async fn run_rduel_test(
         return Ok(render_embedded_test_steps(steps, Vec::new()));
     }
 
-    let test_results = run_embedded_sample_tests(contest_path, problem_path, target_path).await;
+    let test_results = run_embedded_sample_tests(root_path, test_path, target_path).await;
     Ok(render_embedded_test_steps(steps, test_results))
 }
 
 async fn run_rduel_submit(
-    contest_path: PathBuf,
-    problem_path: PathBuf,
+    root_path: PathBuf,
+    problem_rs_path: PathBuf,
     cargo_toml_path: PathBuf,
+    test_path: PathBuf,
     target_path: PathBuf,
 ) -> anyhow::Result<RduelCommandOutput> {
-    let test_output = run_rduel_test(contest_path, problem_path.clone(), target_path).await?;
+    let test_output = run_rduel_test(root_path, test_path, target_path).await?;
     if !test_output.success {
         return Ok(RduelCommandOutput {
             success: false,
@@ -568,9 +806,10 @@ async fn run_rduel_submit(
         });
     }
 
-    let source_path = problem_path.join("src").join("main.rs");
+    let source_path = problem_rs_path;
     let source_code = std::fs::read_to_string(&source_path)?;
-    let problem_url = read_problem_url(&cargo_toml_path).unwrap_or_else(|| PROBLEM_URL.to_string());
+    let problem_url = read_problem_url(&cargo_toml_path)
+        .ok_or_else(|| anyhow::anyhow!("problem_url was not found in Cargo.toml"))?;
     let submit_url = atcoder_submit_url(&problem_url).unwrap_or_else(|| problem_url.clone());
     Ok(RduelCommandOutput {
         success: true,
@@ -643,19 +882,31 @@ impl RduelMatchCommand {
                     }
                 })
             }
-            Self::ReportAc {
+            Self::PollRoom {
+                server_url,
+                room_id,
+            } => {
+                let path = format!("/rooms/{room_id}");
+                let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "GET", &path, None)?;
+                Ok(RduelMatchOutput::RoomStatus { room })
+            }
+            Self::SetAtCoderUser {
                 server_url,
                 room_id,
                 player_id,
+                atcoder_user,
             } => {
-                let path = format!("/rooms/{room_id}/ac");
+                let path = format!("/rooms/{room_id}/atcoder-user");
                 let room: ServerRoom = rduel_http_json(
                     &server_url,
                     "POST",
                     &path,
-                    Some(&ReportAcRequest { player_id }),
+                    Some(&SetAtCoderUserRequest {
+                        player_id,
+                        atcoder_user,
+                    }),
                 )?;
-                Ok(RduelMatchOutput::AcReported { room })
+                Ok(RduelMatchOutput::RoomStatus { room })
             }
         }
     }
@@ -867,17 +1118,16 @@ enum EmbeddedAcrTestResult {
 }
 
 async fn run_embedded_sample_tests(
-    contest_path: PathBuf,
-    problem_path: PathBuf,
+    root_path: PathBuf,
+    test_path: PathBuf,
     target_path: PathBuf,
 ) -> Vec<(usize, EmbeddedAcrTestResult)> {
     let mut results = Vec::new();
     let mut index = 1;
-    let tests_path = problem_path.join("tests");
 
     loop {
-        let input_path = tests_path.join(format!("{index}.in"));
-        let output_path = tests_path.join(format!("{index}.out"));
+        let input_path = test_path.join(format!("{index}.in"));
+        let output_path = test_path.join(format!("{index}.out"));
         if !input_path.exists() || !output_path.exists() {
             break;
         }
@@ -911,7 +1161,7 @@ async fn run_embedded_sample_tests(
 
         results.push((
             index,
-            run_embedded_sample_test(&contest_path, &target_path, input, expected).await,
+            run_embedded_sample_test(&root_path, &target_path, input, expected).await,
         ));
         index += 1;
     }
@@ -920,7 +1170,7 @@ async fn run_embedded_sample_tests(
 }
 
 async fn run_embedded_sample_test(
-    contest_path: &Path,
+    root_path: &Path,
     target_path: &Path,
     input: String,
     expected: String,
@@ -931,8 +1181,8 @@ async fn run_embedded_sample_test(
         };
     };
     let mut child = match smol::process::Command::new(cargo)
-        .args(["run", "--release", "-q", "-p", "abc001-a"])
-        .current_dir(contest_path)
+        .args(["run", "--release", "-q"])
+        .current_dir(root_path)
         .env("CARGO_TARGET_DIR", target_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1100,12 +1350,31 @@ impl RduelView {
         project: Entity<Project>,
         rduel_project: Option<RduelProjectFiles>,
         language_registry: Arc<LanguageRegistry>,
+        session: RduelSession,
         main_rs_buffer: Entity<Buffer>,
         cargo_toml_buffer: Entity<Buffer>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let problem = MockProblem::abc001_a();
+        let problem = session
+            .room
+            .as_ref()
+            .map(|room| RduelProblem::from_server(&room.problem))
+            .unwrap_or_else(|| RduelProblem {
+                title: "Rduel".into(),
+                markdown: "No problem was received from the server.".into(),
+            });
+        let room_id = session.room.as_ref().map(|room| room.id.clone());
+        let remote_user = session
+            .room
+            .as_ref()
+            .and_then(|room| {
+                room.players
+                    .iter()
+                    .find(|player| player.id != session.player_id)
+                    .map(|player| player.name.clone())
+            })
+            .unwrap_or_else(|| "waiting".to_string());
         let main_rs_buffer_for_view = main_rs_buffer.clone();
         let cargo_toml_buffer_for_view = cargo_toml_buffer.clone();
         let problem_markdown =
@@ -1129,16 +1398,16 @@ impl RduelView {
             editor
         });
 
-        Self {
+        let view = Self {
             focus_handle: cx.focus_handle(),
             project,
             room: RoomState {
-                local_player: "你：编辑中".into(),
-                remote_player: "对手：等待中".into(),
+                local_user: format!("{}：作答中", session.atcoder_user).into(),
+                remote_user: format!("{remote_user}：作答中").into(),
                 match_state: MatchState {
-                    player_id: None,
-                    room_id: None,
-                    server_url: RDUEL_SERVER_URL.to_string(),
+                    player_id: Some(session.player_id),
+                    room_id,
+                    server_url: session.server_url,
                 },
             },
             problem,
@@ -1155,7 +1424,9 @@ impl RduelView {
             problem_scroll_handle: ScrollHandle::new(),
             command_output_editor,
             command_status: CommandStatus::Idle,
-        }
+        };
+        view.poll_room_after_delay(cx);
+        view
     }
 
     fn new_problem_markdown(
@@ -1195,47 +1466,9 @@ impl RduelView {
             "Test",
             rduel_project.clone(),
             RduelCommand::Test {
-                contest_path: rduel_project.contest_path.clone(),
-                problem_path: rduel_project.problem_path.clone(),
+                root_path: rduel_project.root_path.clone(),
+                test_path: rduel_project.test_path.clone(),
                 target_path: rduel_project.target_path.clone(),
-            },
-            window,
-            cx,
-        );
-    }
-
-    fn join_match(&mut self, _: &JoinMatch, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(rduel_project) = self.rduel_project.clone() else {
-            self.command_status = CommandStatus::Failed;
-            self.set_command_output(
-                "Rduel project files are not available. Reopen Rduel after checking ~/.rduel.",
-                window,
-                cx,
-            );
-            cx.notify();
-            return;
-        };
-
-        self.room.local_player = "你：匹配中".into();
-        self.room.remote_player = "对手：等待中".into();
-        self.set_command_output(
-            format!(
-                "Connecting to Rduel server...\n{}",
-                self.room.match_state.server_url
-            ),
-            window,
-            cx,
-        );
-        cx.notify();
-
-        let server_url = self.room.match_state.server_url.clone();
-        let player_id = self.room.match_state.player_id.clone();
-        self.spawn_match_command(
-            rduel_project,
-            RduelMatchCommand::Join {
-                server_url,
-                player_id,
-                name: "local".into(),
             },
             window,
             cx,
@@ -1302,9 +1535,10 @@ impl RduelView {
                     "Submit",
                     rduel_project.clone(),
                     RduelCommand::Submit {
-                        contest_path: rduel_project.contest_path.clone(),
-                        problem_path: rduel_project.problem_path.clone(),
+                        root_path: rduel_project.root_path.clone(),
+                        problem_rs_path: rduel_project.problem_rs_path.clone(),
                         cargo_toml_path: rduel_project.cargo_toml_path.clone(),
+                        test_path: rduel_project.test_path.clone(),
                         target_path: rduel_project.target_path.clone(),
                     },
                     window,
@@ -1359,9 +1593,6 @@ impl RduelView {
                                 submit_ready.source_path.display()
                             );
                         }
-                        if output.success && label == "Test" {
-                            this.report_ac_if_matched(window, cx);
-                        }
                         output.rendered
                     }
                     Err(error) => {
@@ -1384,175 +1615,78 @@ impl RduelView {
         .detach_and_log_err(cx);
     }
 
-    fn spawn_match_command(
-        &mut self,
-        rduel_project: RduelProjectFiles,
-        command: RduelMatchCommand,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { command.run() }).await;
-            this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(output) => this.apply_match_output(output, rduel_project, window, cx),
-                    Err(error) => {
-                        this.room.local_player = "你：离线".into();
-                        this.room.remote_player = "对手：未知".into();
-                        this.set_command_output(
-                            format!(
-                                "Failed to contact Rduel server:\n{error:#}\n\nRun:\ncargo run -p rduel_server -- --host 127.0.0.1 --port 8787"
-                            ),
-                            window,
-                            cx,
-                        );
-                    }
-                }
-                cx.notify();
-            })
-        })
-        .detach_and_log_err(cx);
-    }
-
-    fn apply_match_output(
-        &mut self,
-        output: RduelMatchOutput,
-        rduel_project: RduelProjectFiles,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match output {
-            RduelMatchOutput::Waiting { player_id } => {
-                self.room.match_state.player_id = Some(player_id.clone());
-                self.room.local_player = "你：等待中".into();
-                self.room.remote_player = "对手：匹配中".into();
-                self.set_command_output("Waiting for opponent...", window, cx);
-                self.poll_match_after_delay(rduel_project, player_id, window, cx);
-            }
-            RduelMatchOutput::Matched { player_id, room } => {
-                self.room.match_state.player_id = Some(player_id);
-                self.apply_matched_room(rduel_project, room, window, cx);
-            }
-            RduelMatchOutput::AcReported { room } => {
-                self.apply_room_status(room, window, cx);
-            }
-        }
-    }
-
-    fn poll_match_after_delay(
-        &mut self,
-        rduel_project: RduelProjectFiles,
-        player_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let server_url = self.room.match_state.server_url.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(2)).await;
-            this.update_in(cx, |this, window, cx| {
-                this.spawn_match_command(
-                    rduel_project,
-                    RduelMatchCommand::Poll {
-                        server_url,
-                        player_id,
-                    },
-                    window,
-                    cx,
-                );
-            })
-        })
-        .detach_and_log_err(cx);
-    }
-
-    fn apply_matched_room(
-        &mut self,
-        rduel_project: RduelProjectFiles,
-        room: ServerRoom,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.room.match_state.room_id = Some(room.id.clone());
-        if let Some(local_player_id) = self.room.match_state.player_id.as_deref() {
-            let remote_name = room
-                .players
-                .iter()
-                .find(|player| player.id != local_player_id)
-                .map(|player| player.name.as_str())
-                .unwrap_or("opponent");
-            self.room.local_player = "你：作答中".into();
-            self.room.remote_player = format!("{remote_name}：作答中").into();
-        }
-
-        let problem = MockProblem::from_server(&room.problem);
-        if let Err(error) = write_server_problem_to_project(&rduel_project, &room.problem) {
-            self.set_command_output(
-                format!("Matched, but failed to write problem files:\n{error:#}"),
-                window,
-                cx,
-            );
-            return;
-        }
-        if let Ok(cargo_toml) = std::fs::read_to_string(&rduel_project.cargo_toml_path) {
-            self.cargo_toml_buffer.update(cx, |buffer, cx| {
-                buffer.set_text(cargo_toml, cx);
-            });
-        }
-
-        self.problem = problem;
-        self.problem_markdown = Self::new_problem_markdown(
-            self.problem.markdown.clone(),
-            self.project.read(cx).languages().clone(),
-            cx,
-        );
-        self.set_command_output(
-            format!(
-                "Matched room {}\nProblem: {} ({})\nURL: {}\n{} sample cases written.",
-                room.id,
-                room.problem.title,
-                room.problem.id,
-                self.problem.url,
-                room.problem.samples.len()
-            ),
-            window,
-            cx,
-        );
-        self.apply_room_status(room, window, cx);
-    }
-
-    fn apply_room_status(&mut self, room: ServerRoom, window: &mut Window, cx: &mut Context<Self>) {
-        if room.status == ServerRoomStatus::Finished {
-            let winner = room.winner_player_id.as_deref();
-            if winner == self.room.match_state.player_id.as_deref() {
-                self.room.local_player = "你：AC".into();
-                self.room.remote_player = "对手：结束".into();
-                self.set_command_output("Server accepted your AC. Room finished.", window, cx);
-            } else {
-                self.room.local_player = "你：结束".into();
-                self.room.remote_player = "对手：AC".into();
-                self.set_command_output("Opponent solved first. Room finished.", window, cx);
-            }
-        }
-    }
-
-    fn report_ac_if_matched(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(rduel_project), Some(room_id), Some(player_id)) = (
-            self.rduel_project.clone(),
+    fn poll_room_after_delay(&self, cx: &mut Context<Self>) {
+        let (Some(room_id), server_url) = (
             self.room.match_state.room_id.clone(),
-            self.room.match_state.player_id.clone(),
+            self.room.match_state.server_url.clone(),
         ) else {
             return;
         };
-        let server_url = self.room.match_state.server_url.clone();
-        self.spawn_match_command(
-            rduel_project,
-            RduelMatchCommand::ReportAc {
-                server_url,
-                room_id,
-                player_id,
-            },
-            window,
-            cx,
-        );
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let result = cx
+                .background_spawn(async move {
+                    RduelMatchCommand::PollRoom {
+                        server_url,
+                        room_id,
+                    }
+                    .run()
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(RduelMatchOutput::RoomStatus { room }) => {
+                        if this.apply_room_status(room) {
+                            this.poll_room_after_delay(cx);
+                        }
+                    }
+                    Ok(RduelMatchOutput::Waiting { .. } | RduelMatchOutput::Matched { .. }) => {
+                        this.poll_room_after_delay(cx);
+                    }
+                    Err(error) => {
+                        log::warn!("failed to poll Rduel room: {error:#}");
+                        this.poll_room_after_delay(cx);
+                    }
+                }
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn apply_room_status(&mut self, room: ServerRoom) -> bool {
+        if room.status != ServerRoomStatus::Finished {
+            return true;
+        }
+
+        let winner = room.winner_player_id.as_deref();
+        let local_name = room
+            .players
+            .iter()
+            .find(|player| Some(player.id.as_str()) == self.room.match_state.player_id.as_deref())
+            .map(|player| player.name.as_str())
+            .unwrap_or("local");
+        let remote_name = room
+            .players
+            .iter()
+            .find(|player| Some(player.id.as_str()) != self.room.match_state.player_id.as_deref())
+            .map(|player| player.name.as_str())
+            .unwrap_or("opponent");
+        if winner == self.room.match_state.player_id.as_deref() {
+            self.room.local_user = format!("{local_name}：AC").into();
+            self.room.remote_user = format!("{remote_name}：结束").into();
+        } else if winner.is_some() {
+            self.room.local_user = format!("{local_name}：结束").into();
+            self.room.remote_user = format!("{remote_name}：AC").into();
+        } else {
+            self.room.local_user = format!("{local_name}：结束").into();
+            self.room.remote_user = format!("{remote_name}：结束").into();
+        }
+        false
     }
 
     fn set_command_output(
@@ -1682,20 +1816,12 @@ impl RduelView {
                     .gap_2()
                     .justify_center()
                     .overflow_hidden()
-                    .child(self.render_status_chip(self.room.local_player.clone(), cx))
-                    .child(self.render_status_chip(self.room.remote_player.clone(), cx)),
+                    .child(self.render_status_chip(self.room.local_user.clone(), cx))
+                    .child(self.render_status_chip(self.room.remote_user.clone(), cx)),
             )
             .child(
                 h_flex()
                     .gap_2()
-                    .child(
-                        Button::new("rduel-join-match", "Match")
-                            .size(ButtonSize::Compact)
-                            .disabled(self.command_status.is_running())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.join_match(&JoinMatch, window, cx);
-                            })),
-                    )
                     .child(
                         Button::new("rduel-toggle-layout", "Swap")
                             .size(ButtonSize::Compact)
@@ -2044,7 +2170,6 @@ impl Render for RduelView {
             .key_context("Rduel")
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .on_action(cx.listener(Self::join_match))
             .on_action(cx.listener(Self::run_samples))
             .on_action(cx.listener(Self::submit_solution))
             .on_action(cx.listener(Self::toggle_layout))
@@ -2074,113 +2199,6 @@ impl Render for RduelView {
     }
 }
 
-impl MockProblem {
-    fn abc001_a() -> Self {
-        Self {
-            title: "AtCoder ABC001 A - 積雪深差".into(),
-            url: PROBLEM_URL.into(),
-            markdown: r#"# A - 積雪深差
-
-You are given yesterday's snow depth $H_1$ and today's snow depth $H_2$.
-Print the difference $H_1 - H_2$.
-
-## Constraints
-
-- $0 \leq H_1, H_2 \leq 1000$
-- All values in input are integers.
-
-## Input
-
-```text
-H_1
-H_2
-```
-
-## Output
-
-Print the value of $H_1 - H_2$.
-
-## Sample 1
-
-```text
-15
-10
-```
-
-```text
-5
-```
-
-This mock statement intentionally includes inline math such as $H_1 - H_2$ and block math:
-
-$$
-\sum_{i=1}^{N} i = \frac{N(N+1)}{2}
-$$
-
-## Explanation
-
-Read the two integers from standard input, convert them to numbers, and print their difference.
-The operation is small enough that a normal 32-bit signed integer is sufficient, but using
-Rust's `i64` is also fine for competitive programming templates.
-
-If the input is:
-
-```text
-H_1
-H_2
-```
-
-then the required value is:
-
-$$
-\mathrm{answer} = H_1 - H_2
-$$
-
-## Sample 2
-
-```text
-0
-0
-```
-
-```text
-0
-```
-
-## Sample 3
-
-```text
-5
-20
-```
-
-```text
--15
-```
-
-## Implementation Notes
-
-- Use `read_to_string` to read all input.
-- Split the input by whitespace.
-- Parse the first two tokens as integers.
-- Print the difference with `println!`.
-
-For example, the core calculation can be written as:
-
-```rust
-let h1: i64 = it.next().unwrap().parse().unwrap();
-let h2: i64 = it.next().unwrap().parse().unwrap();
-println!("{}", h1 - h2);
-```
-
-This section is intentionally longer than necessary so the Rduel prototype has enough
-content to exercise the left-side scroll container.
-"#
-            .into(),
-        }
-    }
-}
-
 const STARTER_CODE: &str = r#"use std::io::{self, Read};
 
 fn main() {
@@ -2191,13 +2209,8 @@ fn main() {
 }
 "#;
 
-const STARTER_ACR_WORKSPACE_TOML: &str = r#"[workspace]
-members = ["a"]
-resolver = "2"
-"#;
-
 const STARTER_ACR_PROBLEM_TOML: &str = r#"[package]
-name = "abc001-a"
+name = "rduel"
 version = "0.1.0"
 edition = "2024"
 

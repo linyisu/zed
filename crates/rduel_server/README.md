@@ -8,6 +8,14 @@ Run:
 cargo run -p rduel_server -- --host 127.0.0.1 --port 8787
 ```
 
+Problem source defaults to `crates/rduel_server/problems.json`. Override it with:
+
+```sh
+cargo run -p rduel_server -- --problem-config /path/to/problems.json
+```
+
+The current config generates AtCoder ABC042-ABC463 A/B/C URLs.
+
 Join matchmaking:
 
 ```sh
@@ -30,12 +38,12 @@ Poll room state:
 curl -s http://127.0.0.1:8787/rooms/<room_id>
 ```
 
-Report AC:
+Register an AtCoder username for server-side AC polling:
 
 ```sh
-curl -s http://127.0.0.1:8787/rooms/<room_id>/ac \
+curl -s http://127.0.0.1:8787/rooms/<room_id>/atcoder-user \
   -H 'content-type: application/json' \
-  -d '{"player_id":"<player_id>"}'
+  -d '{"player_id":"<player_id>","atcoder_user":"<atcoder_user>"}'
 ```
 
-The first AC report marks the room as `finished` and records `winner_player_id`.
+The server polls AtCoder Problems submissions every 3 seconds and finishes the room when it finds the earliest AC submission for the room problem after `started_at_second`.

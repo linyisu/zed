@@ -14820,6 +14820,7 @@ dependencies = [
  "language",
  "log",
  "markdown",
+ "menu",
  "project",
  "schemars 1.0.4",
  "serde",
@@ -14840,12 +14841,15 @@ dependencies = [
  "axum",
  "clap",
  "env_logger 0.11.8",
+ "html_to_markdown",
  "log",
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "uuid",
+ "zed-reqwest",
 ]
 
 [[package]]

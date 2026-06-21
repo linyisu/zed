@@ -1,0 +1,6 @@
+{
+  "contest_prefix": "abc",
+  "contest_start": 42,
+  "contest_end": 463,
+  "tasks": ["a", "b", "c"]
+}
