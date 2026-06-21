@@ -14839,9 +14839,11 @@ name = "rduel_server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-compression",
  "axum",
  "clap",
  "env_logger 0.11.8",
+ "futures-lite 1.13.0",
  "html_to_markdown",
  "log",
  "rand 0.9.4",

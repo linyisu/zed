@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::Context as _;
+use async_compression::futures::bufread::GzipDecoder;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -14,8 +15,10 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
+use futures_lite::{AsyncReadExt, io::BufReader};
 use html_to_markdown::{TagHandler, convert_html_to_markdown, markdown};
 use rand::prelude::IndexedRandom;
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -47,7 +50,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/players/:player_id", get(player_state))
         .route("/players/:player_id/leave", post(leave_player))
         .route("/rooms/:room_id", get(room_state))
-        .route("/rooms/:room_id/atcoder-user", post(set_atcoder_user))
+        .route(
+            "/rooms/:room_id/watch-submissions",
+            post(watch_room_submissions),
+        )
         .with_state(state);
 
     log::info!(
@@ -152,12 +158,13 @@ impl RduelRooms {
             started_at_second: unix_now(),
             status: RoomStatus::Playing,
             winner_player_id: None,
+            finish_reason: None,
             winning_submission: None,
             atcoder_users: HashMap::from([
                 (opponent.id.clone(), opponent.name.clone()),
                 (player.id.clone(), player.name.clone()),
             ]),
-            polling_submissions: true,
+            polling_submissions: false,
         };
         let room_id = room.id.clone();
         log::info!(
@@ -216,15 +223,34 @@ impl RduelRooms {
         }
     }
 
-    fn leave_waiting_player(&mut self, player_id: &str) -> bool {
-        if !matches!(self.players.get(player_id), Some(PlayerLocation::Waiting)) {
-            return false;
-        }
+    fn leave_player(&mut self, player_id: &str) -> LeaveOutcome {
+        match self.players.get(player_id).cloned() {
+            Some(PlayerLocation::Waiting) => {
+                self.players.remove(player_id);
+                self.waiting_players
+                    .retain(|player| player.id.as_str() != player_id);
+                LeaveOutcome::LeftWaiting
+            }
+            Some(PlayerLocation::Room { room_id }) => {
+                let Some(room) = self.rooms.get_mut(&room_id) else {
+                    self.players.remove(player_id);
+                    return LeaveOutcome::NotFound;
+                };
+                if !matches!(room.status, RoomStatus::Playing) {
+                    return LeaveOutcome::RoomAlreadyFinished(room.clone());
+                }
+                let Some(winner) = room.players.iter().find(|player| player.id != player_id) else {
+                    return LeaveOutcome::NotFound;
+                };
 
-        self.players.remove(player_id);
-        self.waiting_players
-            .retain(|player| player.id.as_str() != player_id);
-        true
+                room.status = RoomStatus::Finished;
+                room.winner_player_id = Some(winner.id.clone());
+                room.finish_reason = Some(RoomFinishReason::PlayerLeft);
+                self.players.remove(player_id);
+                LeaveOutcome::ForfeitedRoom(room.clone())
+            }
+            None => LeaveOutcome::NotFound,
+        }
     }
 
     fn remove_waiting_players_by_name(&mut self, player_name: &str) -> usize {
@@ -248,19 +274,8 @@ impl RduelRooms {
         self.rooms.get(room_id).cloned()
     }
 
-    fn set_atcoder_user(
-        &mut self,
-        room_id: &str,
-        player_id: &str,
-        atcoder_user: String,
-    ) -> Option<(Room, bool)> {
+    fn start_submission_watch(&mut self, room_id: &str) -> Option<(Room, bool)> {
         let room = self.rooms.get_mut(room_id)?;
-        if !room.players.iter().any(|player| player.id == player_id) {
-            return None;
-        }
-
-        room.atcoder_users
-            .insert(player_id.to_string(), atcoder_user);
         let should_start_polling = !room.polling_submissions;
         if should_start_polling {
             room.polling_submissions = true;
@@ -284,6 +299,7 @@ impl RduelRooms {
 
         room.status = RoomStatus::Finished;
         room.winner_player_id = Some(player_id.to_string());
+        room.finish_reason = Some(RoomFinishReason::Accepted);
         room.winning_submission = Some(WinningSubmission {
             player_id: player_id.to_string(),
             atcoder_user: submission.user_id,
@@ -297,6 +313,13 @@ impl RduelRooms {
 enum JoinDecision {
     Respond(JoinResponse),
     CreateRoom { opponent: Player, player: Player },
+}
+
+enum LeaveOutcome {
+    LeftWaiting,
+    ForfeitedRoom(Room),
+    RoomAlreadyFinished(Room),
+    NotFound,
 }
 
 #[derive(Clone)]
@@ -325,12 +348,6 @@ enum PlayerStateResponse {
     Matched { player_id: String, room: Room },
 }
 
-#[derive(Deserialize)]
-struct SetAtCoderUserRequest {
-    player_id: String,
-    atcoder_user: String,
-}
-
 #[derive(Clone, Serialize)]
 struct Room {
     id: String,
@@ -339,6 +356,7 @@ struct Room {
     started_at_second: i64,
     status: RoomStatus,
     winner_player_id: Option<String>,
+    finish_reason: Option<RoomFinishReason>,
     winning_submission: Option<WinningSubmission>,
     atcoder_users: HashMap<String, String>,
     #[serde(skip)]
@@ -398,6 +416,13 @@ enum RoomStatus {
     Finished,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RoomFinishReason {
+    Accepted,
+    PlayerLeft,
+}
+
 fn unix_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
@@ -424,9 +449,6 @@ async fn join_matchmaking(
                         let mut rooms = state.rooms.lock().await;
                         rooms.create_room(opponent, player, problem)
                     };
-                    if let JoinResponse::Matched { room, .. } = &response {
-                        tokio::spawn(poll_room_submissions(state, room.id.clone()));
-                    }
                     response
                 }
                 Err(error) => {
@@ -456,14 +478,28 @@ async fn leave_player(
     State(state): State<ServerState>,
     Path(player_id): Path<String>,
 ) -> Json<serde_json::Value> {
-    let left = {
+    let outcome = {
         let mut rooms = state.rooms.lock().await;
-        rooms.leave_waiting_player(&player_id)
+        rooms.leave_player(&player_id)
     };
-    if left {
-        log::info!("Rduel waiting player {player_id} left matchmaking");
+    match outcome {
+        LeaveOutcome::LeftWaiting => {
+            log::info!("Rduel waiting player {player_id} left matchmaking");
+            Json(serde_json::json!({ "left": true, "state": "waiting" }))
+        }
+        LeaveOutcome::ForfeitedRoom(room) => {
+            log::info!(
+                "Rduel player {player_id} left active room {}; winner: {:?}",
+                room.id,
+                room.winner_player_id
+            );
+            Json(serde_json::json!({ "left": true, "state": "room", "room": room }))
+        }
+        LeaveOutcome::RoomAlreadyFinished(room) => {
+            Json(serde_json::json!({ "left": false, "state": "finished", "room": room }))
+        }
+        LeaveOutcome::NotFound => Json(serde_json::json!({ "left": false })),
     }
-    Json(serde_json::json!({ "left": left }))
 }
 
 async fn room_state(
@@ -477,19 +513,19 @@ async fn room_state(
         .ok_or(ApiError::NotFound("room was not found"))
 }
 
-async fn set_atcoder_user(
+async fn watch_room_submissions(
     State(state): State<ServerState>,
     Path(room_id): Path<String>,
-    Json(request): Json<SetAtCoderUserRequest>,
 ) -> Result<Json<Room>, ApiError> {
     let (room, should_start_polling) = {
         let mut rooms = state.rooms.lock().await;
         rooms
-            .set_atcoder_user(&room_id, &request.player_id, request.atcoder_user)
-            .ok_or(ApiError::NotFound("room or player was not found"))?
+            .start_submission_watch(&room_id)
+            .ok_or(ApiError::NotFound("room was not found"))?
     };
 
     if should_start_polling {
+        log::info!("Rduel room {room_id} started watching AtCoder submissions");
         tokio::spawn(poll_room_submissions(state, room_id));
     }
 
@@ -507,6 +543,7 @@ async fn select_problem_for_server(state: &ServerState) -> anyhow::Result<Proble
 async fn poll_room_submissions(state: ServerState, room_id: String) {
     log::info!("started AtCoder submission polling for Rduel room {room_id}");
     let mut ticker = interval(Duration::from_secs(3));
+    let mut last_fetch_errors = HashMap::new();
     loop {
         ticker.tick().await;
 
@@ -523,7 +560,9 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
             room
         };
 
-        let Some((player_id, submission)) = earliest_ac_submission(&room).await else {
+        let Some((player_id, submission)) =
+            earliest_ac_submission(&room, &mut last_fetch_errors).await
+        else {
             continue;
         };
 
@@ -538,7 +577,10 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
     }
 }
 
-async fn earliest_ac_submission(room: &Room) -> Option<(String, AtCoderSubmission)> {
+async fn earliest_ac_submission(
+    room: &Room,
+    last_fetch_errors: &mut HashMap<String, String>,
+) -> Option<(String, AtCoderSubmission)> {
     let mut earliest: Option<(String, AtCoderSubmission)> = None;
 
     for player in &room.players {
@@ -547,9 +589,18 @@ async fn earliest_ac_submission(room: &Room) -> Option<(String, AtCoderSubmissio
         };
         let from_second = room.started_at_second.saturating_sub(60);
         let submissions = match fetch_user_submissions(atcoder_user, from_second).await {
-            Ok(submissions) => submissions,
+            Ok(submissions) => {
+                last_fetch_errors.remove(atcoder_user);
+                submissions
+            }
             Err(error) => {
-                log::warn!("failed to fetch submissions for {atcoder_user}: {error:#}");
+                let error = format!("{error:#}");
+                if last_fetch_errors.get(atcoder_user) != Some(&error) {
+                    log::warn!("failed to fetch submissions for {atcoder_user}: {error}");
+                    last_fetch_errors.insert(atcoder_user.clone(), error);
+                } else {
+                    log::debug!("still failing to fetch submissions for {atcoder_user}: {error}");
+                }
                 continue;
             }
         };
@@ -587,14 +638,34 @@ async fn fetch_user_submissions(
     let url = format!(
         "https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={atcoder_user}&from_second={from_second}"
     );
-    let response = reqwest::get(&url)
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header(ACCEPT_ENCODING, "gzip")
+        .send()
         .await
         .context("requesting AtCoder submissions")?
         .error_for_status()
-        .context("AtCoder submissions API returned an error status")?
-        .text()
+        .context("AtCoder submissions API returned an error status")?;
+    let content_encoding = response
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let response = response
+        .bytes()
         .await
         .context("reading AtCoder submissions")?;
+    let response = if content_encoding.as_deref() == Some("gzip") {
+        let mut decoder = GzipDecoder::new(BufReader::new(response.as_ref()));
+        let mut decoded = String::new();
+        decoder
+            .read_to_string(&mut decoded)
+            .await
+            .context("decompressing AtCoder submissions")?;
+        decoded
+    } else {
+        String::from_utf8(response.to_vec()).context("decoding AtCoder submissions")?
+    };
     Ok(serde_json::from_str(&response).context("parsing AtCoder submissions")?)
 }
 

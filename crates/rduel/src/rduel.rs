@@ -19,14 +19,17 @@ use markdown::{
     MarkdownOptions, MarkdownStyle, WrapButtonVisibility,
 };
 use menu::{Cancel, Confirm};
-use project::Project;
+use project::{Project, ProjectItem, ProjectPath};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings};
 use text::{LineEnding, Rope};
 use ui::{Button, ButtonSize, ButtonStyle, prelude::*};
 use util::{ResultExt, rel_path::RelPath};
-use workspace::{Item, ModalView, Workspace, item::ItemEvent, item::SaveOptions};
+use workspace::{
+    Item, ModalView, Workspace,
+    item::{ItemBufferKind, ItemEvent, SaveOptions},
+};
 use zed_actions::rduel::OpenRduel;
 
 const DEFAULT_PROBLEM_WIDTH_FRACTION: f32 = 0.42;
@@ -281,7 +284,7 @@ impl RduelProjectFiles {
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("could not determine current user home directory"))?;
         let root_path = home.join(".rduel");
-        let target_path = root_path.join("target");
+        let target_path = home.join(".cache").join("rduel").join("target");
         Ok(Self {
             problem_rs_path: root_path.join("src").join("main.rs"),
             problem_markdown_path: root_path.join("problem.md"),
@@ -300,10 +303,17 @@ async fn prepare_rduel_project(
 ) -> anyhow::Result<RduelProjectFiles> {
     let src_path = rduel_project.root_path.join("src");
     let cargo_config_dir = rduel_project.root_path.join(".cargo");
+    let Some(target_parent) = rduel_project.target_path.parent() else {
+        anyhow::bail!(
+            "Rduel target path has no parent: {}",
+            rduel_project.target_path.display()
+        );
+    };
     fs.create_dir(&rduel_project.root_path).await?;
     fs.create_dir(&src_path).await?;
     fs.create_dir(&cargo_config_dir).await?;
     fs.create_dir(&rduel_project.test_path).await?;
+    fs.create_dir(target_parent).await?;
     save_if_missing(&fs, &rduel_project.root_path.join(".acr"), "").await?;
     save_if_missing(
         &fs,
@@ -488,6 +498,7 @@ struct ServerRoom {
     problem: ServerProblem,
     status: ServerRoomStatus,
     winner_player_id: Option<String>,
+    finish_reason: Option<ServerRoomFinishReason>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -517,6 +528,13 @@ enum ServerRoomStatus {
     Finished,
 }
 
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ServerRoomFinishReason {
+    Accepted,
+    PlayerLeft,
+}
+
 enum RduelMatchCommand {
     Join {
         server_url: String,
@@ -528,6 +546,10 @@ enum RduelMatchCommand {
         player_id: String,
     },
     PollRoom {
+        server_url: String,
+        room_id: String,
+    },
+    WatchSubmissions {
         server_url: String,
         room_id: String,
     },
@@ -1016,6 +1038,14 @@ impl RduelMatchCommand {
             } => {
                 let path = format!("/rooms/{room_id}");
                 let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "GET", &path, None)?;
+                Ok(RduelMatchOutput::RoomStatus { room })
+            }
+            Self::WatchSubmissions {
+                server_url,
+                room_id,
+            } => {
+                let path = format!("/rooms/{room_id}/watch-submissions");
+                let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "POST", &path, None)?;
                 Ok(RduelMatchOutput::RoomStatus { room })
             }
             Self::Leave {
@@ -1707,6 +1737,7 @@ impl RduelView {
                                 submit_ready.source_code,
                             ));
                             cx.open_url(&submit_ready.submit_url);
+                            this.start_server_submission_watch(cx);
                             log::info!(
                                 "prepared Rduel submit for {}",
                                 submit_ready.source_path.display()
@@ -1730,6 +1761,24 @@ impl RduelView {
                 this.set_command_output(output_text, window, cx);
                 cx.notify();
             })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn start_server_submission_watch(&self, cx: &mut Context<Self>) {
+        let (Some(room_id), server_url) = (
+            self.room.match_state.room_id.clone(),
+            self.room.match_state.server_url.clone(),
+        ) else {
+            return;
+        };
+
+        cx.background_spawn(async move {
+            RduelMatchCommand::WatchSubmissions {
+                server_url,
+                room_id,
+            }
+            .run()
         })
         .detach_and_log_err(cx);
     }
@@ -1765,7 +1814,7 @@ impl RduelView {
                         this.poll_room_after_delay(cx);
                     }
                     Err(error) => {
-                        log::warn!("failed to poll Rduel room: {error:#}");
+                        log::debug!("failed to poll Rduel room: {error:#}");
                         this.poll_room_after_delay(cx);
                     }
                 }
@@ -1783,29 +1832,62 @@ impl RduelView {
         }
 
         let winner = room.winner_player_id.as_deref();
+        let local_player_id = self.room.match_state.player_id.as_deref();
         let local_name = room
             .players
             .iter()
-            .find(|player| Some(player.id.as_str()) == self.room.match_state.player_id.as_deref())
+            .find(|player| Some(player.id.as_str()) == local_player_id)
             .map(|player| player.name.as_str())
             .unwrap_or("local");
         let remote_name = room
             .players
             .iter()
-            .find(|player| Some(player.id.as_str()) != self.room.match_state.player_id.as_deref())
+            .find(|player| Some(player.id.as_str()) != local_player_id)
             .map(|player| player.name.as_str())
             .unwrap_or("opponent");
-        if winner == self.room.match_state.player_id.as_deref() {
-            self.room.local_user = format!("{local_name}：AC").into();
-            self.room.remote_user = format!("{remote_name}：结束").into();
-        } else if winner.is_some() {
-            self.room.local_user = format!("{local_name}：结束").into();
-            self.room.remote_user = format!("{remote_name}：AC").into();
-        } else {
-            self.room.local_user = format!("{local_name}：结束").into();
-            self.room.remote_user = format!("{remote_name}：结束").into();
+        match room.finish_reason {
+            Some(ServerRoomFinishReason::PlayerLeft) if winner == local_player_id => {
+                self.room.local_user = format!("{local_name}：胜利（对手离开）").into();
+                self.room.remote_user = format!("{remote_name}：离开").into();
+            }
+            Some(ServerRoomFinishReason::PlayerLeft) if winner.is_some() => {
+                self.room.local_user = format!("{local_name}：离开").into();
+                self.room.remote_user = format!("{remote_name}：胜利（对手离开）").into();
+            }
+            _ if winner == local_player_id => {
+                self.room.local_user = format!("{local_name}：AC").into();
+                self.room.remote_user = format!("{remote_name}：结束").into();
+            }
+            _ if winner.is_some() => {
+                self.room.local_user = format!("{local_name}：结束").into();
+                self.room.remote_user = format!("{remote_name}：AC").into();
+            }
+            _ => {
+                self.room.local_user = format!("{local_name}：结束").into();
+                self.room.remote_user = format!("{remote_name}：结束").into();
+            }
         }
         false
+    }
+
+    fn is_match_playing(&self) -> bool {
+        self.room.match_state.player_id.is_some() && self.room.match_state.room_id.is_some()
+    }
+
+    fn leave_active_match(&mut self, cx: &mut Context<Self>) {
+        let Some(player_id) = self.room.match_state.player_id.take() else {
+            return;
+        };
+        self.room.match_state.room_id.take();
+        let server_url = self.room.match_state.server_url.clone();
+        cx.background_spawn(async move {
+            RduelMatchCommand::Leave {
+                server_url,
+                player_id,
+            }
+            .run()
+        })
+        .detach_and_log_err(cx);
     }
 
     fn set_command_output(
@@ -2259,11 +2341,44 @@ impl Item for RduelView {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        self.has_unsaved_solution_buffers(cx)
+        self.has_unsaved_solution_buffers(cx) || self.is_match_playing()
     }
 
     fn can_save(&self, _cx: &App) -> bool {
         true
+    }
+
+    fn can_autosave(&self, cx: &App) -> bool {
+        !self.is_match_playing() && self.has_unsaved_solution_buffers(cx)
+    }
+
+    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        if self.main_rs_buffer.read(cx).is_dirty() {
+            self.main_rs_buffer.read(cx).project_path(cx)
+        } else if self.cargo_toml_buffer.read(cx).is_dirty() {
+            self.cargo_toml_buffer.read(cx).project_path(cx)
+        } else {
+            None
+        }
+    }
+
+    fn buffer_kind(&self, _cx: &App) -> ItemBufferKind {
+        ItemBufferKind::Singleton
+    }
+
+    fn for_each_project_item(
+        &self,
+        cx: &App,
+        f: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
+    ) {
+        f(
+            self.main_rs_buffer.entity_id(),
+            self.main_rs_buffer.read(cx),
+        );
+        f(
+            self.cargo_toml_buffer.entity_id(),
+            self.cargo_toml_buffer.read(cx),
+        );
     }
 
     fn save(
@@ -2274,6 +2389,37 @@ impl Item for RduelView {
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
         self.save_solution_editors(options, project, window, cx)
+    }
+
+    fn reload(
+        &mut self,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<anyhow::Result<()>> {
+        let main_rs_editor = self.main_rs_editor.clone();
+        let cargo_toml_editor = self.cargo_toml_editor.clone();
+
+        cx.spawn_in(window, async move |_, cx| {
+            let main_rs_reload = main_rs_editor.update_in(cx, |editor, window, cx| {
+                editor.reload(project.clone(), window, cx)
+            })?;
+            main_rs_reload.await?;
+
+            let cargo_toml_reload = cargo_toml_editor
+                .update_in(cx, |editor, window, cx| editor.reload(project, window, cx))?;
+            cargo_toml_reload.await
+        })
+    }
+
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                this.leave_active_match(cx);
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
