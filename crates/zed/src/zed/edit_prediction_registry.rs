@@ -28,6 +28,9 @@ pub fn init(client: Arc<Client>, user_store: Entity<UserStore>, cx: &mut App) {
             if !editor.mode().is_full() {
                 return;
             }
+            if editor.edit_predictions_disabled() {
+                return;
+            }
 
             register_backward_compatible_actions(editor, cx);
 
@@ -211,6 +214,9 @@ fn assign_edit_prediction_providers(
     for (editor, window) in editors.borrow().iter() {
         _ = window.update(cx, |_window, window, cx| {
             _ = editor.update(cx, |editor, cx| {
+                if editor.edit_predictions_disabled() {
+                    return;
+                }
                 assign_edit_prediction_provider(
                     editor,
                     provider_config,

@@ -632,6 +632,29 @@ async fn test_edit_prediction_preview_cleanup_on_toggle_off(cx: &mut gpui::TestA
 }
 
 #[gpui::test]
+async fn test_edit_predictions_can_be_disabled_for_an_editor(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    let provider = cx.new(|_| FakeEditPredictionDelegate::default());
+    assign_editor_completion_provider(provider.clone(), &mut cx);
+    cx.set_state("let x = ˇ;");
+
+    cx.update_editor(|editor, _, cx| {
+        assert!(editor.edit_predictions_enabled_at_cursor(cx));
+        editor.set_edit_predictions_disabled(true, cx);
+        assert!(!editor.edit_predictions_enabled_at_cursor(cx));
+    });
+
+    propose_edits(&provider, vec![(8..8, "42")], &mut cx);
+    cx.update_editor(|editor, window, cx| editor.update_visible_edit_prediction(window, cx));
+
+    cx.editor(|editor, _, _| {
+        assert!(!editor.has_active_edit_prediction());
+    });
+}
+
+#[gpui::test]
 async fn test_hidden_edit_prediction_does_not_open_snippet_menu_on_word_input(
     cx: &mut gpui::TestAppContext,
 ) {

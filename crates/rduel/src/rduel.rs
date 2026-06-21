@@ -1545,13 +1545,19 @@ impl RduelView {
         let main_rs_multibuffer = cx
             .new(|cx| MultiBuffer::singleton(main_rs_buffer, cx).with_title("src/main.rs".into()));
         let main_rs_editor = cx.new(|cx| {
-            Editor::for_multibuffer(main_rs_multibuffer, Some(project.clone()), window, cx)
+            let mut editor =
+                Editor::for_multibuffer(main_rs_multibuffer, Some(project.clone()), window, cx);
+            editor.set_edit_predictions_disabled(true, cx);
+            editor
         });
         let cargo_toml_multibuffer = cx.new(|cx| {
             MultiBuffer::singleton(cargo_toml_buffer, cx).with_title("Cargo.toml".into())
         });
         let cargo_toml_editor = cx.new(|cx| {
-            Editor::for_multibuffer(cargo_toml_multibuffer, Some(project.clone()), window, cx)
+            let mut editor =
+                Editor::for_multibuffer(cargo_toml_multibuffer, Some(project.clone()), window, cx);
+            editor.set_edit_predictions_disabled(true, cx);
+            editor
         });
         let command_output_editor = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);

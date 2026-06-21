@@ -1047,6 +1047,7 @@ pub struct Editor {
     /// Used to prevent flickering as the user types while the menu is open
     stale_edit_prediction_in_menu: Option<EditPredictionState>,
     edit_prediction_settings: EditPredictionSettings,
+    edit_predictions_disabled: bool,
     edit_predictions_hidden_for_vim_mode: bool,
     show_edit_predictions_override: Option<bool>,
     show_completions_on_input_override: Option<bool>,
@@ -2262,6 +2263,7 @@ impl Editor {
             hovered_cursors: HashMap::default(),
             next_editor_action_id: EditorActionId::default(),
             editor_actions: Rc::default(),
+            edit_predictions_disabled: false,
             edit_predictions_hidden_for_vim_mode: false,
             show_edit_predictions_override: None,
             show_completions_on_input_override: None,
@@ -2917,6 +2919,10 @@ impl Editor {
 
     pub fn mode(&self) -> &EditorMode {
         &self.mode
+    }
+
+    pub fn edit_predictions_disabled(&self) -> bool {
+        self.edit_predictions_disabled
     }
 
     pub fn set_mode(&mut self, mode: EditorMode) {

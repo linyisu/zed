@@ -185,6 +185,20 @@ impl Editor {
         }
     }
 
+    pub fn set_edit_predictions_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if self.edit_predictions_disabled == disabled {
+            return;
+        }
+        self.edit_predictions_disabled = disabled;
+        if disabled {
+            self.edit_prediction_provider = None;
+            self.edit_prediction_settings = EditPredictionSettings::Disabled;
+            self.discard_edit_prediction(EditPredictionDiscardReason::Ignored, cx);
+        } else {
+            self.update_edit_prediction_settings(cx);
+        }
+    }
+
     pub fn toggle_edit_predictions(
         &mut self,
         _: &ToggleEditPrediction,
@@ -1517,6 +1531,7 @@ impl Editor {
         cx: &App,
     ) -> EditPredictionSettings {
         if !self.mode.is_full()
+            || self.edit_predictions_disabled
             || !self.show_edit_predictions_override.unwrap_or(true)
             || self.edit_predictions_disabled_in_scope(buffer, buffer_position, cx)
         {
