@@ -508,9 +508,10 @@ async fn select_problem(problems: &[Problem]) -> anyhow::Result<Problem> {
 }
 
 async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
-    let html = reqwest::get(&fallback.url)
+    let statement_url = english_problem_url(&fallback.url);
+    let html = reqwest::get(&statement_url)
         .await
-        .context("requesting AtCoder problem")?
+        .with_context(|| format!("requesting AtCoder problem statement {statement_url}"))?
         .error_for_status()
         .context("AtCoder returned an error status")?
         .text()
@@ -519,9 +520,11 @@ async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
 
     let statement_html =
         extract_task_statement_html(&html).context("AtCoder task statement was not found")?;
+    let statement_html = wrap_var_tags_as_math(&statement_html);
     let mut handlers = markdown_handlers();
     let statement_markdown = convert_html_to_markdown(statement_html.as_bytes(), &mut handlers)
         .context("converting AtCoder statement to Markdown")?;
+    let statement_markdown = prefer_english_statement(statement_markdown);
     let samples = extract_markdown_samples(&statement_markdown);
     let samples = if samples.is_empty() {
         extract_html_samples(&statement_html)
@@ -534,6 +537,52 @@ async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
         fallback.samples = samples;
     }
     Ok(fallback)
+}
+
+fn english_problem_url(problem_url: &str) -> String {
+    if problem_url.contains('?') {
+        format!("{problem_url}&lang=en")
+    } else {
+        format!("{problem_url}?lang=en")
+    }
+}
+
+fn prefer_english_statement(markdown: String) -> String {
+    for marker in ["Score :", "### Problem Statement", "## Problem Statement"] {
+        if let Some(index) = markdown.find(marker) {
+            return markdown[index..].trim_start().to_string();
+        }
+    }
+    markdown
+}
+
+fn wrap_var_tags_as_math(html: &str) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut remaining = html;
+
+    while let Some(open_start) = remaining.find("<var") {
+        output.push_str(&remaining[..open_start]);
+        let after_open_start = &remaining[open_start..];
+        let Some(open_end) = after_open_start.find('>') else {
+            output.push_str(after_open_start);
+            return output;
+        };
+        let content_start = open_start + open_end + 1;
+        let after_content_start = &remaining[content_start..];
+        let Some(close_start) = after_content_start.find("</var>") else {
+            output.push_str(after_open_start);
+            return output;
+        };
+
+        let raw_math = &remaining[content_start..content_start + close_start];
+        output.push('$');
+        output.push_str(&html_unescape(raw_math).replace('$', "\\$"));
+        output.push('$');
+        remaining = &after_content_start[close_start + "</var>".len()..];
+    }
+
+    output.push_str(remaining);
+    output
 }
 
 fn markdown_handlers() -> Vec<TagHandler> {

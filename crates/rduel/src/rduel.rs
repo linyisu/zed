@@ -2244,15 +2244,7 @@ impl Render for RduelView {
     }
 }
 
-const STARTER_CODE: &str = r#"use std::io::{self, Read};
-
-fn main() {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).unwrap();
-    let mut it = input.split_whitespace();
-
-}
-"#;
+const STARTER_CODE: &str = "";
 
 const STARTER_ACR_PROBLEM_TOML: &str = r#"[package]
 name = "rduel"
