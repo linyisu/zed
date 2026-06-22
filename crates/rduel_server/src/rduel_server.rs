@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use time::{OffsetDateTime, format_description::FormatItem};
 use tokio::sync::Mutex;
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, Instant, interval, sleep_until};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -38,6 +38,17 @@ struct Args {
     session_file: Option<PathBuf>,
 }
 
+/// How long a finished room (and its players) is retained before being reaped.
+const ROOM_TTL_SECONDS: i64 = 600;
+/// How often the background sweeper reaps finished rooms.
+const ROOM_REAP_INTERVAL_SECONDS: u64 = 60;
+/// Minimum spacing between any two outbound AtCoder requests, server-wide.
+const ATCODER_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(700);
+/// Hard cap on AtCoder submission pages fetched per user per poll. The newest
+/// submissions come first, so a duel's winning AC is on the first page(s); this
+/// is only a safety net against a user with a very long submission history.
+const MAX_SUBMISSION_PAGES: u32 = 5;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -48,6 +59,23 @@ async fn main() -> anyhow::Result<()> {
         load_problem_pool(&args.problem_config)?,
         load_atcoder_revel_session(args.session_file.as_deref())?,
     );
+
+    {
+        let rooms = state.rooms.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(ROOM_REAP_INTERVAL_SECONDS));
+            loop {
+                ticker.tick().await;
+                let reaped = rooms
+                    .lock()
+                    .await
+                    .reap_finished(ROOM_TTL_SECONDS, unix_now());
+                if reaped > 0 {
+                    log::info!("reaped {reaped} finished Rduel room(s)");
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/health", get(health))
@@ -78,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
 struct ServerState {
     rooms: Arc<Mutex<RduelRooms>>,
     atcoder_revel_session: Option<Arc<str>>,
+    /// Spaces out all outbound AtCoder requests across every room so the shared
+    /// login session is not rate-limited or banned.
+    atcoder_rate_limiter: RateLimiter,
 }
 
 impl ServerState {
@@ -85,7 +116,37 @@ impl ServerState {
         Self {
             rooms: Arc::new(Mutex::new(RduelRooms::new(problems))),
             atcoder_revel_session: atcoder_revel_session.map(Arc::from),
+            atcoder_rate_limiter: RateLimiter::new(ATCODER_MIN_REQUEST_INTERVAL),
         }
+    }
+}
+
+/// Serializes outbound requests so consecutive calls are at least
+/// `min_interval` apart, regardless of how many rooms poll concurrently.
+#[derive(Clone)]
+struct RateLimiter {
+    next_allowed: Arc<Mutex<Instant>>,
+    min_interval: Duration,
+}
+
+impl RateLimiter {
+    fn new(min_interval: Duration) -> Self {
+        Self {
+            next_allowed: Arc::new(Mutex::new(Instant::now())),
+            min_interval,
+        }
+    }
+
+    /// Waits until this caller's time slot, reserving the next slot before
+    /// releasing the lock so concurrent callers queue rather than collide.
+    async fn acquire(&self) {
+        let slot = {
+            let mut next = self.next_allowed.lock().await;
+            let slot = (*next).max(Instant::now());
+            *next = slot + self.min_interval;
+            slot
+        };
+        sleep_until(slot).await;
     }
 }
 
@@ -93,6 +154,9 @@ struct RduelRooms {
     waiting_players: VecDeque<Player>,
     players: HashMap<String, PlayerLocation>,
     rooms: HashMap<String, Room>,
+    /// Per-player secret token. `player_id` is public (it appears in room state),
+    /// so a separate secret is required to authorize `/leave` and `/complete`.
+    player_tokens: HashMap<String, String>,
     problems: Vec<Problem>,
 }
 
@@ -102,8 +166,32 @@ impl RduelRooms {
             waiting_players: VecDeque::new(),
             players: HashMap::new(),
             rooms: HashMap::new(),
+            player_tokens: HashMap::new(),
             problems,
         }
+    }
+
+    /// Returns the player's secret token, generating one on first use.
+    fn ensure_token(&mut self, player_id: &str) -> String {
+        self.player_tokens
+            .entry(player_id.to_string())
+            .or_insert_with(|| Uuid::new_v4().to_string())
+            .clone()
+    }
+
+    fn token_for(&self, player_id: &str) -> String {
+        self.player_tokens.get(player_id).cloned().unwrap_or_default()
+    }
+
+    /// Constant-time-ish check that a non-empty token matches the player's.
+    fn token_matches(&self, player_id: &str, token: &str) -> bool {
+        !token.is_empty() && self.player_tokens.get(player_id).is_some_and(|t| t == token)
+    }
+
+    /// Removes a player from all bookkeeping, including its secret token.
+    fn forget_player(&mut self, player_id: &str) {
+        self.players.remove(player_id);
+        self.player_tokens.remove(player_id);
     }
 
     fn join(&mut self, request: JoinRequest) -> JoinDecision {
@@ -113,16 +201,19 @@ impl RduelRooms {
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
             name: request.name,
         };
+        let token = self.ensure_token(&player.id);
 
         if let Some(location) = self.players.get(&player.id).cloned() {
             return JoinDecision::Respond(match location {
-                PlayerLocation::Waiting => JoinResponse::Waiting {
+                PlayerLocation::Waiting | PlayerLocation::Matching => JoinResponse::Waiting {
                     player_id: player.id,
+                    token,
                 },
                 PlayerLocation::Room { room_id } => {
                     if let Some(room) = self.rooms.get(&room_id).cloned() {
                         JoinResponse::Matched {
                             player_id: player.id,
+                            token,
                             room,
                         }
                     } else {
@@ -132,6 +223,7 @@ impl RduelRooms {
                         self.waiting_players.push_back(player.clone());
                         JoinResponse::Waiting {
                             player_id: player.id,
+                            token,
                         }
                     }
                 }
@@ -157,6 +249,7 @@ impl RduelRooms {
             );
             return JoinDecision::Respond(JoinResponse::Waiting {
                 player_id: player.id,
+                token,
             });
         };
 
@@ -167,10 +260,27 @@ impl RduelRooms {
             player.id,
             player.name
         );
+        // Reserve both players atomically while problem selection runs without the
+        // lock held. The `Matching` state keeps them out of the waiting queue and
+        // lets a concurrent `/leave` cancel the pairing instead of being undone.
+        self.players
+            .insert(opponent.id.clone(), PlayerLocation::Matching);
+        self.players
+            .insert(player.id.clone(), PlayerLocation::Matching);
         JoinDecision::CreateRoom { opponent, player }
     }
 
     fn create_room(&mut self, opponent: Player, player: Player, problem: Problem) -> JoinResponse {
+        // If either player left while problem selection was in flight they are no
+        // longer `Matching`; abort rather than resurrecting them into a room.
+        let both_present = matches!(
+            self.players.get(&opponent.id),
+            Some(PlayerLocation::Matching)
+        ) && matches!(self.players.get(&player.id), Some(PlayerLocation::Matching));
+        if !both_present {
+            return self.requeue_pair(opponent, player);
+        }
+
         let room = Room {
             id: Uuid::new_v4().to_string(),
             players: [opponent.clone(), player.clone()],
@@ -185,6 +295,7 @@ impl RduelRooms {
                 (player.id.clone(), player.name.clone()),
             ]),
             polling_submissions: false,
+            finished_at_second: None,
         };
         let room_id = room.id.clone();
         log::info!(
@@ -195,7 +306,7 @@ impl RduelRooms {
         );
 
         self.players.insert(
-            opponent.id.clone(),
+            opponent.id,
             PlayerLocation::Room {
                 room_id: room.id.clone(),
             },
@@ -208,29 +319,42 @@ impl RduelRooms {
         );
         self.rooms.insert(room.id.clone(), room.clone());
 
+        let token = self.token_for(&player.id);
         JoinResponse::Matched {
             player_id: player.id,
+            token,
             room,
         }
     }
 
     fn requeue_pair(&mut self, opponent: Player, player: Player) -> JoinResponse {
-        self.players
-            .insert(opponent.id.clone(), PlayerLocation::Waiting);
-        self.waiting_players.push_front(opponent);
-        self.players
-            .insert(player.id.clone(), PlayerLocation::Waiting);
-        self.waiting_players.push_back(player.clone());
-        JoinResponse::Waiting {
-            player_id: player.id,
+        let player_id = player.id.clone();
+        let token = self.token_for(&player.id);
+        // Only requeue players that are still pending (`Matching`); a player that
+        // left during problem selection must stay gone.
+        if matches!(
+            self.players.get(&opponent.id),
+            Some(PlayerLocation::Matching)
+        ) {
+            self.players
+                .insert(opponent.id.clone(), PlayerLocation::Waiting);
+            self.waiting_players.push_front(opponent);
         }
+        if matches!(self.players.get(&player.id), Some(PlayerLocation::Matching)) {
+            self.players
+                .insert(player.id.clone(), PlayerLocation::Waiting);
+            self.waiting_players.push_back(player);
+        }
+        JoinResponse::Waiting { player_id, token }
     }
 
     fn player_state(&self, player_id: &str) -> Option<PlayerStateResponse> {
         match self.players.get(player_id)? {
-            PlayerLocation::Waiting => Some(PlayerStateResponse::Waiting {
-                player_id: player_id.to_string(),
-            }),
+            PlayerLocation::Waiting | PlayerLocation::Matching => {
+                Some(PlayerStateResponse::Waiting {
+                    player_id: player_id.to_string(),
+                })
+            }
             PlayerLocation::Room { room_id } => {
                 self.rooms
                     .get(room_id)
@@ -246,14 +370,20 @@ impl RduelRooms {
     fn leave_player(&mut self, player_id: &str) -> LeaveOutcome {
         match self.players.get(player_id).cloned() {
             Some(PlayerLocation::Waiting) => {
-                self.players.remove(player_id);
+                self.forget_player(player_id);
                 self.waiting_players
                     .retain(|player| player.id.as_str() != player_id);
                 LeaveOutcome::LeftWaiting
             }
+            Some(PlayerLocation::Matching) => {
+                // Cancel a pairing that is still selecting a problem; `create_room`
+                // will see the player is gone and abort instead of resurrecting them.
+                self.forget_player(player_id);
+                LeaveOutcome::LeftWaiting
+            }
             Some(PlayerLocation::Room { room_id }) => {
                 let Some(room) = self.rooms.get_mut(&room_id) else {
-                    self.players.remove(player_id);
+                    self.forget_player(player_id);
                     return LeaveOutcome::NotFound;
                 };
                 if !matches!(room.status, RoomStatus::Playing) {
@@ -266,8 +396,10 @@ impl RduelRooms {
                 room.status = RoomStatus::Finished;
                 room.winner_player_id = Some(winner.id.clone());
                 room.finish_reason = Some(RoomFinishReason::PlayerLeft);
-                self.players.remove(player_id);
-                LeaveOutcome::ForfeitedRoom(room.clone())
+                room.finished_at_second = Some(unix_now());
+                let finished_room = room.clone();
+                self.forget_player(player_id);
+                LeaveOutcome::ForfeitedRoom(finished_room)
             }
             None => LeaveOutcome::NotFound,
         }
@@ -289,7 +421,7 @@ impl RduelRooms {
         });
         let removed_count = removed_player_ids.len();
         for player_id in removed_player_ids {
-            self.players.remove(&player_id);
+            self.forget_player(&player_id);
         }
         removed_count
     }
@@ -307,6 +439,14 @@ impl RduelRooms {
         Some((room.clone(), should_start_polling))
     }
 
+    /// Clears the polling flag when a poll task stops, so a later watch request
+    /// can spawn a fresh poller instead of being permanently suppressed.
+    fn stop_submission_watch(&mut self, room_id: &str) {
+        if let Some(room) = self.rooms.get_mut(room_id) {
+            room.polling_submissions = false;
+        }
+    }
+
     fn complete_room(&mut self, room_id: &str, player_id: &str) -> Option<Room> {
         let room = self.rooms.get_mut(room_id)?;
         if !room.players.iter().any(|player| player.id == player_id) {
@@ -319,6 +459,7 @@ impl RduelRooms {
         room.status = RoomStatus::Finished;
         room.winner_player_id = Some(player_id.to_string());
         room.finish_reason = Some(RoomFinishReason::ManualComplete);
+        room.finished_at_second = Some(unix_now());
         Some(room.clone())
     }
 
@@ -339,13 +480,53 @@ impl RduelRooms {
         room.status = RoomStatus::Finished;
         room.winner_player_id = Some(player_id.to_string());
         room.finish_reason = Some(RoomFinishReason::Accepted);
+        room.finished_at_second = Some(unix_now());
+        // Parsed submissions don't carry the submitter handle; resolve it from the
+        // room's registered AtCoder users instead of the empty `submission.user_id`.
+        let atcoder_user = room
+            .atcoder_users
+            .get(player_id)
+            .cloned()
+            .unwrap_or_default();
         room.winning_submission = Some(WinningSubmission {
             player_id: player_id.to_string(),
-            atcoder_user: submission.user_id,
+            atcoder_user,
             epoch_second: submission.epoch_second,
             submission_id: submission.id,
         });
         Some(room.clone())
+    }
+
+    /// Removes rooms that finished more than `ttl_seconds` ago along with any
+    /// players still pointing at them. Returns the number of rooms reaped.
+    fn reap_finished(&mut self, ttl_seconds: i64, now: i64) -> usize {
+        let stale_room_ids: Vec<String> = self
+            .rooms
+            .iter()
+            .filter(|(_, room)| {
+                matches!(room.status, RoomStatus::Finished)
+                    && room
+                        .finished_at_second
+                        .is_some_and(|finished| now.saturating_sub(finished) >= ttl_seconds)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for room_id in &stale_room_ids {
+            let Some(room) = self.rooms.remove(room_id) else {
+                continue;
+            };
+            for player in room.players {
+                let still_in_room = matches!(
+                    self.players.get(&player.id),
+                    Some(PlayerLocation::Room { room_id: located }) if located == room_id
+                );
+                if still_in_room {
+                    self.forget_player(&player.id);
+                }
+            }
+        }
+        stale_room_ids.len()
     }
 }
 
@@ -364,6 +545,10 @@ enum LeaveOutcome {
 #[derive(Clone)]
 enum PlayerLocation {
     Waiting,
+    /// The player has been paired and removed from the waiting queue, but the
+    /// room has not been created yet because problem selection is in flight.
+    /// While in this state the player is not in `waiting_players`.
+    Matching,
     Room { room_id: String },
 }
 
@@ -376,13 +561,27 @@ struct JoinRequest {
 #[derive(Deserialize)]
 struct CompleteRoomRequest {
     player_id: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct LeaveRequest {
+    #[serde(default)]
+    token: String,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum JoinResponse {
-    Waiting { player_id: String },
-    Matched { player_id: String, room: Room },
+    Waiting {
+        player_id: String,
+        token: String,
+    },
+    Matched {
+        player_id: String,
+        token: String,
+        room: Room,
+    },
 }
 
 #[derive(Serialize)]
@@ -405,6 +604,10 @@ struct Room {
     atcoder_users: HashMap<String, String>,
     #[serde(skip)]
     polling_submissions: bool,
+    /// Unix second at which the room transitioned to `Finished`, used to reap
+    /// finished rooms (and their players) after a TTL.
+    #[serde(skip)]
+    finished_at_second: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -441,7 +644,6 @@ struct AtCoderSubmission {
     id: i64,
     epoch_second: i64,
     problem_id: String,
-    user_id: String,
     result: String,
 }
 
@@ -527,12 +729,16 @@ async fn player_state(
 async fn leave_player(
     State(state): State<ServerState>,
     Path(player_id): Path<String>,
-) -> Json<serde_json::Value> {
+    Json(request): Json<LeaveRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let outcome = {
         let mut rooms = state.rooms.lock().await;
+        if !rooms.token_matches(&player_id, &request.token) {
+            return Err(ApiError::Unauthorized("invalid player token"));
+        }
         rooms.leave_player(&player_id)
     };
-    match outcome {
+    Ok(match outcome {
         LeaveOutcome::LeftWaiting => {
             log::info!("Rduel waiting player {player_id} left matchmaking");
             Json(serde_json::json!({ "left": true, "state": "waiting" }))
@@ -549,7 +755,7 @@ async fn leave_player(
             Json(serde_json::json!({ "left": false, "state": "finished", "room": room }))
         }
         LeaveOutcome::NotFound => Json(serde_json::json!({ "left": false })),
-    }
+    })
 }
 
 async fn room_state(
@@ -570,6 +776,9 @@ async fn complete_room(
 ) -> Result<Json<Room>, ApiError> {
     let room = {
         let mut rooms = state.rooms.lock().await;
+        if !rooms.token_matches(&request.player_id, &request.token) {
+            return Err(ApiError::Unauthorized("invalid player token"));
+        }
         rooms
             .complete_room(&room_id, &request.player_id)
             .ok_or(ApiError::NotFound("room or player was not found"))?
@@ -617,12 +826,13 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
         ticker.tick().await;
 
         let room = {
-            let rooms = state.rooms.lock().await;
+            let mut rooms = state.rooms.lock().await;
             let Some(room) = rooms.room_state(&room_id) else {
                 log::warn!("stopping Rduel polling because room {room_id} no longer exists");
                 return;
             };
             if !matches!(room.status, RoomStatus::Playing) {
+                rooms.stop_submission_watch(&room_id);
                 log::info!("stopping Rduel polling because room {room_id} is finished");
                 return;
             }
@@ -632,6 +842,7 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
         let Some((player_id, submission)) = earliest_ac_submission(
             &room,
             state.atcoder_revel_session.as_deref(),
+            &state.atcoder_rate_limiter,
             &mut last_fetch_errors,
         )
         .await
@@ -653,6 +864,7 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
 async fn earliest_ac_submission(
     room: &Room,
     atcoder_revel_session: Option<&str>,
+    rate_limiter: &RateLimiter,
     last_fetch_errors: &mut HashMap<String, String>,
 ) -> Option<(String, AtCoderSubmission)> {
     let mut earliest: Option<(String, AtCoderSubmission)> = None;
@@ -665,6 +877,8 @@ async fn earliest_ac_submission(
             atcoder_user,
             &room.problem,
             atcoder_revel_session,
+            room.started_at_second,
+            rate_limiter,
         )
         .await
         {
@@ -714,6 +928,8 @@ async fn fetch_user_submissions(
     atcoder_user: &str,
     problem: &Problem,
     atcoder_revel_session: Option<&str>,
+    started_at_second: i64,
+    rate_limiter: &RateLimiter,
 ) -> anyhow::Result<Vec<AtCoderSubmission>> {
     let revel_session = match atcoder_revel_session {
         Some(revel_session) if !revel_session.trim().is_empty() => revel_session,
@@ -732,11 +948,12 @@ async fn fetch_user_submissions(
         .context("building AtCoder submissions HTTP client")?;
     let mut submissions = Vec::new();
 
-    for page in 1.. {
+    for page in 1..=MAX_SUBMISSION_PAGES {
         let url = format!(
             "https://atcoder.jp/contests/{contest_id}/submissions?f.User={atcoder_user}&f.Task={}&page={page}",
             problem.id
         );
+        rate_limiter.acquire().await;
         let response = client
             .get(&url)
             .header(COOKIE, format!("REVEL_SESSION={}", revel_session.trim()))
@@ -764,11 +981,15 @@ async fn fetch_user_submissions(
         if page_submissions.is_empty() {
             break;
         }
+        // Submissions are newest-first, so once an entire page predates the room
+        // there are no newer relevant submissions on later pages.
+        let page_is_all_old = page_submissions
+            .iter()
+            .all(|submission| submission.epoch_second < started_at_second);
         submissions.extend(page_submissions);
-        if page >= 20 {
+        if page_is_all_old {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     Ok(submissions)
@@ -826,7 +1047,6 @@ fn parse_atcoder_submissions_page(
             id,
             epoch_second,
             problem_id: problem_id.to_string(),
-            user_id: String::new(),
             result,
         });
     }
@@ -848,6 +1068,7 @@ fn html_selector(selector: &str) -> anyhow::Result<Selector> {
 
 enum ApiError {
     NotFound(&'static str),
+    Unauthorized(&'static str),
 }
 
 impl IntoResponse for ApiError {
@@ -855,6 +1076,11 @@ impl IntoResponse for ApiError {
         match self {
             Self::NotFound(message) => (
                 StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Self::Unauthorized(message) => (
+                StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({ "error": message })),
             )
                 .into_response(),
@@ -1340,11 +1566,11 @@ mod tests {
 
         assert!(matches!(
             rooms.join(join_request("player-1", "atcoder-user-a")),
-            JoinDecision::Respond(JoinResponse::Waiting { player_id }) if player_id == "player-1"
+            JoinDecision::Respond(JoinResponse::Waiting { player_id, .. }) if player_id == "player-1"
         ));
         assert!(matches!(
             rooms.join(join_request("player-1", "atcoder-user-a")),
-            JoinDecision::Respond(JoinResponse::Waiting { player_id }) if player_id == "player-1"
+            JoinDecision::Respond(JoinResponse::Waiting { player_id, .. }) if player_id == "player-1"
         ));
 
         assert_eq!(rooms.waiting_players.len(), 1);
@@ -1367,13 +1593,64 @@ mod tests {
         ));
         assert!(matches!(
             rooms.join(join_request("new-player", "atcoder-user-a")),
-            JoinDecision::Respond(JoinResponse::Waiting { player_id }) if player_id == "new-player"
+            JoinDecision::Respond(JoinResponse::Waiting { player_id, .. }) if player_id == "new-player"
         ));
 
         assert!(!rooms.players.contains_key("old-player"));
         assert!(rooms.players.contains_key("new-player"));
         assert_eq!(rooms.waiting_players.len(), 1);
         assert_eq!(rooms.waiting_players[0].id, "new-player");
+    }
+
+    #[test]
+    fn leaving_during_matching_aborts_room_creation() {
+        let mut rooms = test_rooms();
+        rooms.join(join_request("player-1", "atcoder-user-a"));
+        let JoinDecision::CreateRoom { opponent, player } =
+            rooms.join(join_request("player-2", "atcoder-user-b"))
+        else {
+            panic!("expected a CreateRoom decision");
+        };
+
+        // player-1 leaves while problem selection is still in flight.
+        assert!(matches!(
+            rooms.leave_player("player-1"),
+            LeaveOutcome::LeftWaiting
+        ));
+
+        // create_room must not resurrect the player that left; it requeues only
+        // the survivor and creates no room.
+        let problem = rooms.problems[0].clone();
+        let response = rooms.create_room(opponent, player, problem);
+        assert!(
+            matches!(response, JoinResponse::Waiting { player_id, .. } if player_id == "player-2")
+        );
+        assert!(!rooms.players.contains_key("player-1"));
+        assert!(rooms.rooms.is_empty());
+        assert_eq!(rooms.waiting_players.len(), 1);
+        assert_eq!(rooms.waiting_players[0].id, "player-2");
+    }
+
+    #[test]
+    fn join_issues_token_required_for_privileged_actions() {
+        let mut rooms = test_rooms();
+        let JoinDecision::Respond(JoinResponse::Waiting { player_id, token }) =
+            rooms.join(join_request("player-1", "atcoder-user-a"))
+        else {
+            panic!("expected a Waiting response");
+        };
+
+        assert!(!token.is_empty());
+        assert!(rooms.token_matches(&player_id, &token));
+        assert!(!rooms.token_matches(&player_id, "wrong-token"));
+        assert!(!rooms.token_matches(&player_id, ""));
+
+        // Leaving forgets the player and their token.
+        assert!(matches!(
+            rooms.leave_player(&player_id),
+            LeaveOutcome::LeftWaiting
+        ));
+        assert!(!rooms.token_matches(&player_id, &token));
     }
 
     #[test]
