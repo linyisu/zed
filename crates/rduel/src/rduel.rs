@@ -9,9 +9,9 @@ use std::{
 
 use editor::{Editor, MultiBuffer};
 use gpui::{
-    Action, App, ClipboardItem, Context, DismissEvent, DragMoveEvent, Empty, Entity, EventEmitter,
-    FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseUpEvent, Render, ScrollHandle,
-    SharedString, WeakEntity, Window, div, px,
+    Action, AnyElement, App, ClipboardItem, Context, DismissEvent, DragMoveEvent, Empty, Entity,
+    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseUpEvent, Render,
+    ScrollHandle, SharedString, WeakEntity, Window, div, px,
 };
 use language::{Buffer, LanguageRegistry};
 use markdown::{
@@ -38,7 +38,7 @@ const MAX_PROBLEM_WIDTH_FRACTION: f32 = 0.75;
 const DEFAULT_COMMAND_OUTPUT_HEIGHT: f32 = 156.0;
 const MIN_COMMAND_OUTPUT_HEIGHT: f32 = 96.0;
 const MAX_COMMAND_OUTPUT_HEIGHT: f32 = 360.0;
-const PROBLEM_MARKDOWN_FONT_SCALE: f32 = 1.05;
+const PROBLEM_MARKDOWN_FONT_SCALE: f32 = 1.12;
 const DEFAULT_RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
 
 #[derive(Clone, Debug, RegisterSetting)]
@@ -402,8 +402,113 @@ struct RduelView {
     problem_width_fraction: f32,
     command_output_height: f32,
     problem_scroll_handle: ScrollHandle,
-    command_output_editor: Entity<Editor>,
+    command_output: CommandOutputState,
     command_status: CommandStatus,
+}
+
+#[derive(Clone)]
+struct CommandOutputState {
+    items: Vec<CommandOutputItem>,
+    selected_index: Option<usize>,
+}
+
+#[derive(Clone)]
+struct CommandOutputItem {
+    label: SharedString,
+    status: CommandOutputItemStatus,
+    detail: Option<CommandOutputDetail>,
+}
+
+#[derive(Clone)]
+struct CommandOutputDetail {
+    heading: SharedString,
+    sections: Vec<CommandOutputDetailSection>,
+}
+
+#[derive(Clone)]
+struct CommandOutputDetailSection {
+    title: SharedString,
+    body: SharedString,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandOutputItemStatus {
+    Pending,
+    Passed,
+    Failed,
+}
+
+impl CommandOutputState {
+    fn initial(sample_count: usize) -> Self {
+        let mut items = vec![CommandOutputItem {
+            label: "cargo build".into(),
+            status: CommandOutputItemStatus::Pending,
+            detail: None,
+        }];
+        if sample_count == 0 {
+            items.push(CommandOutputItem {
+                label: "Samples".into(),
+                status: CommandOutputItemStatus::Pending,
+                detail: Some(CommandOutputDetail::new("No sample cases found.")),
+            });
+        } else {
+            items.extend((1..=sample_count).map(|index| CommandOutputItem {
+                label: format!("Case {index}").into(),
+                status: CommandOutputItemStatus::Pending,
+                detail: None,
+            }));
+        }
+
+        Self {
+            selected_index: None,
+            items,
+        }
+    }
+
+    fn running(label: &'static str) -> Self {
+        Self {
+            items: vec![CommandOutputItem {
+                label: label.into(),
+                status: CommandOutputItemStatus::Pending,
+                detail: Some(CommandOutputDetail::new("Waiting for command output...")),
+            }],
+            selected_index: Some(0),
+        }
+    }
+}
+
+fn single_command_output_state(
+    label: impl Into<SharedString>,
+    status: CommandOutputItemStatus,
+    detail: impl Into<SharedString>,
+) -> CommandOutputState {
+    CommandOutputState {
+        items: vec![CommandOutputItem {
+            label: label.into(),
+            status,
+            detail: Some(CommandOutputDetail::new(detail)),
+        }],
+        selected_index: Some(0),
+    }
+}
+
+impl CommandOutputDetail {
+    fn new(heading: impl Into<SharedString>) -> Self {
+        Self {
+            heading: heading.into(),
+            sections: Vec::new(),
+        }
+    }
+
+    fn with_sections(
+        heading: impl Into<SharedString>,
+        sections: Vec<CommandOutputDetailSection>,
+    ) -> Self {
+        Self {
+            heading: heading.into(),
+            sections,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -437,14 +542,13 @@ impl Render for DraggedRduelOutputDivider {
 }
 
 struct RoomState {
-    local_user: SharedString,
-    remote_user: SharedString,
     match_state: MatchState,
 }
 
 struct RduelProblem {
     title: SharedString,
     markdown: SharedString,
+    sample_count: usize,
 }
 
 impl RduelProblem {
@@ -452,6 +556,7 @@ impl RduelProblem {
         Self {
             title: problem.title.clone().into(),
             markdown: problem.statement_markdown.clone().into(),
+            sample_count: problem.samples.len(),
         }
     }
 }
@@ -461,7 +566,6 @@ struct RduelSession {
     player_id: String,
     room: Option<ServerRoom>,
     server_url: String,
-    atcoder_user: String,
 }
 
 #[derive(Clone)]
@@ -570,23 +674,14 @@ enum RduelMatchOutput {
 #[derive(Clone, Copy)]
 enum CommandStatus {
     Idle,
-    Running(&'static str),
+    Running,
     Succeeded,
     Failed,
 }
 
 impl CommandStatus {
     fn is_running(self) -> bool {
-        matches!(self, Self::Running(_))
-    }
-
-    fn label(self) -> SharedString {
-        match self {
-            Self::Idle => "Idle".into(),
-            Self::Running(label) => format!("{label} running").into(),
-            Self::Succeeded => "Done".into(),
-            Self::Failed => "Failed".into(),
-        }
+        matches!(self, Self::Running)
     }
 }
 
@@ -617,7 +712,7 @@ impl RduelMatchModal {
         });
         window.focus(&atcoder_user_editor.read(cx).focus_handle(cx), cx);
 
-        let mut modal = Self {
+        Self {
             focus_handle: cx.focus_handle(),
             workspace,
             atcoder_user_editor,
@@ -625,11 +720,7 @@ impl RduelMatchModal {
             player_id: None,
             status: "输入 AtCoder 用户名后开始匹配。".into(),
             is_waiting: false,
-        };
-        if !configured_atcoder_user.is_empty() {
-            modal.join(window, cx);
         }
-        modal
     }
 
     fn join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -736,17 +827,10 @@ impl RduelMatchModal {
                 self.status = "匹配成功，正在打开 Rduel...".into();
                 self.is_waiting = false;
                 self.player_id = None;
-                let atcoder_user = self
-                    .atcoder_user_editor
-                    .read(cx)
-                    .text(cx)
-                    .trim()
-                    .to_string();
                 let session = RduelSession {
                     player_id: player_id.clone(),
                     room: Some(room),
                     server_url: self.server_url.clone(),
-                    atcoder_user: atcoder_user.clone(),
                 };
                 let workspace = self.workspace.clone();
                 let window_handle = window.window_handle();
@@ -787,6 +871,8 @@ impl Render for RduelMatchModal {
             .child(
                 div()
                     .h(px(32.))
+                    .flex()
+                    .items_center()
                     .border_1()
                     .border_color(cx.theme().colors().border)
                     .rounded_sm()
@@ -806,7 +892,7 @@ impl Render for RduelMatchModal {
                 ),
             )
             .when(self.is_waiting, |this| {
-                this.child(Label::new("等待服务器匹配并准备题面...").size(LabelSize::Small))
+                this.child(Label::new("等待服务器匹配并准备题面...").size(LabelSize::Default))
             })
             .on_action(cx.listener(|this, _: &Confirm, window, cx| {
                 if !this.is_waiting {
@@ -867,6 +953,7 @@ enum RduelCommand {
 struct RduelCommandOutput {
     success: bool,
     rendered: String,
+    items: Vec<CommandOutputItem>,
     submit_ready: Option<RduelSubmitReady>,
 }
 
@@ -954,6 +1041,7 @@ async fn run_rduel_submit(
                     "{}\n\nSubmit was stopped because the solution did not build.",
                     test_output.rendered
                 ),
+                items: test_output.items,
                 submit_ready: None,
             });
         }
@@ -972,6 +1060,7 @@ async fn run_rduel_submit(
             source_path.display(),
             submit_url,
         ),
+        items: submit_ready_items(&test_output, &source_path, &submit_url),
         submit_ready: Some(RduelSubmitReady {
             source_code,
             source_path,
@@ -1274,9 +1363,21 @@ fn executable_search_paths() -> Vec<PathBuf> {
 // Rduel vendors the runner behavior so users do not need an external `acr` binary.
 #[derive(Debug)]
 enum EmbeddedAcrTestResult {
-    Ac,
-    Wa { actual: String, expected: String },
-    Re { stderr: String },
+    Ac {
+        input: String,
+        actual: String,
+        expected: String,
+    },
+    Wa {
+        input: String,
+        actual: String,
+        expected: String,
+    },
+    Re {
+        input: Option<String>,
+        expected: Option<String>,
+        stderr: String,
+    },
 }
 
 async fn run_embedded_sample_tests(
@@ -1300,6 +1401,8 @@ async fn run_embedded_sample_tests(
                 results.push((
                     index,
                     EmbeddedAcrTestResult::Re {
+                        input: None,
+                        expected: None,
                         stderr: format!("Failed to read {}: {error}", input_path.display()),
                     },
                 ));
@@ -1313,6 +1416,8 @@ async fn run_embedded_sample_tests(
                 results.push((
                     index,
                     EmbeddedAcrTestResult::Re {
+                        input: Some(input),
+                        expected: None,
                         stderr: format!("Failed to read {}: {error}", output_path.display()),
                     },
                 ));
@@ -1339,6 +1444,8 @@ async fn run_embedded_sample_test(
 ) -> EmbeddedAcrTestResult {
     let Some(cargo) = resolve_rduel_executable("cargo") else {
         return EmbeddedAcrTestResult::Re {
+            input: Some(input),
+            expected: Some(expected),
             stderr: "could not find `cargo` in PATH or common user bin directories".into(),
         };
     };
@@ -1354,6 +1461,8 @@ async fn run_embedded_sample_test(
         Ok(child) => child,
         Err(error) => {
             return EmbeddedAcrTestResult::Re {
+                input: Some(input),
+                expected: Some(expected),
                 stderr: error.to_string(),
             };
         }
@@ -1363,6 +1472,8 @@ async fn run_embedded_sample_test(
         use smol::io::AsyncWriteExt;
         if let Err(error) = stdin.write_all(input.as_bytes()).await {
             return EmbeddedAcrTestResult::Re {
+                input: Some(input),
+                expected: Some(expected),
                 stderr: error.to_string(),
             };
         }
@@ -1372,6 +1483,8 @@ async fn run_embedded_sample_test(
         Ok(output) => output,
         Err(error) => {
             return EmbeddedAcrTestResult::Re {
+                input: Some(input),
+                expected: Some(expected),
                 stderr: error.to_string(),
             };
         }
@@ -1380,13 +1493,22 @@ async fn run_embedded_sample_test(
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        return EmbeddedAcrTestResult::Re { stderr };
+        return EmbeddedAcrTestResult::Re {
+            input: Some(input),
+            expected: Some(expected),
+            stderr,
+        };
     }
 
     if stdout.trim_end() == expected.trim_end() {
-        EmbeddedAcrTestResult::Ac
+        EmbeddedAcrTestResult::Ac {
+            input,
+            actual: stdout,
+            expected,
+        }
     } else {
         EmbeddedAcrTestResult::Wa {
+            input,
             actual: stdout,
             expected,
         }
@@ -1401,6 +1523,7 @@ fn render_embedded_test_steps(
     let Some(build_step) = steps.iter().find(|step| step.label == "cargo build") else {
         return render_command_steps(steps);
     };
+    let build_item = process_output_item(build_step);
 
     if !build_step.status.success() {
         let mut rendered = String::from("Build failed.\n\n");
@@ -1412,6 +1535,7 @@ fn render_embedded_test_steps(
         return RduelCommandOutput {
             success,
             rendered,
+            items: vec![build_item],
             submit_ready: None,
         };
     }
@@ -1420,13 +1544,21 @@ fn render_embedded_test_steps(
         return RduelCommandOutput {
             success,
             rendered: "Build: OK\nTest: no sample cases found.".into(),
+            items: vec![
+                build_item,
+                CommandOutputItem {
+                    label: "Samples".into(),
+                    status: CommandOutputItemStatus::Pending,
+                    detail: Some(CommandOutputDetail::new("No sample cases found.")),
+                },
+            ],
             submit_ready: None,
         };
     }
 
     let passed = results
         .iter()
-        .filter(|(_, result)| matches!(result, EmbeddedAcrTestResult::Ac))
+        .filter(|(_, result)| matches!(result, EmbeddedAcrTestResult::Ac { .. }))
         .count();
     let success = success && passed == results.len();
 
@@ -1434,23 +1566,26 @@ fn render_embedded_test_steps(
         return RduelCommandOutput {
             success,
             rendered: format!("Build: OK\nTest: AC ({passed} cases)"),
+            items: embedded_test_items(build_item, &results),
             submit_ready: None,
         };
     }
 
     let mut rendered = String::from("Build: OK\nTest: Failed\n");
     rendered.push_str(&format!("{passed}/{} cases passed\n", results.len()));
-    for (index, result) in results {
+    for (index, result) in &results {
         match result {
-            EmbeddedAcrTestResult::Ac => {}
-            EmbeddedAcrTestResult::Wa { actual, expected } => {
+            EmbeddedAcrTestResult::Ac { .. } => {}
+            EmbeddedAcrTestResult::Wa {
+                actual, expected, ..
+            } => {
                 rendered.push_str(&format!(
                     "\nCase {index}: WA\nExpected:\n{}\n\nActual:\n{}\n",
                     expected.trim_end(),
                     actual.trim_end()
                 ));
             }
-            EmbeddedAcrTestResult::Re { stderr } => {
+            EmbeddedAcrTestResult::Re { stderr, .. } => {
                 rendered.push_str(&format!("\nCase {index}: RE\n{}\n", stderr.trim_end()));
             }
         }
@@ -1459,6 +1594,7 @@ fn render_embedded_test_steps(
     RduelCommandOutput {
         success,
         rendered,
+        items: embedded_test_items(build_item, &results),
         submit_ready: None,
     }
 }
@@ -1503,8 +1639,164 @@ fn render_command_steps(steps: Vec<RduelProcessOutput>) -> RduelCommandOutput {
     RduelCommandOutput {
         success,
         rendered,
+        items: steps.iter().map(process_output_item).collect(),
         submit_ready: None,
     }
+}
+
+fn embedded_test_items(
+    build_item: CommandOutputItem,
+    results: &[(usize, EmbeddedAcrTestResult)],
+) -> Vec<CommandOutputItem> {
+    let mut items = vec![build_item];
+    items.extend(results.iter().map(|(index, result)| match result {
+        EmbeddedAcrTestResult::Ac {
+            input,
+            actual,
+            expected,
+        } => CommandOutputItem {
+            label: format!("Case {index}").into(),
+            status: CommandOutputItemStatus::Passed,
+            detail: Some(sample_detail(
+                "Accepted",
+                Some(input),
+                Some(expected),
+                Some(actual),
+                None,
+            )),
+        },
+        EmbeddedAcrTestResult::Wa {
+            input,
+            actual,
+            expected,
+        } => CommandOutputItem {
+            label: format!("Case {index}").into(),
+            status: CommandOutputItemStatus::Failed,
+            detail: Some(sample_detail(
+                "Wrong Answer",
+                Some(input),
+                Some(expected),
+                Some(actual),
+                None,
+            )),
+        },
+        EmbeddedAcrTestResult::Re {
+            input,
+            expected,
+            stderr,
+        } => CommandOutputItem {
+            label: format!("Case {index}").into(),
+            status: CommandOutputItemStatus::Failed,
+            detail: Some(sample_detail(
+                "Runtime Error",
+                input.as_ref(),
+                expected.as_ref(),
+                None,
+                Some(stderr),
+            )),
+        },
+    }));
+    items
+}
+
+fn sample_detail(
+    heading: &str,
+    input: Option<&String>,
+    expected: Option<&String>,
+    actual: Option<&String>,
+    stderr: Option<&String>,
+) -> CommandOutputDetail {
+    let mut sections = Vec::new();
+    if let Some(input) = input {
+        sections.push(CommandOutputDetailSection {
+            title: "Input".into(),
+            body: input.trim_end().to_string().into(),
+        });
+    }
+    if let Some(expected) = expected {
+        sections.push(CommandOutputDetailSection {
+            title: "Expected".into(),
+            body: expected.trim_end().to_string().into(),
+        });
+    }
+    if let Some(actual) = actual {
+        sections.push(CommandOutputDetailSection {
+            title: "Actual".into(),
+            body: actual.trim_end().to_string().into(),
+        });
+    }
+    if let Some(stderr) = stderr {
+        sections.push(CommandOutputDetailSection {
+            title: "Stderr".into(),
+            body: stderr.trim_end().to_string().into(),
+        });
+    }
+    CommandOutputDetail::with_sections(heading, sections)
+}
+
+fn process_output_item(step: &RduelProcessOutput) -> CommandOutputItem {
+    let code = step
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| code.to_string());
+    let mut sections = Vec::new();
+    if !step.stdout.trim().is_empty() {
+        sections.push(CommandOutputDetailSection {
+            title: "stdout".into(),
+            body: step.stdout.trim_end().to_string().into(),
+        });
+    }
+    if !step.stderr.trim().is_empty() {
+        sections.push(CommandOutputDetailSection {
+            title: "stderr".into(),
+            body: step.stderr.trim_end().to_string().into(),
+        });
+    }
+    let heading = if step.status.success() {
+        format!("{} succeeded", step.label)
+    } else {
+        format!("{} failed (exit {code})", step.label)
+    };
+
+    CommandOutputItem {
+        label: step.label.into(),
+        status: if step.status.success() {
+            CommandOutputItemStatus::Passed
+        } else {
+            CommandOutputItemStatus::Failed
+        },
+        detail: Some(CommandOutputDetail::with_sections(heading, sections)),
+    }
+}
+
+fn submit_ready_items(
+    test_output: &RduelCommandOutput,
+    source_path: &Path,
+    submit_url: &str,
+) -> Vec<CommandOutputItem> {
+    let mut items = test_output.items.clone();
+    items.push(CommandOutputItem {
+        label: "Submit".into(),
+        status: CommandOutputItemStatus::Passed,
+        detail: Some(CommandOutputDetail::with_sections(
+            "Ready",
+            vec![
+                CommandOutputDetailSection {
+                    title: "Source file".into(),
+                    body: source_path.display().to_string().into(),
+                },
+                CommandOutputDetailSection {
+                    title: "Submit page".into(),
+                    body: submit_url.to_string().into(),
+                },
+                CommandOutputDetailSection {
+                    title: "Clipboard".into(),
+                    body: "Source code was copied to the system clipboard.".into(),
+                },
+            ],
+        )),
+    });
+    items
 }
 
 impl RduelView {
@@ -1525,22 +1817,14 @@ impl RduelView {
             .unwrap_or_else(|| RduelProblem {
                 title: "Rduel".into(),
                 markdown: "No problem was received from the server.".into(),
+                sample_count: 0,
             });
         let room_id = session.room.as_ref().map(|room| room.id.clone());
-        let remote_user = session
-            .room
-            .as_ref()
-            .and_then(|room| {
-                room.players
-                    .iter()
-                    .find(|player| player.id != session.player_id)
-                    .map(|player| player.name.clone())
-            })
-            .unwrap_or_else(|| "waiting".to_string());
         let main_rs_buffer_for_view = main_rs_buffer.clone();
         let cargo_toml_buffer_for_view = cargo_toml_buffer.clone();
         let problem_markdown =
             Self::new_problem_markdown(problem.markdown.clone(), language_registry, cx);
+        let sample_count = problem.sample_count;
 
         let main_rs_multibuffer = cx
             .new(|cx| MultiBuffer::singleton(main_rs_buffer, cx).with_title("src/main.rs".into()));
@@ -1559,19 +1843,10 @@ impl RduelView {
             editor.set_edit_predictions_disabled(true, cx);
             editor
         });
-        let command_output_editor = cx.new(|cx| {
-            let mut editor = Editor::multi_line(window, cx);
-            editor.set_text("Test / Submit output will appear here.", window, cx);
-            editor.set_read_only(true);
-            editor
-        });
-
         let view = Self {
             focus_handle: cx.focus_handle(),
             project,
             room: RoomState {
-                local_user: format!("{}：作答中", session.atcoder_user).into(),
-                remote_user: format!("{remote_user}：作答中").into(),
                 match_state: MatchState {
                     player_id: Some(session.player_id),
                     room_id,
@@ -1591,7 +1866,7 @@ impl RduelView {
             problem_width_fraction: DEFAULT_PROBLEM_WIDTH_FRACTION,
             command_output_height: DEFAULT_COMMAND_OUTPUT_HEIGHT,
             problem_scroll_handle: ScrollHandle::new(),
-            command_output_editor,
+            command_output: CommandOutputState::initial(sample_count),
             command_status: CommandStatus::Idle,
         };
         view.poll_room_after_delay(cx);
@@ -1623,11 +1898,13 @@ impl RduelView {
         let Some(rduel_project) = self.rduel_project.clone() else {
             self.command_status = CommandStatus::Failed;
             self.set_command_output(
-                "Rduel project files are not available. Reopen Rduel after checking ~/.rduel.",
-                window,
+                single_command_output_state(
+                    "Project",
+                    CommandOutputItemStatus::Failed,
+                    "Rduel project files are not available. Reopen Rduel after checking ~/.rduel.",
+                ),
                 cx,
             );
-            cx.notify();
             return;
         };
 
@@ -1679,11 +1956,13 @@ impl RduelView {
         let Some(rduel_project) = self.rduel_project.clone() else {
             self.command_status = CommandStatus::Failed;
             self.set_command_output(
-                "Rduel project files are not available. Reopen Rduel after checking ~/.rduel.",
-                window,
+                single_command_output_state(
+                    "Project",
+                    CommandOutputItemStatus::Failed,
+                    "Rduel project files are not available. Reopen Rduel after checking ~/.rduel.",
+                ),
                 cx,
             );
-            cx.notify();
             return;
         };
 
@@ -1730,9 +2009,8 @@ impl RduelView {
             return;
         }
 
-        self.command_status = CommandStatus::Running(label);
-        self.set_command_output(format!("{label} is running..."), window, cx);
-        cx.notify();
+        self.command_status = CommandStatus::Running;
+        self.set_command_output(CommandOutputState::running(label), cx);
 
         let save_task =
             self.save_solution_editors(SaveOptions::default(), self.project.clone(), window, cx);
@@ -1744,8 +2022,8 @@ impl RduelView {
                     .await
             }
             .await;
-            this.update_in(cx, |this, window, cx| {
-                let mut output_text = match result {
+            this.update_in(cx, |this, _window, cx| {
+                let mut output_state = match result {
                     Ok(output) => {
                         this.command_status = if output.success {
                             CommandStatus::Succeeded
@@ -1763,23 +2041,34 @@ impl RduelView {
                                 submit_ready.source_path.display()
                             );
                         }
-                        output.rendered
+                        CommandOutputState {
+                            items: output.items,
+                            selected_index: Some(0),
+                        }
                     }
                     Err(error) => {
                         this.command_status = CommandStatus::Failed;
-                        format!("Failed before running command:\n{error:#}")
+                        let detail = format!("Failed before running command:\n{error:#}");
+                        single_command_output_state(
+                            "Command",
+                            CommandOutputItemStatus::Failed,
+                            detail,
+                        )
                     }
                 };
 
                 if !rduel_project.root_path.exists() {
-                    output_text.push_str(&format!(
-                        "\n\nWarning: Rduel project directory no longer exists: {}",
-                        rduel_project.root_path.display()
-                    ));
+                    output_state.items.push(CommandOutputItem {
+                        label: "Project".into(),
+                        status: CommandOutputItemStatus::Failed,
+                        detail: Some(CommandOutputDetail::new(format!(
+                            "Rduel project directory no longer exists: {}",
+                            rduel_project.root_path.display()
+                        ))),
+                    });
                 }
 
-                this.set_command_output(output_text, window, cx);
-                cx.notify();
+                this.set_command_output(output_state, cx);
             })
         })
         .detach_and_log_err(cx);
@@ -1823,10 +2112,18 @@ impl RduelView {
                 })
                 .await;
 
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(RduelMatchOutput::RoomStatus { room }) => {
-                        if this.apply_room_status(room) {
+                        if let Some(message) = this.apply_room_status(room) {
+                            drop(window.prompt(
+                                gpui::PromptLevel::Info,
+                                &message,
+                                None,
+                                &["OK"],
+                                cx,
+                            ));
+                        } else {
                             this.poll_room_after_delay(cx);
                         }
                     }
@@ -1846,57 +2143,40 @@ impl RduelView {
         .detach_and_log_err(cx);
     }
 
-    fn apply_room_status(&mut self, room: ServerRoom) -> bool {
+    fn apply_room_status(&mut self, room: ServerRoom) -> Option<String> {
         if room.status != ServerRoomStatus::Finished {
-            return true;
+            return None;
         }
 
         let winner = room.winner_player_id.as_deref();
         let local_player_id = self.room.match_state.player_id.as_deref();
-        let local_name = room
-            .players
-            .iter()
-            .find(|player| Some(player.id.as_str()) == local_player_id)
-            .map(|player| player.name.as_str())
-            .unwrap_or("local");
         let remote_name = room
             .players
             .iter()
             .find(|player| Some(player.id.as_str()) != local_player_id)
             .map(|player| player.name.as_str())
             .unwrap_or("opponent");
-        match room.finish_reason {
+        let message = match room.finish_reason {
             Some(ServerRoomFinishReason::PlayerLeft) if winner == local_player_id => {
-                self.room.local_user = format!("{local_name}：胜利（对手离开）").into();
-                self.room.remote_user = format!("{remote_name}：离开").into();
+                format!("The match has finished. You won because {remote_name} left the match.")
             }
             Some(ServerRoomFinishReason::PlayerLeft) if winner.is_some() => {
-                self.room.local_user = format!("{local_name}：离开").into();
-                self.room.remote_user = format!("{remote_name}：胜利（对手离开）").into();
+                format!("The match has finished. {remote_name} won because you left the match.")
             }
             Some(ServerRoomFinishReason::ManualComplete) if winner == local_player_id => {
-                self.room.local_user = format!("{local_name}：完成").into();
-                self.room.remote_user = format!("{remote_name}：结束").into();
+                "The match has finished. You won.".to_string()
             }
             Some(ServerRoomFinishReason::ManualComplete) if winner.is_some() => {
-                self.room.local_user = format!("{local_name}：结束").into();
-                self.room.remote_user = format!("{remote_name}：完成").into();
+                format!("The match has finished. {remote_name} completed first.")
             }
-            _ if winner == local_player_id => {
-                self.room.local_user = format!("{local_name}：AC").into();
-                self.room.remote_user = format!("{remote_name}：结束").into();
-            }
+            _ if winner == local_player_id => "The match has finished. You won.".to_string(),
             _ if winner.is_some() => {
-                self.room.local_user = format!("{local_name}：结束").into();
-                self.room.remote_user = format!("{remote_name}：AC").into();
+                format!("The match has finished. {remote_name} got AC first.")
             }
-            _ => {
-                self.room.local_user = format!("{local_name}：结束").into();
-                self.room.remote_user = format!("{remote_name}：结束").into();
-            }
-        }
+            _ => "The match has finished.".to_string(),
+        };
         self.room.match_state.room_status = ServerRoomStatus::Finished;
-        false
+        Some(message)
     }
 
     fn leave_active_match(&mut self, cx: &mut Context<Self>) {
@@ -1918,17 +2198,9 @@ impl RduelView {
         .detach_and_log_err(cx);
     }
 
-    fn set_command_output(
-        &mut self,
-        output: impl Into<Arc<str>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.command_output_editor.update(cx, |editor, cx| {
-            editor.set_read_only(false);
-            editor.set_text(output, window, cx);
-            editor.set_read_only(true);
-        });
+    fn set_command_output(&mut self, output: CommandOutputState, cx: &mut Context<Self>) {
+        self.command_output = output;
+        cx.notify();
     }
 
     fn has_unsaved_solution_buffers(&self, cx: &App) -> bool {
@@ -2029,54 +2301,39 @@ impl RduelView {
         style
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_command_running = self.command_status.is_running();
+    fn render_action_button(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let background_color = cx.theme().colors().ghost_element_background;
         h_flex()
-            .w_full()
-            .h(px(40.))
-            .px_4()
-            .gap_2()
+            .id(id)
+            .h(px(28.))
+            .w(px(28.))
             .items_center()
-            .justify_between()
-            .overflow_hidden()
-            .child(Label::new("Rduel").size(LabelSize::Large))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .gap_2()
-                    .justify_center()
-                    .overflow_hidden()
-                    .child(self.render_status_chip(self.room.local_user.clone(), cx))
-                    .child(self.render_status_chip(self.room.remote_user.clone(), cx)),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("rduel-toggle-layout", "Swap")
-                            .size(ButtonSize::Compact)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_layout(&ToggleLayout, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("rduel-run-samples", "Test")
-                            .size(ButtonSize::Compact)
-                            .disabled(is_command_running)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.run_samples(&RunSamples, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("rduel-submit", "Submit")
-                            .size(ButtonSize::Compact)
-                            .style(ButtonStyle::Filled)
-                            .disabled(is_command_running)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit_solution(&SubmitSolution, window, cx);
-                            })),
-                    ),
-            )
+            .justify_center()
+            .rounded_sm()
+            .bg(background_color)
+            .when(!disabled, |this| {
+                this.hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
+                    .cursor_pointer()
+            })
+            .when(disabled, |this| this.opacity(0.5))
+            .child(Icon::new(icon).size(IconSize::Small))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if disabled {
+                    return;
+                }
+                match id {
+                    "rduel-toggle-layout" => this.toggle_layout(&ToggleLayout, window, cx),
+                    "rduel-run-samples" => this.run_samples(&RunSamples, window, cx),
+                    "rduel-submit" => this.submit_solution(&SubmitSolution, window, cx),
+                    _ => {}
+                }
+            }))
     }
 
     fn render_problem(
@@ -2097,7 +2354,7 @@ impl RduelView {
                     .px_4()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(Label::new(self.problem.title.clone()).size(LabelSize::Small)),
+                    .child(Label::new(self.problem.title.clone()).size(LabelSize::Default)),
             )
             .child(
                 h_flex()
@@ -2213,10 +2470,19 @@ impl RduelView {
         tab: ActiveCodeTab,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let id = format!("rduel-code-tab-{label}");
+        let id = match tab {
+            ActiveCodeTab::MainRs => "rduel-code-tab-main-rs",
+            ActiveCodeTab::CargoToml => "rduel-code-tab-cargo-toml",
+        };
         let is_dirty = match tab {
             ActiveCodeTab::MainRs => self.main_rs_buffer.read(cx).is_dirty(),
             ActiveCodeTab::CargoToml => self.cargo_toml_buffer.read(cx).is_dirty(),
+        };
+        let is_selected = self.active_code_tab == tab;
+        let background_color = if is_selected {
+            cx.theme().colors().element_background
+        } else {
+            cx.theme().colors().ghost_element_background
         };
         let label = if is_dirty {
             format!("{label} *").into()
@@ -2224,13 +2490,16 @@ impl RduelView {
             SharedString::from(label)
         };
 
-        Button::new(id, label)
-            .size(ButtonSize::Compact)
-            .style(if self.active_code_tab == tab {
-                ButtonStyle::Filled
-            } else {
-                ButtonStyle::Subtle
-            })
+        h_flex()
+            .id(id)
+            .h(px(28.))
+            .items_center()
+            .px_2p5()
+            .rounded_sm()
+            .bg(background_color)
+            .hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
+            .cursor_pointer()
+            .child(Label::new(label).size(LabelSize::Default))
             .on_click(cx.listener(move |this, _, window, cx| {
                 match tab {
                     ActiveCodeTab::MainRs => this.select_main_rs(&SelectMainRs, window, cx),
@@ -2241,18 +2510,22 @@ impl RduelView {
             }))
     }
 
-    fn render_status_chip(&self, text: SharedString, cx: &App) -> impl IntoElement {
-        div()
-            .px_1p5()
-            .py_0p5()
-            .rounded_sm()
-            .bg(cx.theme().colors().element_background)
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .child(Label::new(text).size(LabelSize::Small).truncate())
-    }
-
     fn render_command_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_command_running = self.command_status.is_running();
+        let selected_item = self
+            .command_output
+            .selected_index
+            .and_then(|index| self.command_output.items.get(index));
+        let output_items = self
+            .command_output
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                self.render_command_output_item(index, item, cx)
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         v_flex()
             .h(px(self.command_output_height))
             .flex_none()
@@ -2261,20 +2534,128 @@ impl RduelView {
                 h_flex()
                     .h(px(28.))
                     .items_center()
-                    .justify_between()
                     .px_3()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .justify_between()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(Label::new("Output").size(LabelSize::Small))
-                    .child(self.render_status_chip(self.command_status.label(), cx)),
+                    .child(h_flex().gap_1p5().overflow_hidden().children(output_items))
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(self.render_action_button(
+                                "rduel-run-samples",
+                                IconName::PlayFilled,
+                                is_command_running,
+                                cx,
+                            ))
+                            .child(self.render_action_button(
+                                "rduel-submit",
+                                IconName::Send,
+                                is_command_running,
+                                cx,
+                            )),
+                    ),
+            )
+            .child(
+                v_flex().flex_1().min_h_0().overflow_hidden().p_3().child(
+                    div()
+                        .id("rduel-command-output-detail")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_2()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().editor_background)
+                        .child(self.render_command_output_detail(selected_item, cx)),
+                ),
+            )
+    }
+
+    fn render_command_output_detail(
+        &self,
+        selected_item: Option<&CommandOutputItem>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(detail) = selected_item.and_then(|item| item.detail.as_ref()) else {
+            return Empty.into_any_element();
+        };
+
+        v_flex()
+            .gap_2()
+            .child(Label::new(detail.heading.clone()).size(LabelSize::Default))
+            .children(detail.sections.iter().map(|section| {
+                self.render_command_output_detail_section(section, cx)
+                    .into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    fn render_command_output_detail_section(
+        &self,
+        section: &CommandOutputDetailSection,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(
+                Label::new(section.title.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(self.command_output_editor.clone()),
+                    .p_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().element_background)
+                    .child(
+                        Label::new(section.body.clone())
+                            .size(LabelSize::Default)
+                            .buffer_font(cx),
+                    ),
             )
+    }
+
+    fn render_command_output_item(
+        &self,
+        index: usize,
+        item: &CommandOutputItem,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = self.command_output.selected_index == Some(index);
+        let dot_color = match item.status {
+            CommandOutputItemStatus::Pending => cx.theme().colors().border_variant,
+            CommandOutputItemStatus::Passed => cx.theme().status().success,
+            CommandOutputItemStatus::Failed => cx.theme().status().error,
+        };
+        let border_color = if is_selected {
+            cx.theme().colors().text_accent
+        } else {
+            cx.theme().colors().border
+        };
+
+        h_flex()
+            .id(("rduel-command-output-item", index))
+            .h(px(20.))
+            .gap_1()
+            .items_center()
+            .px_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(border_color)
+            .bg(cx.theme().colors().element_background)
+            .child(div().size(px(7.)).rounded_full().bg(dot_color))
+            .child(Label::new(item.label.clone()).size(LabelSize::Default))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.command_output.selected_index = Some(index);
+                cx.notify();
+            }))
     }
 
     fn render_command_output_divider(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2469,7 +2850,6 @@ impl Render for RduelView {
             .on_action(cx.listener(Self::toggle_layout))
             .on_action(cx.listener(Self::select_main_rs))
             .on_action(cx.listener(Self::select_cargo_toml))
-            .child(self.render_header(cx))
             .child({
                 let problem = self
                     .render_problem(markdown_style, window, cx)
@@ -2493,7 +2873,8 @@ impl Render for RduelView {
     }
 }
 
-const STARTER_CODE: &str = "";
+const STARTER_CODE: &str = r#"fn main() {}
+"#;
 
 const STARTER_ACR_PROBLEM_TOML: &str = r#"[package]
 name = "rduel"
@@ -2507,3 +2888,16 @@ problem_url = "https://atcoder.jp/contests/abc001/tasks/abc001_1"
 num = "=0.4.3"
 proconio = { version = "=0.5.0", features = ["derive"] }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atcoder_submit_url_preselects_language_and_task() {
+        assert_eq!(
+            atcoder_submit_url("https://atcoder.jp/contests/abc073/tasks/abc073_c"),
+            Some("https://atcoder.jp/contests/abc073/submit?taskScreenName=abc073_c".to_string())
+        );
+    }
+}
