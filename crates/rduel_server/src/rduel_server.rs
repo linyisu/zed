@@ -294,6 +294,7 @@ impl RduelRooms {
                 (opponent.id.clone(), opponent.name.clone()),
                 (player.id.clone(), player.name.clone()),
             ]),
+            player_activity: HashMap::new(),
             polling_submissions: false,
             finished_at_second: None,
         };
@@ -497,6 +498,18 @@ impl RduelRooms {
         Some(room.clone())
     }
 
+    /// Merges freshly polled submission activity into the room. Only players with
+    /// new data are updated, so a transient fetch failure keeps the last value.
+    fn update_player_activity(&mut self, room_id: &str, activity: &[(String, PlayerActivity)]) {
+        let Some(room) = self.rooms.get_mut(room_id) else {
+            return;
+        };
+        for (player_id, player_activity) in activity {
+            room.player_activity
+                .insert(player_id.clone(), player_activity.clone());
+        }
+    }
+
     /// Removes rooms that finished more than `ttl_seconds` ago along with any
     /// players still pointing at them. Returns the number of rooms reaped.
     fn reap_finished(&mut self, ttl_seconds: i64, now: i64) -> usize {
@@ -602,12 +615,23 @@ struct Room {
     finish_reason: Option<RoomFinishReason>,
     winning_submission: Option<WinningSubmission>,
     atcoder_users: HashMap<String, String>,
+    /// Per-player live submission activity (`player_id` -> activity), surfaced to
+    /// the client so each side can see the opponent submitting in real time.
+    player_activity: HashMap<String, PlayerActivity>,
     #[serde(skip)]
     polling_submissions: bool,
     /// Unix second at which the room transitioned to `Finished`, used to reap
     /// finished rooms (and their players) after a TTL.
     #[serde(skip)]
     finished_at_second: Option<i64>,
+}
+
+/// A player's submission activity on the room problem since the match started.
+#[derive(Clone, Default, Serialize)]
+struct PlayerActivity {
+    attempt_count: u32,
+    last_verdict: Option<String>,
+    last_submission_epoch: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -839,35 +863,43 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
             room
         };
 
-        let Some((player_id, submission)) = earliest_ac_submission(
+        let poll = poll_room_submission_state(
             &room,
             state.atcoder_revel_session.as_deref(),
             &state.atcoder_rate_limiter,
             &mut last_fetch_errors,
         )
-        .await
-        else {
-            continue;
-        };
+        .await;
 
         let mut rooms = state.rooms.lock().await;
-        if let Some(room) = rooms.apply_submission_ac(&room_id, &player_id, submission) {
-            log::info!(
-                "Rduel room {room_id} finished; winner: {:?}, problem: {}",
-                room.winner_player_id,
-                room.problem.id
-            );
+        rooms.update_player_activity(&room_id, &poll.activity);
+        if let Some((player_id, submission)) = poll.winner {
+            if let Some(room) = rooms.apply_submission_ac(&room_id, &player_id, submission) {
+                log::info!(
+                    "Rduel room {room_id} finished; winner: {:?}, problem: {}",
+                    room.winner_player_id,
+                    room.problem.id
+                );
+            }
         }
     }
 }
 
-async fn earliest_ac_submission(
+/// The result of one polling pass: the earliest AC across both players (if any)
+/// and each player's current submission activity.
+struct SubmissionPoll {
+    winner: Option<(String, AtCoderSubmission)>,
+    activity: Vec<(String, PlayerActivity)>,
+}
+
+async fn poll_room_submission_state(
     room: &Room,
     atcoder_revel_session: Option<&str>,
     rate_limiter: &RateLimiter,
     last_fetch_errors: &mut HashMap<String, String>,
-) -> Option<(String, AtCoderSubmission)> {
-    let mut earliest: Option<(String, AtCoderSubmission)> = None;
+) -> SubmissionPoll {
+    let mut winner: Option<(String, AtCoderSubmission)> = None;
+    let mut activity = Vec::new();
 
     for player in &room.players {
         let Some(atcoder_user) = room.atcoder_users.get(&player.id) else {
@@ -898,30 +930,36 @@ async fn earliest_ac_submission(
             }
         };
 
-        for submission in submissions {
-            if submission.problem_id != room.problem.id || submission.result != "AC" {
-                continue;
-            }
-            if submission.epoch_second < room.started_at_second {
+        let mut player_activity = PlayerActivity::default();
+        for submission in &submissions {
+            if submission.problem_id != room.problem.id
+                || submission.epoch_second < room.started_at_second
+            {
                 continue;
             }
 
-            log::info!(
-                "found Rduel AC candidate: user={atcoder_user}, problem={}, submission={}, epoch={}",
-                submission.problem_id,
-                submission.id,
-                submission.epoch_second
-            );
-            let should_replace = earliest
-                .as_ref()
-                .is_none_or(|(_, earliest)| submission.epoch_second < earliest.epoch_second);
-            if should_replace {
-                earliest = Some((player.id.clone(), submission));
+            player_activity.attempt_count += 1;
+            if player_activity
+                .last_submission_epoch
+                .is_none_or(|epoch| submission.epoch_second >= epoch)
+            {
+                player_activity.last_submission_epoch = Some(submission.epoch_second);
+                player_activity.last_verdict = Some(submission.result.clone());
+            }
+
+            if submission.result == "AC" {
+                let should_replace = winner
+                    .as_ref()
+                    .is_none_or(|(_, earliest)| submission.epoch_second < earliest.epoch_second);
+                if should_replace {
+                    winner = Some((player.id.clone(), submission.clone()));
+                }
             }
         }
+        activity.push((player.id.clone(), player_activity));
     }
 
-    earliest
+    SubmissionPoll { winner, activity }
 }
 
 async fn fetch_user_submissions(
@@ -1651,6 +1689,55 @@ mod tests {
             LeaveOutcome::LeftWaiting
         ));
         assert!(!rooms.token_matches(&player_id, &token));
+    }
+
+    #[test]
+    fn update_player_activity_merges_per_player() {
+        let mut rooms = test_rooms();
+        rooms.join(join_request("player-1", "atcoder-user-a"));
+        let JoinDecision::CreateRoom { opponent, player } =
+            rooms.join(join_request("player-2", "atcoder-user-b"))
+        else {
+            panic!("expected a CreateRoom decision");
+        };
+        let problem = rooms.problems[0].clone();
+        let JoinResponse::Matched { room, .. } = rooms.create_room(opponent, player, problem) else {
+            panic!("expected a Matched response");
+        };
+        let room_id = room.id;
+
+        rooms.update_player_activity(
+            &room_id,
+            &[(
+                "player-1".to_string(),
+                PlayerActivity {
+                    attempt_count: 2,
+                    last_verdict: Some("WA".to_string()),
+                    last_submission_epoch: Some(100),
+                },
+            )],
+        );
+        let activity = &rooms.rooms[&room_id].player_activity;
+        assert_eq!(activity["player-1"].attempt_count, 2);
+        assert_eq!(activity["player-1"].last_verdict.as_deref(), Some("WA"));
+        assert!(!activity.contains_key("player-2"));
+
+        // A later update for one player must not wipe the other's activity.
+        rooms.update_player_activity(
+            &room_id,
+            &[(
+                "player-2".to_string(),
+                PlayerActivity {
+                    attempt_count: 1,
+                    last_verdict: Some("AC".to_string()),
+                    last_submission_epoch: Some(200),
+                },
+            )],
+        );
+        let activity = &rooms.rooms[&room_id].player_activity;
+        assert_eq!(activity["player-1"].attempt_count, 2);
+        assert_eq!(activity["player-2"].attempt_count, 1);
+        assert_eq!(activity["player-2"].last_verdict.as_deref(), Some("AC"));
     }
 
     #[test]

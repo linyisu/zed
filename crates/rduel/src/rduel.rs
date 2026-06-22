@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use editor::{Editor, MultiBuffer};
@@ -40,6 +40,8 @@ const MIN_COMMAND_OUTPUT_HEIGHT: f32 = 96.0;
 const MAX_COMMAND_OUTPUT_HEIGHT: f32 = 360.0;
 const PROBLEM_MARKDOWN_FONT_SCALE: f32 = 1.12;
 const DEFAULT_RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
+/// How long the "opponent submitted" banner stays visible.
+const OPPONENT_FLASH_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct RduelSettings {
@@ -404,6 +406,56 @@ struct RduelView {
     problem_scroll_handle: ScrollHandle,
     command_output: CommandOutputState,
     command_status: CommandStatus,
+    presence: Option<RoomPresence>,
+    opponent_flash: Option<OpponentFlash>,
+}
+
+/// A live snapshot of both players used to render the versus header.
+#[derive(Clone)]
+struct RoomPresence {
+    started_at_second: i64,
+    local: Option<PlayerPresence>,
+    opponent: Option<PlayerPresence>,
+}
+
+#[derive(Clone)]
+struct PlayerPresence {
+    name: String,
+    activity: ServerPlayerActivity,
+}
+
+/// A transient banner shown when the opponent makes a new submission.
+#[derive(Clone)]
+struct OpponentFlash {
+    message: SharedString,
+    shown_at: Instant,
+}
+
+impl RoomPresence {
+    fn from_room(room: &ServerRoom, local_player_id: Option<&str>) -> Self {
+        let mut local = None;
+        let mut opponent = None;
+        for player in &room.players {
+            let presence = PlayerPresence {
+                name: player.name.clone(),
+                activity: room
+                    .player_activity
+                    .get(&player.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            if Some(player.id.as_str()) == local_player_id {
+                local = Some(presence);
+            } else {
+                opponent = Some(presence);
+            }
+        }
+        Self {
+            started_at_second: room.started_at_second,
+            local,
+            opponent,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -642,6 +694,20 @@ struct ServerRoom {
     status: ServerRoomStatus,
     winner_player_id: Option<String>,
     finish_reason: Option<ServerRoomFinishReason>,
+    #[serde(default)]
+    started_at_second: i64,
+    #[serde(default)]
+    player_activity: std::collections::HashMap<String, ServerPlayerActivity>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct ServerPlayerActivity {
+    #[serde(default)]
+    attempt_count: u32,
+    #[serde(default)]
+    last_verdict: Option<String>,
+    #[serde(default)]
+    last_submission_epoch: Option<i64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1349,6 +1415,38 @@ fn parse_port(port: &str) -> anyhow::Result<u16> {
         .map_err(|_| anyhow::anyhow!("Rduel server URL has an invalid port: {port:?}"))
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Formats the elapsed match time as `MM:SS` (or `H:MM:SS` past an hour).
+fn format_elapsed(started_at_second: i64) -> String {
+    let elapsed = (unix_now() - started_at_second).max(0);
+    let hours = elapsed / 3600;
+    let minutes = (elapsed % 3600) / 60;
+    let seconds = elapsed % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Formats how long ago a submission happened, in Chinese.
+fn format_relative(epoch_second: i64) -> String {
+    let delta = (unix_now() - epoch_second).max(0);
+    if delta < 60 {
+        format!("{delta}秒前")
+    } else if delta < 3600 {
+        format!("{}分钟前", delta / 60)
+    } else {
+        format!("{}小时前", delta / 3600)
+    }
+}
+
 async fn run_process(
     label: &'static str,
     current_dir: &Path,
@@ -1963,6 +2061,10 @@ impl RduelView {
             editor.set_edit_predictions_disabled(true, cx);
             editor
         });
+        let initial_presence = session
+            .room
+            .as_ref()
+            .map(|room| RoomPresence::from_room(room, Some(session.player_id.as_str())));
         let view = Self {
             focus_handle: cx.focus_handle(),
             project,
@@ -1989,8 +2091,11 @@ impl RduelView {
             problem_scroll_handle: ScrollHandle::new(),
             command_output: CommandOutputState::initial(&samples),
             command_status: CommandStatus::Idle,
+            presence: initial_presence,
+            opponent_flash: None,
         };
         view.poll_room_after_delay(cx);
+        view.tick_match_timer(cx);
         view
     }
 
@@ -2217,6 +2322,7 @@ impl RduelView {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(RduelMatchOutput::RoomStatus { room }) => {
+                        this.update_room_presence(&room);
                         this.handle_room_status(room, window, cx);
                     }
                     Ok(_) => {}
@@ -2227,6 +2333,68 @@ impl RduelView {
                 cx.notify();
             })?;
 
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Rebuilds the presence snapshot from a fresh room state and flashes a
+    /// banner when the opponent has made a new submission since the last poll.
+    fn update_room_presence(&mut self, room: &ServerRoom) {
+        let local_id = self.room.match_state.player_id.as_deref();
+        let next = RoomPresence::from_room(room, local_id);
+
+        let previous_opponent = self
+            .presence
+            .as_ref()
+            .and_then(|presence| presence.opponent.as_ref());
+        if let (Some(previous), Some(current)) = (previous_opponent, next.opponent.as_ref()) {
+            let attempts_increased =
+                current.activity.attempt_count > previous.activity.attempt_count;
+            let newer_submission =
+                match (
+                    current.activity.last_submission_epoch,
+                    previous.activity.last_submission_epoch,
+                ) {
+                    (Some(current_epoch), Some(previous_epoch)) => current_epoch > previous_epoch,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+            if attempts_increased || newer_submission {
+                let verdict = current
+                    .activity
+                    .last_verdict
+                    .clone()
+                    .unwrap_or_else(|| "提交".to_string());
+                self.opponent_flash = Some(OpponentFlash {
+                    message: format!("对手提交了：{verdict}").into(),
+                    shown_at: Instant::now(),
+                });
+            }
+        }
+
+        self.presence = Some(next);
+    }
+
+    /// Re-renders once per second so the elapsed-time clock advances and a stale
+    /// opponent flash is cleared. Stops when the match finishes.
+    fn tick_match_timer(&self, cx: &mut Context<Self>) {
+        if self.room.match_state.room_status != ServerRoomStatus::Playing {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            this.update(cx, |this, cx| {
+                if let Some(flash) = &this.opponent_flash {
+                    if flash.shown_at.elapsed() > OPPONENT_FLASH_DURATION {
+                        this.opponent_flash = None;
+                    }
+                }
+                if this.room.match_state.room_status == ServerRoomStatus::Playing {
+                    this.tick_match_timer(cx);
+                }
+                cx.notify();
+            })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -2255,6 +2423,7 @@ impl RduelView {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(RduelMatchOutput::RoomStatus { room }) => {
+                        this.update_room_presence(&room);
                         if !this.handle_room_status(room, window, cx) {
                             this.poll_room_after_delay(cx);
                         }
@@ -2819,6 +2988,106 @@ impl RduelView {
             }))
     }
 
+    fn render_versus_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let presence = self.presence.as_ref();
+        let started_at = presence.map(|presence| presence.started_at_second).unwrap_or(0);
+        let elapsed = format_elapsed(started_at);
+        let flash = self
+            .opponent_flash
+            .as_ref()
+            .filter(|flash| flash.shown_at.elapsed() <= OPPONENT_FLASH_DURATION)
+            .map(|flash| flash.message.clone());
+
+        h_flex()
+            .h(px(40.))
+            .w_full()
+            .flex_none()
+            .px_3()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(self.render_player_presence("你", presence.and_then(|p| p.local.as_ref()), cx))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        Label::new("对局")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(elapsed).size(LabelSize::Default)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .when_some(flash, |this, message| {
+                        this.child(
+                            h_flex()
+                                .h(px(22.))
+                                .items_center()
+                                .px_2()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(cx.theme().status().error)
+                                .child(Label::new(message).size(LabelSize::Small).color(Color::Error)),
+                        )
+                    })
+                    .child(self.render_player_presence(
+                        "对手",
+                        presence.and_then(|p| p.opponent.as_ref()),
+                        cx,
+                    )),
+            )
+    }
+
+    fn render_player_presence(
+        &self,
+        role: &'static str,
+        presence: Option<&PlayerPresence>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let name = presence
+            .map(|presence| presence.name.clone())
+            .unwrap_or_else(|| "—".to_string());
+        let attempts = presence.map(|p| p.activity.attempt_count).unwrap_or(0);
+        let verdict = presence.and_then(|p| p.activity.last_verdict.clone());
+        let last_epoch = presence.and_then(|p| p.activity.last_submission_epoch);
+        let (dot_color, verdict_color) = match verdict.as_deref() {
+            Some("AC") => (cx.theme().status().success, Color::Success),
+            Some(_) => (cx.theme().status().error, Color::Error),
+            None => (cx.theme().colors().border_variant, Color::Muted),
+        };
+
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(div().size(px(7.)).rounded_full().bg(dot_color))
+            .child(Label::new(role).size(LabelSize::Small).color(Color::Muted))
+            .child(Label::new(name).size(LabelSize::Default))
+            .when(attempts > 0, |this| {
+                this.child(
+                    Label::new(format!("{attempts} 次提交"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when_some(verdict, |this, verdict| {
+                this.child(Label::new(verdict).size(LabelSize::Small).color(verdict_color))
+            })
+            .when_some(last_epoch, |this, epoch| {
+                this.child(
+                    Label::new(format_relative(epoch))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+    }
+
     fn render_command_output_divider(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rduel-output-divider")
@@ -3011,6 +3280,7 @@ impl Render for RduelView {
             .on_action(cx.listener(Self::toggle_layout))
             .on_action(cx.listener(Self::select_main_rs))
             .on_action(cx.listener(Self::select_cargo_toml))
+            .child(self.render_versus_header(cx))
             .child({
                 let problem = self
                     .render_problem(markdown_style, window, cx)
