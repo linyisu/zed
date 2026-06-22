@@ -3394,14 +3394,7 @@ impl Editor {
             let highlights = if let Some(highlights) = cx.update(|cx| {
                 provider.document_highlights(&cursor_buffer, cursor_buffer_position, cx)
             }) {
-                match highlights.await {
-                    Ok(highlights) => Some(highlights),
-                    Err(error) if format!("{error:#}").ends_with("content modified") => None,
-                    Err(error) => {
-                        log::error!("Get document highlights via rust-analyzer failed: {error:#}");
-                        None
-                    }
-                }
+                highlights.await.log_err()
             } else {
                 None
             };
