@@ -1404,8 +1404,9 @@ fn wrap_var_tags_as_math(html: &str) -> String {
         };
 
         let raw_math = &remaining[content_start..content_start + close_start];
+        let math = html_unescape(raw_math);
         output.push('$');
-        output.push_str(&html_unescape(raw_math).replace('$', "\\$"));
+        output.push_str(&math.trim().replace('$', "\\$"));
         output.push('$');
         remaining = &after_content_start[close_start + "</var>".len()..];
     }
@@ -1956,6 +1957,16 @@ mod tests {
                 "",
             ]
             .join("\n")
+        );
+    }
+
+    #[test]
+    fn trims_var_math_before_wrapping_as_markdown_math() {
+        let html = "<p>For the first query, <var>S_3S_4\\ldots S_9 = </var> ssissip.</p>";
+
+        assert_eq!(
+            wrap_var_tags_as_math(html),
+            "<p>For the first query, $S_3S_4\\ldots S_9 =$ ssissip.</p>"
         );
     }
 

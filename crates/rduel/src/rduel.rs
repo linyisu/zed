@@ -1,4 +1,5 @@
 use std::{
+    any::TypeId,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -29,6 +30,7 @@ use util::{ResultExt, rel_path::RelPath};
 use workspace::{
     Item, ModalView, Workspace,
     item::{ItemBufferKind, ItemEvent, SaveOptions},
+    searchable::SearchableItemHandle,
 };
 use zed_actions::rduel::OpenRduel;
 
@@ -398,6 +400,7 @@ async fn open_rduel_project_buffer(
 struct RduelView {
     focus_handle: FocusHandle,
     project: Entity<Project>,
+    language_registry: Arc<LanguageRegistry>,
     room: RoomState,
     problem: RduelProblem,
     rduel_project: Option<RduelProjectFiles>,
@@ -2064,7 +2067,7 @@ impl RduelView {
         let main_rs_buffer_for_view = main_rs_buffer.clone();
         let cargo_toml_buffer_for_view = cargo_toml_buffer.clone();
         let problem_markdown =
-            Self::new_problem_markdown(problem.markdown.clone(), language_registry, cx);
+            Self::new_problem_markdown(problem.markdown.clone(), language_registry.clone(), cx);
         let samples = problem.samples.clone();
 
         let main_rs_multibuffer = cx
@@ -2105,6 +2108,7 @@ impl RduelView {
         let view = Self {
             focus_handle: cx.focus_handle(),
             project,
+            language_registry,
             room: RoomState {
                 match_state: MatchState {
                     player_id: Some(session.player_id),
@@ -2261,9 +2265,18 @@ impl RduelView {
         cx.notify();
     }
 
+    fn active_code_editor(&self) -> Option<Entity<Editor>> {
+        match self.active_code_tab {
+            ActiveCodeTab::MainRs => Some(self.main_rs_editor.clone()),
+            ActiveCodeTab::CargoToml => Some(self.cargo_toml_editor.clone()),
+            ActiveCodeTab::OpponentMainRs => self.opponent_main_rs_editor.clone(),
+        }
+    }
+
     fn new_opponent_main_rs_editor(
         source_code: &str,
         atcoder_user: &str,
+        language_registry: Arc<LanguageRegistry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Editor> {
@@ -2273,6 +2286,17 @@ impl RduelView {
             format!("{}/main.rs", atcoder_user.trim())
         };
         let buffer = cx.new(|cx| Buffer::local(source_code, cx));
+        let buffer_for_language = buffer.clone();
+        cx.spawn(async move |_, cx| {
+            let Some(language) = language_registry.language_for_name("Rust").await.log_err() else {
+                return anyhow::Ok(());
+            };
+            buffer_for_language.update(cx, |buffer, cx| {
+                buffer.set_language(Some(language), cx);
+            });
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
         let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(title.into()));
         cx.new(|cx| {
             let mut editor = Editor::for_multibuffer(multi_buffer, None, window, cx);
@@ -2655,6 +2679,7 @@ impl RduelView {
         self.opponent_main_rs_editor = Some(Self::new_opponent_main_rs_editor(
             source_code,
             &winning_submission.atcoder_user,
+            self.language_registry.clone(),
             window,
             cx,
         ));
@@ -3785,6 +3810,25 @@ impl Item for RduelView {
 
     fn buffer_kind(&self, _cx: &App) -> ItemBufferKind {
         ItemBufferKind::Singleton
+    }
+
+    fn act_as_type<'a>(
+        &'a self,
+        type_id: TypeId,
+        self_handle: &'a Entity<Self>,
+        cx: &'a App,
+    ) -> Option<gpui::AnyEntity> {
+        if TypeId::of::<Self>() == type_id {
+            Some(self_handle.clone().into())
+        } else {
+            let editor = self.active_code_editor()?;
+            editor.read(cx).act_as_type(type_id, &editor, cx)
+        }
+    }
+
+    fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
+        self.active_code_editor()
+            .map(|editor| Box::new(editor) as Box<dyn SearchableItemHandle>)
     }
 
     fn for_each_project_item(
