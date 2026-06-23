@@ -108,7 +108,7 @@ impl Toolbar {
 
 impl Render for Toolbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.has_any_visible_items() {
+        if self.hidden || !self.has_any_visible_items() {
             return div();
         }
 

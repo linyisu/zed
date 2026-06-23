@@ -8,11 +8,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use editor::{Editor, EditorMode, MultiBuffer, SizingBehavior};
+use editor::{
+    Editor, EditorMode, MultiBuffer, SizingBehavior,
+    actions::{ConfirmRename, Rename},
+};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, DismissEvent, DragMoveEvent, Empty, Entity,
-    EventEmitter, FocusHandle, Focusable, ImageSource, MouseButton, MouseDownEvent, MouseUpEvent,
-    Render, Resource, ScrollHandle, SharedString, SharedUri, WeakEntity, Window, div, px,
+    EntityId, EventEmitter, FocusHandle, Focusable, ImageSource, MouseButton, MouseDownEvent,
+    MouseUpEvent, Render, Resource, ScrollHandle, SharedString, SharedUri, Subscription,
+    WeakEntity, Window, div, px,
 };
 use language::{Buffer, LanguageRegistry};
 use markdown::{
@@ -22,15 +26,15 @@ use markdown::{
 use menu::{Cancel, Confirm};
 use project::{Project, ProjectItem, ProjectPath};
 use schemars::JsonSchema;
+use search::BufferSearchBar;
 use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings};
 use text::{LineEnding, Rope};
 use ui::{Button, ButtonSize, ButtonStyle, prelude::*};
 use util::{ResultExt, rel_path::RelPath};
 use workspace::{
-    Item, ModalView, Workspace,
+    Item, ModalView, ToolbarItemEvent, ToolbarItemView, Workspace,
     item::{ItemBufferKind, ItemEvent, SaveOptions},
-    searchable::SearchableItemHandle,
 };
 use zed_actions::rduel::OpenRduel;
 
@@ -225,6 +229,7 @@ fn open_rduel_session(
             let fallback_toml = language_registry.language_for_name("TOML").await.log_err();
 
             let session_for_view = session.clone();
+            let workspace_for_view = workspace.clone();
             let Some(rduel) = workspace
                 .update_in(cx, |workspace, window, cx| {
                     let project = workspace.project().clone();
@@ -250,6 +255,7 @@ fn open_rduel_session(
                     });
                     Some(cx.new(|cx| {
                         let view = RduelView::new(
+                            workspace_for_view,
                             project,
                             rduel_project.clone(),
                             language_registry,
@@ -410,6 +416,9 @@ struct RduelView {
     main_rs_editor: Entity<Editor>,
     cargo_toml_editor: Entity<Editor>,
     opponent_main_rs_editor: Option<Entity<Editor>>,
+    workspace: WeakEntity<Workspace>,
+    search_target_editor: Option<Entity<Editor>>,
+    search_bar_subscriptions: Option<(EntityId, Vec<Subscription>)>,
     active_code_tab: ActiveCodeTab,
     layout_order: LayoutOrder,
     problem_width_fraction: f32,
@@ -1209,13 +1218,8 @@ async fn run_rduel_submit(
     let submit_url = atcoder_submit_url(&problem_url).unwrap_or_else(|| problem_url.clone());
     Ok(RduelCommandOutput {
         success: true,
-        rendered: format!(
-            "{}\n\nSubmit: ready\nSource file: {}\nSubmit page: {}\n\nLocal sample failures do not block submit because some tasks use special judges. The task is preselected when AtCoder accepts taskScreenName. Source code was copied to the system clipboard.",
-            test_output.rendered,
-            source_path.display(),
-            submit_url,
-        ),
-        items: submit_ready_items(&test_output, &source_path, &submit_url),
+        rendered: test_output.rendered,
+        items: test_output.items,
         case_results: test_output.case_results,
         submit_ready: Some(RduelSubmitReady {
             source_code,
@@ -2013,38 +2017,9 @@ fn process_output_item(step: &RduelProcessOutput) -> CommandOutputItem {
     }
 }
 
-fn submit_ready_items(
-    test_output: &RduelCommandOutput,
-    source_path: &Path,
-    submit_url: &str,
-) -> Vec<CommandOutputItem> {
-    let mut items = test_output.items.clone();
-    items.push(CommandOutputItem {
-        label: "Submit".into(),
-        status: CommandOutputItemStatus::Passed,
-        detail: Some(CommandOutputDetail::with_sections(
-            "Ready",
-            vec![
-                CommandOutputDetailSection {
-                    title: "Source file".into(),
-                    body: source_path.display().to_string().into(),
-                },
-                CommandOutputDetailSection {
-                    title: "Submit page".into(),
-                    body: submit_url.to_string().into(),
-                },
-                CommandOutputDetailSection {
-                    title: "Clipboard".into(),
-                    body: "Source code was copied to the system clipboard.".into(),
-                },
-            ],
-        )),
-    });
-    items
-}
-
 impl RduelView {
     fn new(
+        workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         rduel_project: Option<RduelProjectFiles>,
         language_registry: Arc<LanguageRegistry>,
@@ -2126,6 +2101,9 @@ impl RduelView {
             main_rs_editor,
             cargo_toml_editor,
             opponent_main_rs_editor: None,
+            workspace,
+            search_target_editor: None,
+            search_bar_subscriptions: None,
             active_code_tab: ActiveCodeTab::MainRs,
             layout_order: LayoutOrder::ProblemLeft,
             problem_width_fraction: DEFAULT_PROBLEM_WIDTH_FRACTION,
@@ -2265,12 +2243,173 @@ impl RduelView {
         cx.notify();
     }
 
+    fn rename_symbol(&mut self, action: &Rename, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.focused_code_editor(window, cx) else {
+            cx.propagate();
+            return;
+        };
+        let handled = editor.update(cx, |editor, cx| {
+            if let Some(task) = editor.rename(action, window, cx) {
+                editor.detach_and_notify_err(task, window, cx);
+                true
+            } else {
+                false
+            }
+        });
+        if !handled {
+            cx.propagate();
+        }
+    }
+
+    fn confirm_rename(
+        &mut self,
+        action: &ConfirmRename,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self
+            .code_editor_with_pending_rename(cx)
+            .or_else(|| self.focused_code_editor(window, cx))
+        else {
+            cx.propagate();
+            return;
+        };
+        let handled = editor.update(cx, |editor, cx| {
+            if let Some(task) = editor.confirm_rename(action, window, cx) {
+                editor.detach_and_notify_err(task, window, cx);
+                true
+            } else {
+                false
+            }
+        });
+        if !handled {
+            cx.propagate();
+        }
+    }
+
     fn active_code_editor(&self) -> Option<Entity<Editor>> {
         match self.active_code_tab {
             ActiveCodeTab::MainRs => Some(self.main_rs_editor.clone()),
             ActiveCodeTab::CargoToml => Some(self.cargo_toml_editor.clone()),
             ActiveCodeTab::OpponentMainRs => self.opponent_main_rs_editor.clone(),
         }
+    }
+
+    fn focused_code_editor(&self, window: &Window, cx: &App) -> Option<Entity<Editor>> {
+        for editor in [&self.main_rs_editor, &self.cargo_toml_editor] {
+            if editor
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+            {
+                return Some(editor.clone());
+            }
+        }
+
+        self.active_code_editor()
+    }
+
+    fn code_editor_with_pending_rename(&self, cx: &App) -> Option<Entity<Editor>> {
+        for editor in [&self.main_rs_editor, &self.cargo_toml_editor] {
+            if editor.read(cx).pending_rename().is_some() {
+                return Some(editor.clone());
+            }
+        }
+
+        None
+    }
+
+    fn focused_search_editor(&self, window: &Window, cx: &App) -> Option<Entity<Editor>> {
+        let active_code_editor = self.active_code_editor();
+        for editor in active_code_editor.iter() {
+            if editor
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+            {
+                return Some(editor.clone());
+            }
+        }
+
+        for case in &self.test_cases {
+            if case
+                .input
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+            {
+                return Some(case.input.clone());
+            }
+            if case
+                .expected
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+            {
+                return Some(case.expected.clone());
+            }
+        }
+
+        if let Some(editor) = self.search_target_editor.as_ref() {
+            return Some(editor.clone());
+        }
+
+        active_code_editor
+    }
+
+    fn active_pane_search_bar(&self, cx: &App) -> Option<Entity<BufferSearchBar>> {
+        let pane = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_pane().clone())
+            .log_err()?;
+        pane.read(cx)
+            .toolbar()
+            .read(cx)
+            .item_of_type::<BufferSearchBar>()
+    }
+
+    fn sync_search_target(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<BufferSearchBar>> {
+        let editor = self.focused_search_editor(window, cx)?;
+        let search_bar = self.active_pane_search_bar(cx)?;
+        self.ensure_search_bar_subscriptions(&search_bar, cx);
+        if self.search_target_editor.as_ref() == Some(&editor)
+            && !search_bar.read(cx).is_dismissed()
+        {
+            return Some(search_bar);
+        }
+        self.search_target_editor = Some(editor.clone());
+        search_bar.update(cx, |search_bar, cx| {
+            search_bar.set_active_pane_item(Some(&editor), window, cx);
+        });
+        Some(search_bar)
+    }
+
+    fn ensure_search_bar_subscriptions(
+        &mut self,
+        search_bar: &Entity<BufferSearchBar>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .search_bar_subscriptions
+            .as_ref()
+            .is_some_and(|(entity_id, _)| *entity_id == search_bar.entity_id())
+        {
+            return;
+        }
+
+        self.search_bar_subscriptions = Some((
+            search_bar.entity_id(),
+            vec![
+                cx.subscribe(search_bar, |_, _, _: &search::buffer_search::Event, cx| {
+                    cx.notify()
+                }),
+                cx.subscribe(search_bar, |_, _, _: &ToolbarItemEvent, cx| cx.notify()),
+            ],
+        ));
     }
 
     fn new_opponent_main_rs_editor(
@@ -2377,9 +2516,12 @@ impl RduelView {
             return;
         }
 
+        let is_submit = matches!(command, RduelCommand::Submit { .. });
         self.command_status = CommandStatus::Running;
-        self.output_selection = OutputSelection::Step(0);
-        self.set_command_output(CommandOutputState::running(label), cx);
+        if !is_submit {
+            self.output_selection = OutputSelection::Step(0);
+            self.set_command_output(CommandOutputState::running(label), cx);
+        }
 
         let save_task =
             self.save_solution_editors(SaveOptions::default(), self.project.clone(), window, cx);
@@ -3015,9 +3157,39 @@ impl RduelView {
             .h_full()
             .overflow_hidden()
             .child(self.render_code_tabs(cx))
-            .child(div().flex_1().overflow_hidden().child(active_editor))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(self.render_search_bar_for_editor(active_editor.clone(), cx))
+                    .child(active_editor),
+            )
             .child(self.render_command_output_divider(cx))
             .child(self.render_command_output(cx))
+    }
+
+    fn render_search_bar_for_editor(
+        &self,
+        editor: Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(search_bar) = self.active_pane_search_bar(cx) else {
+            return Empty.into_any_element();
+        };
+        if self.search_target_is_editor(&editor, &search_bar, cx) {
+            search_bar.into_any_element()
+        } else {
+            Empty.into_any_element()
+        }
+    }
+
+    fn search_target_is_editor(
+        &self,
+        editor: &Entity<Editor>,
+        search_bar: &Entity<BufferSearchBar>,
+        cx: &App,
+    ) -> bool {
+        self.search_target_editor.as_ref() == Some(editor) && !search_bar.read(cx).is_dismissed()
     }
 
     fn render_code_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3462,6 +3634,7 @@ impl RduelView {
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().editor_background)
                 .overflow_hidden()
+                .child(self.render_search_bar_for_editor(editor.clone(), cx))
                 .child(editor)
         };
 
@@ -3812,23 +3985,40 @@ impl Item for RduelView {
         ItemBufferKind::Singleton
     }
 
+    fn show_toolbar(&self) -> bool {
+        false
+    }
+
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.main_rs_editor.update(cx, |editor, cx| {
+            editor.added_to_workspace(workspace, window, cx);
+        });
+        self.cargo_toml_editor.update(cx, |editor, cx| {
+            editor.added_to_workspace(workspace, window, cx);
+        });
+    }
+
     fn act_as_type<'a>(
         &'a self,
         type_id: TypeId,
         self_handle: &'a Entity<Self>,
-        cx: &'a App,
+        _: &'a App,
     ) -> Option<gpui::AnyEntity> {
         if TypeId::of::<Self>() == type_id {
             Some(self_handle.clone().into())
+        } else if TypeId::of::<Editor>() == type_id {
+            self.search_target_editor
+                .clone()
+                .or_else(|| self.active_code_editor())
+                .map(Into::into)
         } else {
-            let editor = self.active_code_editor()?;
-            editor.read(cx).act_as_type(type_id, &editor, cx)
+            None
         }
-    }
-
-    fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
-        self.active_code_editor()
-            .map(|editor| Box::new(editor) as Box<dyn SearchableItemHandle>)
     }
 
     fn for_each_project_item(
@@ -3895,6 +4085,7 @@ impl Item for RduelView {
 impl Render for RduelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let markdown_style = self.problem_markdown_style(window, cx);
+        self.sync_search_target(window, cx);
 
         v_flex()
             .key_context("Rduel")
@@ -3906,6 +4097,8 @@ impl Render for RduelView {
             .on_action(cx.listener(Self::select_main_rs))
             .on_action(cx.listener(Self::select_cargo_toml))
             .on_action(cx.listener(Self::select_opponent_main_rs))
+            .on_action(cx.listener(Self::rename_symbol))
+            .on_action(cx.listener(Self::confirm_rename))
             .child(self.render_versus_header(cx))
             .child({
                 let problem = self
