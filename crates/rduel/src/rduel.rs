@@ -129,6 +129,10 @@ pub struct SelectMainRs;
 #[action(namespace = rduel)]
 pub struct SelectCargoToml;
 
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = rduel)]
+pub struct SelectOpponentMainRs;
+
 pub fn init(cx: &mut App) {
     RduelSettings::register(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, cx| {
@@ -402,6 +406,7 @@ struct RduelView {
     cargo_toml_buffer: Entity<Buffer>,
     main_rs_editor: Entity<Editor>,
     cargo_toml_editor: Entity<Editor>,
+    opponent_main_rs_editor: Option<Entity<Editor>>,
     active_code_tab: ActiveCodeTab,
     layout_order: LayoutOrder,
     problem_width_fraction: f32,
@@ -583,6 +588,7 @@ impl CommandOutputDetail {
 enum ActiveCodeTab {
     MainRs,
     CargoToml,
+    OpponentMainRs,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -700,9 +706,19 @@ struct ServerRoom {
     winner_player_id: Option<String>,
     finish_reason: Option<ServerRoomFinishReason>,
     #[serde(default)]
+    winning_submission: Option<ServerWinningSubmission>,
+    #[serde(default)]
     started_at_second: i64,
     #[serde(default)]
     player_activity: std::collections::HashMap<String, ServerPlayerActivity>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ServerWinningSubmission {
+    player_id: String,
+    atcoder_user: String,
+    #[serde(default)]
+    source_code: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -2105,6 +2121,7 @@ impl RduelView {
             cargo_toml_buffer: cargo_toml_buffer_for_view,
             main_rs_editor,
             cargo_toml_editor,
+            opponent_main_rs_editor: None,
             active_code_tab: ActiveCodeTab::MainRs,
             layout_order: LayoutOrder::ProblemLeft,
             problem_width_fraction: DEFAULT_PROBLEM_WIDTH_FRACTION,
@@ -2228,6 +2245,41 @@ impl RduelView {
             .focus_handle(cx)
             .focus(window, cx);
         cx.notify();
+    }
+
+    fn select_opponent_main_rs(
+        &mut self,
+        _: &SelectOpponentMainRs,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.opponent_main_rs_editor.as_ref() else {
+            return;
+        };
+        self.active_code_tab = ActiveCodeTab::OpponentMainRs;
+        editor.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn new_opponent_main_rs_editor(
+        source_code: &str,
+        atcoder_user: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        let title = if atcoder_user.trim().is_empty() {
+            "opponent/main.rs".to_string()
+        } else {
+            format!("{}/main.rs", atcoder_user.trim())
+        };
+        let buffer = cx.new(|cx| Buffer::local(source_code, cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(title.into()));
+        cx.new(|cx| {
+            let mut editor = Editor::for_multibuffer(multi_buffer, None, window, cx);
+            editor.set_read_only(true);
+            editor.set_edit_predictions_disabled(true, cx);
+            editor
+        })
     }
 
     fn submit_solution(&mut self, _: &SubmitSolution, window: &mut Window, cx: &mut Context<Self>) {
@@ -2569,10 +2621,43 @@ impl RduelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.add_opponent_solution_if_lost(&room, window, cx);
         if let Some(message) = self.apply_room_status(room) {
             drop(window.prompt(gpui::PromptLevel::Info, &message, None, &["OK"], cx));
         }
         self.room.match_state.room_status == ServerRoomStatus::Finished
+    }
+
+    fn add_opponent_solution_if_lost(
+        &mut self,
+        room: &ServerRoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.opponent_main_rs_editor.is_some() || room.status != ServerRoomStatus::Finished {
+            return;
+        }
+        let local_player_id = self.room.match_state.player_id.as_deref();
+        let Some(winning_submission) = room.winning_submission.as_ref() else {
+            return;
+        };
+        if Some(winning_submission.player_id.as_str()) == local_player_id {
+            return;
+        }
+        let Some(source_code) = winning_submission
+            .source_code
+            .as_deref()
+            .filter(|source_code| !source_code.is_empty())
+        else {
+            return;
+        };
+
+        self.opponent_main_rs_editor = Some(Self::new_opponent_main_rs_editor(
+            source_code,
+            &winning_submission.atcoder_user,
+            window,
+            cx,
+        ));
     }
 
     fn apply_room_status(&mut self, room: ServerRoom) -> Option<String> {
@@ -2894,6 +2979,10 @@ impl RduelView {
         let active_editor = match self.active_code_tab {
             ActiveCodeTab::MainRs => self.main_rs_editor.clone(),
             ActiveCodeTab::CargoToml => self.cargo_toml_editor.clone(),
+            ActiveCodeTab::OpponentMainRs => self
+                .opponent_main_rs_editor
+                .clone()
+                .unwrap_or_else(|| self.main_rs_editor.clone()),
         };
 
         v_flex()
@@ -2916,6 +3005,13 @@ impl RduelView {
             .border_color(cx.theme().colors().border)
             .child(self.render_code_tab("src/main.rs", ActiveCodeTab::MainRs, cx))
             .child(self.render_code_tab("Cargo.toml", ActiveCodeTab::CargoToml, cx))
+            .when(self.opponent_main_rs_editor.is_some(), |this| {
+                this.child(self.render_code_tab(
+                    "opponent/main.rs",
+                    ActiveCodeTab::OpponentMainRs,
+                    cx,
+                ))
+            })
     }
 
     fn render_code_tab(
@@ -2927,10 +3023,12 @@ impl RduelView {
         let id = match tab {
             ActiveCodeTab::MainRs => "rduel-code-tab-main-rs",
             ActiveCodeTab::CargoToml => "rduel-code-tab-cargo-toml",
+            ActiveCodeTab::OpponentMainRs => "rduel-code-tab-opponent-main-rs",
         };
         let is_dirty = match tab {
             ActiveCodeTab::MainRs => self.main_rs_buffer.read(cx).is_dirty(),
             ActiveCodeTab::CargoToml => self.cargo_toml_buffer.read(cx).is_dirty(),
+            ActiveCodeTab::OpponentMainRs => false,
         };
         let is_selected = self.active_code_tab == tab;
         let background_color = if is_selected {
@@ -2959,6 +3057,9 @@ impl RduelView {
                     ActiveCodeTab::MainRs => this.select_main_rs(&SelectMainRs, window, cx),
                     ActiveCodeTab::CargoToml => {
                         this.select_cargo_toml(&SelectCargoToml, window, cx)
+                    }
+                    ActiveCodeTab::OpponentMainRs => {
+                        this.select_opponent_main_rs(&SelectOpponentMainRs, window, cx)
                     }
                 };
             }))
@@ -3760,6 +3861,7 @@ impl Render for RduelView {
             .on_action(cx.listener(Self::toggle_layout))
             .on_action(cx.listener(Self::select_main_rs))
             .on_action(cx.listener(Self::select_cargo_toml))
+            .on_action(cx.listener(Self::select_opponent_main_rs))
             .child(self.render_versus_header(cx))
             .child({
                 let problem = self

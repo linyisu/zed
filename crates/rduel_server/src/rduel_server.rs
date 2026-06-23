@@ -505,6 +505,7 @@ impl RduelRooms {
             atcoder_user,
             epoch_second: submission.epoch_second,
             submission_id: submission.id,
+            source_code: submission.source_code,
         });
         Some(room.clone())
     }
@@ -674,6 +675,8 @@ struct WinningSubmission {
     atcoder_user: String,
     epoch_second: i64,
     submission_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_code: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -682,6 +685,7 @@ struct AtCoderSubmission {
     epoch_second: i64,
     problem_id: String,
     result: String,
+    source_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -972,6 +976,27 @@ async fn poll_room_submission_state(
         activity.push((player.id.clone(), player_activity));
     }
 
+    if let Some((_, submission)) = winner.as_mut() {
+        match fetch_submission_source(
+            &room.problem,
+            submission.id,
+            atcoder_revel_session,
+            rate_limiter,
+        )
+        .await
+        {
+            Ok(source_code) => {
+                submission.source_code = Some(source_code);
+            }
+            Err(error) => {
+                log::warn!(
+                    "failed to fetch winning submission source {}: {error:#}",
+                    submission.id
+                );
+            }
+        }
+    }
+
     SubmissionPoll { winner, activity }
 }
 
@@ -1099,10 +1124,72 @@ fn parse_atcoder_submissions_page(
             epoch_second,
             problem_id: problem_id.to_string(),
             result,
+            source_code: None,
         });
     }
 
     Ok(submissions)
+}
+
+async fn fetch_submission_source(
+    problem: &Problem,
+    submission_id: i64,
+    atcoder_revel_session: Option<&str>,
+    rate_limiter: &RateLimiter,
+) -> anyhow::Result<String> {
+    let revel_session = match atcoder_revel_session {
+        Some(revel_session) if !revel_session.trim().is_empty() => revel_session,
+        _ => anyhow::bail!(
+            "AtCoder REVEL_SESSION is not configured; skipping AtCoder submission source fetch"
+        ),
+    };
+    let contest_id = contest_id_from_problem_id(&problem.id)
+        .with_context(|| format!("deriving AtCoder contest from problem {}", problem.id))?;
+    let url = format!("https://atcoder.jp/contests/{contest_id}/submissions/{submission_id}");
+    let client = reqwest::Client::builder()
+        .redirect_policy(reqwest::redirect::Policy::none())
+        .user_agent("rduel-server/0.1")
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("building AtCoder submission source HTTP client")?;
+
+    rate_limiter.acquire().await;
+    let response = client
+        .get(&url)
+        .header(COOKIE, format!("REVEL_SESSION={}", revel_session.trim()))
+        .send()
+        .await
+        .with_context(|| format!("requesting AtCoder submission page {url}"))?;
+    if response.status().is_redirection() {
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown");
+        anyhow::bail!(
+            "AtCoder redirected submission source request to {location}; login session may be invalid"
+        );
+    }
+    let response = response
+        .error_for_status()
+        .context("AtCoder submission source page returned an error status")?;
+    let html = response
+        .text()
+        .await
+        .context("reading AtCoder submission source page")?;
+    parse_atcoder_submission_source_page(&html)
+}
+
+fn parse_atcoder_submission_source_page(html: &str) -> anyhow::Result<String> {
+    let document = Html::parse_document(html);
+    let selector = html_selector("#submission-code")?;
+    let source = document
+        .select(&selector)
+        .next()
+        .map(|element| element.text().collect::<String>())
+        .filter(|source| !source.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("AtCoder submission source block was not found"))?;
+    Ok(source)
 }
 
 fn parse_atcoder_submission_time(
