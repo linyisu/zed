@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use editor::{Editor, MultiBuffer};
+use editor::{Editor, EditorMode, MultiBuffer, SizingBehavior};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, DismissEvent, DragMoveEvent, Empty, Entity,
     EventEmitter, FocusHandle, Focusable, ImageSource, MouseButton, MouseDownEvent, MouseUpEvent,
@@ -42,6 +42,7 @@ const MIN_COMMAND_OUTPUT_HEIGHT: f32 = 28.0;
 const CODE_AREA_TOP_RESERVE: f32 = 50.0;
 const PROBLEM_MARKDOWN_FONT_SCALE: f32 = 1.12;
 const DEFAULT_RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
+const SAMPLE_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the "opponent submitted" banner stays visible.
 const OPPONENT_FLASH_DURATION: Duration = Duration::from_secs(5);
 
@@ -1605,6 +1606,18 @@ enum EmbeddedAcrTestResult {
     Ac { actual: String },
     Wa { actual: String, expected: String },
     Re { stderr: String },
+    Tle,
+}
+
+enum SampleProcessWait {
+    Finished(std::io::Result<SampleProcessOutput>),
+    TimedOut,
+}
+
+struct SampleProcessOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
 }
 
 async fn run_embedded_sample_tests(
@@ -1687,8 +1700,10 @@ async fn run_embedded_sample_test(
         }
     };
 
-    use smol::io::AsyncWriteExt;
+    use smol::io::{AsyncReadExt, AsyncWriteExt};
     let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
     let input_bytes = input.clone().into_bytes();
     // Feed stdin concurrently with draining stdout/stderr. Writing all input
     // before reading output deadlocks once a solution fills the stdout pipe
@@ -1706,8 +1721,51 @@ async fn run_embedded_sample_test(
         // Drop the handle to signal EOF to the child.
         drop(stdin);
     };
+    let read_stdout = async move {
+        let mut stdout_text = String::new();
+        if let Some(stdout) = stdout.as_mut() {
+            stdout.read_to_string(&mut stdout_text).await?;
+        }
+        std::io::Result::Ok(stdout_text)
+    };
+    let read_stderr = async move {
+        let mut stderr_text = String::new();
+        if let Some(stderr) = stderr.as_mut() {
+            stderr.read_to_string(&mut stderr_text).await?;
+        }
+        std::io::Result::Ok(stderr_text)
+    };
 
-    let (_, output) = smol::future::zip(write_input, child.output()).await;
+    let output = smol::future::race(
+        async {
+            let (status, (_, (stdout, stderr))) = smol::future::zip(
+                child.status(),
+                smol::future::zip(write_input, smol::future::zip(read_stdout, read_stderr)),
+            )
+            .await;
+            SampleProcessWait::Finished(status.and_then(|status| {
+                Ok(SampleProcessOutput {
+                    status,
+                    stdout: stdout?,
+                    stderr: stderr?,
+                })
+            }))
+        },
+        async {
+            smol::Timer::after(SAMPLE_TEST_TIMEOUT).await;
+            SampleProcessWait::TimedOut
+        },
+    )
+    .await;
+    let output = match output {
+        SampleProcessWait::Finished(output) => output,
+        SampleProcessWait::TimedOut => {
+            if let Err(error) = child.kill() {
+                log::debug!("failed to kill timed out Rduel sample process: {error}");
+            }
+            return EmbeddedAcrTestResult::Tle;
+        }
+    };
     let output = match output {
         Ok(output) => output,
         Err(error) => {
@@ -1717,17 +1775,19 @@ async fn run_embedded_sample_test(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        return EmbeddedAcrTestResult::Re { stderr };
+        return EmbeddedAcrTestResult::Re {
+            stderr: output.stderr,
+        };
     }
 
-    if stdout.trim_end() == expected.trim_end() {
-        EmbeddedAcrTestResult::Ac { actual: stdout }
+    if output.stdout.trim_end() == expected.trim_end() {
+        EmbeddedAcrTestResult::Ac {
+            actual: output.stdout,
+        }
     } else {
         EmbeddedAcrTestResult::Wa {
-            actual: stdout,
+            actual: output.stdout,
             expected,
         }
     }
@@ -1791,6 +1851,9 @@ fn render_embedded_test_steps(
                 }
                 EmbeddedAcrTestResult::Re { stderr, .. } => {
                     rendered.push_str(&format!("\nCase {index}: RE\n{}\n", stderr.trim_end()));
+                }
+                EmbeddedAcrTestResult::Tle => {
+                    rendered.push_str(&format!("\nCase {index}: TLE\n"));
                 }
             }
         }
@@ -1874,6 +1937,12 @@ fn embedded_case_results(results: &[(usize, EmbeddedAcrTestResult)]) -> Vec<(usi
                     heading: "Runtime Error".into(),
                     actual: None,
                     stderr: Some(stderr.clone()),
+                },
+                EmbeddedAcrTestResult::Tle => CaseResult {
+                    status: CommandOutputItemStatus::Failed,
+                    heading: "Time Limit Exceeded".into(),
+                    actual: None,
+                    stderr: None,
                 },
             };
             (*index, case)
@@ -2055,10 +2124,24 @@ impl RduelView {
 
     fn new_case_editor(text: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
         cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, 12, window, cx);
+            let buffer = cx.new(|cx| Buffer::local("", cx));
+            let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::SizeByContent,
+                },
+                buffer,
+                None,
+                window,
+                cx,
+            );
             editor.set_text(text, window, cx);
             editor.set_edit_predictions_disabled(true, cx);
             editor.set_show_gutter(false, cx);
+            editor.disable_scrollbars_and_minimap(window, cx);
+            editor.set_forbid_vertical_scroll(true);
             // Disable soft wrap: with wrapping, the editor's auto height depends on
             // its width, so the detail scrollbar appearing re-wraps it, which
             // toggles the scrollbar again — an infinite relayout loop that strobes
@@ -3193,6 +3276,7 @@ impl RduelView {
             .id("rduel-add-case")
             .h(px(20.))
             .flex_none()
+            .gap_1()
             .items_center()
             .px_2()
             .rounded_sm()
@@ -3201,8 +3285,13 @@ impl RduelView {
             .bg(cx.theme().colors().element_background)
             .cursor_pointer()
             .child(
-                Label::new("＋ Case")
-                    .size(LabelSize::Small)
+                Icon::new(IconName::Plus)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("Case")
+                    .size(LabelSize::Default)
                     .color(Color::Muted),
             )
             .on_click(cx.listener(|this, _, window, cx| this.add_test_case(window, cx)))
@@ -3224,7 +3313,11 @@ impl RduelView {
         let result_diff = case
             .result
             .as_ref()
-            .and_then(|result| result.actual.as_ref())
+            .and_then(|result| {
+                (result.status == CommandOutputItemStatus::Failed)
+                    .then_some(result)
+                    .and_then(|result| result.actual.as_ref())
+            })
             .map(|actual| OutputDiff {
                 expected: expected_text.trim_end().to_string().into(),
                 actual: actual.trim_end().to_string().into(),
@@ -3237,49 +3330,50 @@ impl RduelView {
         let editor_box = |editor: Entity<Editor>, cx: &mut Context<Self>| {
             div()
                 .w_full()
-                .p_1p5()
+                .min_h(px(24.))
                 .rounded_sm()
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().editor_background)
+                .overflow_hidden()
                 .child(editor)
         };
 
         v_flex()
             .gap_2()
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(Label::new(format!("Case {index}")).size(LabelSize::Default))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .when(is_default, |this| {
-                                this.child(
-                                    Button::new(("rduel-case-restore", index), "Restore")
-                                        .disabled(!can_restore)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.restore_test_case(index, window, cx)
-                                        })),
-                                )
-                            })
-                            .child(
-                                Button::new(("rduel-case-delete", index), "Delete").on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.delete_test_case(index, cx)
-                                    }),
-                                ),
-                            ),
-                    ),
-            )
-            .child(
                 v_flex()
                     .gap_1()
                     .child(
-                        Label::new("Input")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                Label::new("Input")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .when(is_default, |this| {
+                                        this.child(
+                                            Button::new(("rduel-case-restore", index), "Restore")
+                                                .disabled(!can_restore)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.restore_test_case(index, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new(("rduel-case-delete", index), "Delete")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_test_case(index, cx)
+                                            })),
+                                    ),
+                            ),
                     )
                     .child(editor_box(case.input.clone(), cx)),
             )
@@ -3702,8 +3796,8 @@ edition = "2024"
 problem_url = "https://atcoder.jp/contests/abc001/tasks/abc001_1"
 
 [dependencies]
-num = "=0.4.3"
-proconio = { version = "=0.5.0", features = ["derive"] }
+num = "0.4.3"
+proconio = { version = "0.5.0", features = ["derive"] }
 "#;
 
 #[cfg(test)]
