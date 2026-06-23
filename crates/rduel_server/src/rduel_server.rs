@@ -14,7 +14,10 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use html_to_markdown::{TagHandler, convert_html_to_markdown, markdown};
+use html_to_markdown::{
+    HandleTag, HtmlElement, MarkdownWriter, StartTagOutcome, TagHandler, convert_html_to_markdown,
+    markdown,
+};
 use rand::prelude::IndexedRandom;
 use reqwest::header::COOKIE;
 use scraper::{Html, Selector};
@@ -180,12 +183,19 @@ impl RduelRooms {
     }
 
     fn token_for(&self, player_id: &str) -> String {
-        self.player_tokens.get(player_id).cloned().unwrap_or_default()
+        self.player_tokens
+            .get(player_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Constant-time-ish check that a non-empty token matches the player's.
     fn token_matches(&self, player_id: &str, token: &str) -> bool {
-        !token.is_empty() && self.player_tokens.get(player_id).is_some_and(|t| t == token)
+        !token.is_empty()
+            && self
+                .player_tokens
+                .get(player_id)
+                .is_some_and(|t| t == token)
     }
 
     /// Removes a player from all bookkeeping, including its secret token.
@@ -273,10 +283,11 @@ impl RduelRooms {
     fn create_room(&mut self, opponent: Player, player: Player, problem: Problem) -> JoinResponse {
         // If either player left while problem selection was in flight they are no
         // longer `Matching`; abort rather than resurrecting them into a room.
-        let both_present = matches!(
-            self.players.get(&opponent.id),
-            Some(PlayerLocation::Matching)
-        ) && matches!(self.players.get(&player.id), Some(PlayerLocation::Matching));
+        let both_present =
+            matches!(
+                self.players.get(&opponent.id),
+                Some(PlayerLocation::Matching)
+            ) && matches!(self.players.get(&player.id), Some(PlayerLocation::Matching));
         if !both_present {
             return self.requeue_pair(opponent, player);
         }
@@ -562,7 +573,9 @@ enum PlayerLocation {
     /// room has not been created yet because problem selection is in flight.
     /// While in this state the player is not in `waiting_players`.
     Matching,
-    Room { room_id: String },
+    Room {
+        room_id: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -1196,6 +1209,7 @@ async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
         .context("converting AtCoder statement to Markdown")?;
     let statement_markdown = prefer_english_statement(statement_markdown);
     let statement_markdown = repair_empty_markdown_list_items(&statement_markdown);
+    let statement_markdown = trim_code_fence_trailing_blanks(&statement_markdown);
     let samples = extract_markdown_samples(&statement_markdown);
     let samples = if samples.is_empty() {
         extract_html_samples(&statement_html)
@@ -1361,7 +1375,45 @@ fn markdown_handlers() -> Vec<TagHandler> {
         Rc::new(RefCell::new(markdown::StyledTextHandler)),
         Rc::new(RefCell::new(markdown::CodeHandler)),
         Rc::new(RefCell::new(markdown::TableHandler::new())),
+        Rc::new(RefCell::new(ImageHandler)),
     ]
+}
+
+/// Emits `<img>` tags as Markdown images; the built-in handlers drop them, which
+/// is why AtCoder statement figures were disappearing.
+struct ImageHandler;
+
+impl HandleTag for ImageHandler {
+    fn should_handle(&self, tag: &str) -> bool {
+        tag == "img"
+    }
+
+    fn handle_tag_start(
+        &mut self,
+        tag: &HtmlElement,
+        writer: &mut MarkdownWriter,
+    ) -> StartTagOutcome {
+        if let Some(src) = tag.attr("src") {
+            let src = absolutize_atcoder_url(src.trim());
+            let alt = tag.attr("alt").unwrap_or_default();
+            writer.push_str(&format!("![{}]({})", alt.trim(), src));
+        }
+        StartTagOutcome::Continue
+    }
+}
+
+/// Resolves AtCoder statement image URLs (often protocol-relative or root-relative)
+/// to absolute URLs the client can fetch.
+fn absolutize_atcoder_url(src: &str) -> String {
+    if src.starts_with("http://") || src.starts_with("https://") {
+        src.to_string()
+    } else if let Some(rest) = src.strip_prefix("//") {
+        format!("https://{rest}")
+    } else if src.starts_with('/') {
+        format!("https://atcoder.jp{src}")
+    } else {
+        format!("https://atcoder.jp/{src}")
+    }
 }
 
 fn extract_task_statement_html(html: &str) -> Option<String> {
@@ -1426,12 +1478,37 @@ fn extract_markdown_samples(markdown: &str) -> Vec<Sample> {
         .into_iter()
         .zip(outputs)
         .map(|(input, output)| Sample {
-            input: ensure_trailing_newline(input),
-            output: ensure_trailing_newline(output),
+            input: normalize_sample(input),
+            output: normalize_sample(output),
         })
         .collect::<Vec<_>>();
     samples.dedup_by(|left, right| left.input == right.input && left.output == right.output);
     samples
+}
+
+/// Drops the blank lines AtCoder leaves before a closing ``` fence so sample
+/// blocks in the rendered statement don't show a trailing empty line.
+fn trim_code_fence_trailing_blanks(markdown: &str) -> String {
+    let had_trailing_newline = markdown.ends_with('\n');
+    let mut output: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in markdown.lines() {
+        let is_fence = line.trim_start().starts_with("```");
+        if is_fence && in_fence {
+            while output.last().is_some_and(|last| last.trim().is_empty()) {
+                output.pop();
+            }
+            in_fence = false;
+        } else if is_fence {
+            in_fence = true;
+        }
+        output.push(line.to_string());
+    }
+    let mut result = output.join("\n");
+    if had_trailing_newline {
+        result.push('\n');
+    }
+    result
 }
 
 fn next_fenced_code_block<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Option<String> {
@@ -1488,19 +1565,18 @@ fn extract_html_samples(statement_html: &str) -> Vec<Sample> {
         .into_iter()
         .zip(outputs)
         .map(|(input, output)| Sample {
-            input: ensure_trailing_newline(input),
-            output: ensure_trailing_newline(output),
+            input: normalize_sample(input),
+            output: normalize_sample(output),
         })
         .collect::<Vec<_>>();
     samples.dedup_by(|left, right| left.input == right.input && left.output == right.output);
     samples
 }
 
-fn ensure_trailing_newline(mut text: String) -> String {
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text
+/// Trims trailing whitespace/newlines from a sample so editors and on-disk test
+/// files don't carry the stray blank lines AtCoder's `<pre>` blocks include.
+fn normalize_sample(text: String) -> String {
+    text.trim_end().to_string()
 }
 
 fn html_unescape(text: &str) -> String {
@@ -1701,7 +1777,8 @@ mod tests {
             panic!("expected a CreateRoom decision");
         };
         let problem = rooms.problems[0].clone();
-        let JoinResponse::Matched { room, .. } = rooms.create_room(opponent, player, problem) else {
+        let JoinResponse::Matched { room, .. } = rooms.create_room(opponent, player, problem)
+        else {
             panic!("expected a Matched response");
         };
         let room_id = room.id;
