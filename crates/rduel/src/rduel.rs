@@ -10,8 +10,8 @@ use std::{
 use editor::{Editor, MultiBuffer};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, DismissEvent, DragMoveEvent, Empty, Entity,
-    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseUpEvent, Render,
-    ScrollHandle, SharedString, WeakEntity, Window, div, px,
+    EventEmitter, FocusHandle, Focusable, ImageSource, MouseButton, MouseDownEvent, MouseUpEvent,
+    Render, Resource, ScrollHandle, SharedString, SharedUri, WeakEntity, Window, div, px,
 };
 use language::{Buffer, LanguageRegistry};
 use markdown::{
@@ -35,9 +35,11 @@ use zed_actions::rduel::OpenRduel;
 const DEFAULT_PROBLEM_WIDTH_FRACTION: f32 = 0.42;
 const MIN_PROBLEM_WIDTH_FRACTION: f32 = 0.25;
 const MAX_PROBLEM_WIDTH_FRACTION: f32 = 0.75;
-const DEFAULT_COMMAND_OUTPUT_HEIGHT: f32 = 156.0;
-const MIN_COMMAND_OUTPUT_HEIGHT: f32 = 96.0;
-const MAX_COMMAND_OUTPUT_HEIGHT: f32 = 360.0;
+const DEFAULT_COMMAND_OUTPUT_HEIGHT: f32 = 280.0;
+/// Floor for the output panel: enough to keep its toolbar (run/submit) usable.
+const MIN_COMMAND_OUTPUT_HEIGHT: f32 = 28.0;
+/// Space kept above the output at full height so the code tab bar stays visible.
+const CODE_AREA_TOP_RESERVE: f32 = 50.0;
 const PROBLEM_MARKDOWN_FONT_SCALE: f32 = 1.12;
 const DEFAULT_RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
 /// How long the "opponent submitted" banner stays visible.
@@ -406,6 +408,8 @@ struct RduelView {
     problem_scroll_handle: ScrollHandle,
     command_output: CommandOutputState,
     command_status: CommandStatus,
+    test_cases: Vec<RduelTestCase>,
+    output_selection: OutputSelection,
     presence: Option<RoomPresence>,
     opponent_flash: Option<OpponentFlash>,
 }
@@ -461,7 +465,6 @@ impl RoomPresence {
 #[derive(Clone)]
 struct CommandOutputState {
     items: Vec<CommandOutputItem>,
-    selected_index: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -474,7 +477,15 @@ struct CommandOutputItem {
 #[derive(Clone)]
 struct CommandOutputDetail {
     heading: SharedString,
+    diff: Option<OutputDiff>,
     sections: Vec<CommandOutputDetailSection>,
+}
+
+/// Expected vs. actual program output, rendered as a git-style line diff.
+#[derive(Clone)]
+struct OutputDiff {
+    expected: SharedString,
+    actual: SharedString,
 }
 
 #[derive(Clone)]
@@ -487,45 +498,38 @@ struct CommandOutputDetailSection {
 enum CommandOutputItemStatus {
     Pending,
     Passed,
+    Warning,
     Failed,
 }
 
-impl CommandOutputState {
-    fn initial(samples: &[RduelSample]) -> Self {
-        let mut items = vec![CommandOutputItem {
-            label: "cargo build".into(),
-            status: CommandOutputItemStatus::Pending,
-            detail: Some(CommandOutputDetail::new("Not run yet.")),
-        }];
-        if samples.is_empty() {
-            items.push(CommandOutputItem {
-                label: "Samples".into(),
-                status: CommandOutputItemStatus::Pending,
-                detail: Some(CommandOutputDetail::new("No sample cases found.")),
-            });
-        } else {
-            items.extend(
-                samples
-                    .iter()
-                    .enumerate()
-                    .map(|(index, sample)| CommandOutputItem {
-                        label: format!("Case {}", index + 1).into(),
-                        status: CommandOutputItemStatus::Pending,
-                        detail: Some(sample_detail(
-                            "Not run yet.",
-                            Some(&sample.input),
-                            Some(&sample.output),
-                            None,
-                            None,
-                        )),
-                    }),
-            );
-        }
+/// An editable test case: input/expected are live editors so the user can
+/// select, copy, and edit them; `default` keeps the provided values for restore.
+struct RduelTestCase {
+    input: Entity<Editor>,
+    expected: Entity<Editor>,
+    default: Option<RduelSample>,
+    result: Option<CaseResult>,
+}
 
-        Self {
-            selected_index: Some(0),
-            items,
-        }
+/// The most recent run outcome for a single test case.
+#[derive(Clone)]
+struct CaseResult {
+    status: CommandOutputItemStatus,
+    heading: SharedString,
+    actual: Option<String>,
+    stderr: Option<String>,
+}
+
+/// Which chip in the output toolbar is selected: a run step or a test case.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputSelection {
+    Step(usize),
+    Case(usize),
+}
+
+impl CommandOutputState {
+    fn empty() -> Self {
+        Self { items: Vec::new() }
     }
 
     fn running(label: &'static str) -> Self {
@@ -535,7 +539,6 @@ impl CommandOutputState {
                 status: CommandOutputItemStatus::Pending,
                 detail: Some(CommandOutputDetail::new("Waiting for command output...")),
             }],
-            selected_index: Some(0),
         }
     }
 }
@@ -551,7 +554,6 @@ fn single_command_output_state(
             status,
             detail: Some(CommandOutputDetail::new(detail)),
         }],
-        selected_index: Some(0),
     }
 }
 
@@ -559,6 +561,7 @@ impl CommandOutputDetail {
     fn new(heading: impl Into<SharedString>) -> Self {
         Self {
             heading: heading.into(),
+            diff: None,
             sections: Vec::new(),
         }
     }
@@ -569,6 +572,7 @@ impl CommandOutputDetail {
     ) -> Self {
         Self {
             heading: heading.into(),
+            diff: None,
             sections,
         }
     }
@@ -1083,6 +1087,7 @@ struct RduelCommandOutput {
     success: bool,
     rendered: String,
     items: Vec<CommandOutputItem>,
+    case_results: Vec<(usize, CaseResult)>,
     submit_ready: Option<RduelSubmitReady>,
 }
 
@@ -1171,6 +1176,7 @@ async fn run_rduel_submit(
                     test_output.rendered
                 ),
                 items: test_output.items,
+                case_results: test_output.case_results,
                 submit_ready: None,
             });
         }
@@ -1190,6 +1196,7 @@ async fn run_rduel_submit(
             submit_url,
         ),
         items: submit_ready_items(&test_output, &source_path, &submit_url),
+        case_results: test_output.case_results,
         submit_ready: Some(RduelSubmitReady {
             source_code,
             source_path,
@@ -1264,13 +1271,11 @@ impl RduelMatchCommand {
                         player_id,
                         token: None,
                     },
-                    PlayerStateResponse::Matched { player_id, room } => {
-                        RduelMatchOutput::Matched {
-                            player_id,
-                            token: None,
-                            room,
-                        }
-                    }
+                    PlayerStateResponse::Matched { player_id, room } => RduelMatchOutput::Matched {
+                        player_id,
+                        token: None,
+                        room,
+                    },
                 })
             }
             Self::PollRoom {
@@ -1500,7 +1505,6 @@ fn write_server_problem_to_project(
     }
 
     for (index, sample) in problem.samples.iter().enumerate() {
-        let index = index + 1;
         std::fs::write(
             rduel_project.test_path.join(format!("{index}.in")),
             &sample.input,
@@ -1514,6 +1518,33 @@ fn write_server_problem_to_project(
     let cargo_toml = std::fs::read_to_string(&rduel_project.cargo_toml_path)?;
     let cargo_toml = replace_problem_url(&cargo_toml, &problem.url);
     std::fs::write(&rduel_project.cargo_toml_path, cargo_toml)?;
+    Ok(())
+}
+
+/// Rewrites the test directory from the current (edited/added) cases, 0-based and
+/// contiguous, so `run_embedded_sample_tests` picks them up.
+fn write_test_case_files(
+    rduel_project: &RduelProjectFiles,
+    cases: &[(String, String)],
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&rduel_project.test_path)?;
+    for entry in std::fs::read_dir(&rduel_project.test_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        if extension == "in" || extension == "out" {
+            std::fs::remove_file(path)?;
+        }
+    }
+    for (index, (input, expected)) in cases.iter().enumerate() {
+        std::fs::write(rduel_project.test_path.join(format!("{index}.in")), input)?;
+        std::fs::write(
+            rduel_project.test_path.join(format!("{index}.out")),
+            expected,
+        )?;
+    }
     Ok(())
 }
 
@@ -1571,21 +1602,9 @@ fn executable_search_paths() -> Vec<PathBuf> {
 // Rduel vendors the runner behavior so users do not need an external `acr` binary.
 #[derive(Debug)]
 enum EmbeddedAcrTestResult {
-    Ac {
-        input: String,
-        actual: String,
-        expected: String,
-    },
-    Wa {
-        input: String,
-        actual: String,
-        expected: String,
-    },
-    Re {
-        input: Option<String>,
-        expected: Option<String>,
-        stderr: String,
-    },
+    Ac { actual: String },
+    Wa { actual: String, expected: String },
+    Re { stderr: String },
 }
 
 async fn run_embedded_sample_tests(
@@ -1594,7 +1613,7 @@ async fn run_embedded_sample_tests(
     target_path: PathBuf,
 ) -> Vec<(usize, EmbeddedAcrTestResult)> {
     let mut results = Vec::new();
-    let mut index = 1;
+    let mut index = 0;
 
     loop {
         let input_path = test_path.join(format!("{index}.in"));
@@ -1609,8 +1628,6 @@ async fn run_embedded_sample_tests(
                 results.push((
                     index,
                     EmbeddedAcrTestResult::Re {
-                        input: None,
-                        expected: None,
                         stderr: format!("Failed to read {}: {error}", input_path.display()),
                     },
                 ));
@@ -1624,8 +1641,6 @@ async fn run_embedded_sample_tests(
                 results.push((
                     index,
                     EmbeddedAcrTestResult::Re {
-                        input: Some(input),
-                        expected: None,
                         stderr: format!("Failed to read {}: {error}", output_path.display()),
                     },
                 ));
@@ -1652,8 +1667,6 @@ async fn run_embedded_sample_test(
 ) -> EmbeddedAcrTestResult {
     let Some(cargo) = resolve_rduel_executable("cargo") else {
         return EmbeddedAcrTestResult::Re {
-            input: Some(input),
-            expected: Some(expected),
             stderr: "could not find `cargo` in PATH or common user bin directories".into(),
         };
     };
@@ -1669,8 +1682,6 @@ async fn run_embedded_sample_test(
         Ok(child) => child,
         Err(error) => {
             return EmbeddedAcrTestResult::Re {
-                input: Some(input),
-                expected: Some(expected),
                 stderr: error.to_string(),
             };
         }
@@ -1701,8 +1712,6 @@ async fn run_embedded_sample_test(
         Ok(output) => output,
         Err(error) => {
             return EmbeddedAcrTestResult::Re {
-                input: Some(input),
-                expected: Some(expected),
                 stderr: error.to_string(),
             };
         }
@@ -1711,22 +1720,13 @@ async fn run_embedded_sample_test(
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        return EmbeddedAcrTestResult::Re {
-            input: Some(input),
-            expected: Some(expected),
-            stderr,
-        };
+        return EmbeddedAcrTestResult::Re { stderr };
     }
 
     if stdout.trim_end() == expected.trim_end() {
-        EmbeddedAcrTestResult::Ac {
-            input,
-            actual: stdout,
-            expected,
-        }
+        EmbeddedAcrTestResult::Ac { actual: stdout }
     } else {
         EmbeddedAcrTestResult::Wa {
-            input,
             actual: stdout,
             expected,
         }
@@ -1741,7 +1741,12 @@ fn render_embedded_test_steps(
     let Some(build_step) = steps.iter().find(|step| step.label == "cargo build") else {
         return render_command_steps(steps);
     };
-    let build_item = process_output_item(build_step);
+    let mut build_item = process_output_item(build_step);
+    // A successful build that still emits warnings is flagged yellow rather than
+    // green, without failing the run.
+    if build_step.status.success() && build_step.stderr.contains("warning") {
+        build_item.status = CommandOutputItemStatus::Warning;
+    }
 
     if !build_step.status.success() {
         let mut rendered = String::from("Build failed.\n\n");
@@ -1754,22 +1759,7 @@ fn render_embedded_test_steps(
             success,
             rendered,
             items: vec![build_item],
-            submit_ready: None,
-        };
-    }
-
-    if results.is_empty() {
-        return RduelCommandOutput {
-            success,
-            rendered: "Build: OK\nTest: no sample cases found.".into(),
-            items: vec![
-                build_item,
-                CommandOutputItem {
-                    label: "Samples".into(),
-                    status: CommandOutputItemStatus::Pending,
-                    detail: Some(CommandOutputDetail::new("No sample cases found.")),
-                },
-            ],
+            case_results: Vec::new(),
             submit_ready: None,
         };
     }
@@ -1780,39 +1770,38 @@ fn render_embedded_test_steps(
         .count();
     let success = success && passed == results.len();
 
-    if success {
-        return RduelCommandOutput {
-            success,
-            rendered: format!("Build: OK\nTest: AC ({passed} cases)"),
-            items: embedded_test_items(build_item, &results),
-            submit_ready: None,
-        };
-    }
-
-    let mut rendered = String::from("Build: OK\nTest: Failed\n");
-    rendered.push_str(&format!("{passed}/{} cases passed\n", results.len()));
-    for (index, result) in &results {
-        match result {
-            EmbeddedAcrTestResult::Ac { .. } => {}
-            EmbeddedAcrTestResult::Wa {
-                actual, expected, ..
-            } => {
-                rendered.push_str(&format!(
-                    "\nCase {index}: WA\nExpected:\n{}\n\nActual:\n{}\n",
-                    expected.trim_end(),
-                    actual.trim_end()
-                ));
-            }
-            EmbeddedAcrTestResult::Re { stderr, .. } => {
-                rendered.push_str(&format!("\nCase {index}: RE\n{}\n", stderr.trim_end()));
+    let rendered = if results.is_empty() {
+        "Build: OK\nTest: no sample cases.".to_string()
+    } else if success {
+        format!("Build: OK\nTest: AC ({passed} cases)")
+    } else {
+        let mut rendered = String::from("Build: OK\nTest: Failed\n");
+        rendered.push_str(&format!("{passed}/{} cases passed\n", results.len()));
+        for (index, result) in &results {
+            match result {
+                EmbeddedAcrTestResult::Ac { .. } => {}
+                EmbeddedAcrTestResult::Wa {
+                    actual, expected, ..
+                } => {
+                    rendered.push_str(&format!(
+                        "\nCase {index}: WA\nExpected:\n{}\n\nActual:\n{}\n",
+                        expected.trim_end(),
+                        actual.trim_end()
+                    ));
+                }
+                EmbeddedAcrTestResult::Re { stderr, .. } => {
+                    rendered.push_str(&format!("\nCase {index}: RE\n{}\n", stderr.trim_end()));
+                }
             }
         }
-    }
+        rendered
+    };
 
     RduelCommandOutput {
         success,
         rendered,
-        items: embedded_test_items(build_item, &results),
+        items: vec![build_item],
+        case_results: embedded_case_results(&results),
         submit_ready: None,
     }
 }
@@ -1858,98 +1847,47 @@ fn render_command_steps(steps: Vec<RduelProcessOutput>) -> RduelCommandOutput {
         success,
         rendered,
         items: steps.iter().map(process_output_item).collect(),
+        case_results: Vec::new(),
         submit_ready: None,
     }
 }
 
-fn embedded_test_items(
-    build_item: CommandOutputItem,
-    results: &[(usize, EmbeddedAcrTestResult)],
-) -> Vec<CommandOutputItem> {
-    let mut items = vec![build_item];
-    items.extend(results.iter().map(|(index, result)| match result {
-        EmbeddedAcrTestResult::Ac {
-            input,
-            actual,
-            expected,
-        } => CommandOutputItem {
-            label: format!("Case {index}").into(),
-            status: CommandOutputItemStatus::Passed,
-            detail: Some(sample_detail(
-                "Accepted",
-                Some(input),
-                Some(expected),
-                Some(actual),
-                None,
-            )),
-        },
-        EmbeddedAcrTestResult::Wa {
-            input,
-            actual,
-            expected,
-        } => CommandOutputItem {
-            label: format!("Case {index}").into(),
-            status: CommandOutputItemStatus::Failed,
-            detail: Some(sample_detail(
-                "Wrong Answer",
-                Some(input),
-                Some(expected),
-                Some(actual),
-                None,
-            )),
-        },
-        EmbeddedAcrTestResult::Re {
-            input,
-            expected,
-            stderr,
-        } => CommandOutputItem {
-            label: format!("Case {index}").into(),
-            status: CommandOutputItemStatus::Failed,
-            detail: Some(sample_detail(
-                "Runtime Error",
-                input.as_ref(),
-                expected.as_ref(),
-                None,
-                Some(stderr),
-            )),
-        },
-    }));
-    items
+fn embedded_case_results(results: &[(usize, EmbeddedAcrTestResult)]) -> Vec<(usize, CaseResult)> {
+    results
+        .iter()
+        .map(|(index, result)| {
+            let case = match result {
+                EmbeddedAcrTestResult::Ac { actual, .. } => CaseResult {
+                    status: CommandOutputItemStatus::Passed,
+                    heading: "Accepted".into(),
+                    actual: Some(actual.clone()),
+                    stderr: None,
+                },
+                EmbeddedAcrTestResult::Wa { actual, .. } => CaseResult {
+                    status: CommandOutputItemStatus::Failed,
+                    heading: "Wrong Answer".into(),
+                    actual: Some(actual.clone()),
+                    stderr: None,
+                },
+                EmbeddedAcrTestResult::Re { stderr, .. } => CaseResult {
+                    status: CommandOutputItemStatus::Failed,
+                    heading: "Runtime Error".into(),
+                    actual: None,
+                    stderr: Some(stderr.clone()),
+                },
+            };
+            (*index, case)
+        })
+        .collect()
 }
 
-fn sample_detail(
-    heading: &str,
-    input: Option<&String>,
-    expected: Option<&String>,
-    actual: Option<&String>,
-    stderr: Option<&String>,
-) -> CommandOutputDetail {
-    let mut sections = Vec::new();
-    if let Some(input) = input {
-        sections.push(CommandOutputDetailSection {
-            title: "Input".into(),
-            body: input.trim_end().to_string().into(),
-        });
+fn status_dot_color(status: CommandOutputItemStatus, cx: &App) -> gpui::Hsla {
+    match status {
+        CommandOutputItemStatus::Pending => cx.theme().colors().border_variant,
+        CommandOutputItemStatus::Passed => cx.theme().status().success,
+        CommandOutputItemStatus::Warning => cx.theme().status().warning,
+        CommandOutputItemStatus::Failed => cx.theme().status().error,
     }
-    if let Some(expected) = expected {
-        sections.push(CommandOutputDetailSection {
-            title: "Expected".into(),
-            body: expected.trim_end().to_string().into(),
-        });
-    }
-    if let Some(actual) = actual {
-        sections.push(CommandOutputDetailSection {
-            title: "Actual".into(),
-            body: actual.trim_end().to_string().into(),
-        });
-    }
-    if let Some(stderr) = stderr {
-        sections.push(CommandOutputDetailSection {
-            title: "Stderr".into(),
-            body: stderr.trim_end().to_string().into(),
-        });
-    }
-    CommandOutputDetail::with_sections(heading, sections)
 }
 
 fn process_output_item(step: &RduelProcessOutput) -> CommandOutputItem {
@@ -2065,6 +2003,20 @@ impl RduelView {
             .room
             .as_ref()
             .map(|room| RoomPresence::from_room(room, Some(session.player_id.as_str())));
+        let test_cases = samples
+            .iter()
+            .map(|sample| RduelTestCase {
+                input: Self::new_case_editor(&sample.input, window, cx),
+                expected: Self::new_case_editor(&sample.output, window, cx),
+                default: Some(sample.clone()),
+                result: None,
+            })
+            .collect::<Vec<_>>();
+        let output_selection = if test_cases.is_empty() {
+            OutputSelection::Step(0)
+        } else {
+            OutputSelection::Case(0)
+        };
         let view = Self {
             focus_handle: cx.focus_handle(),
             project,
@@ -2089,14 +2041,31 @@ impl RduelView {
             problem_width_fraction: DEFAULT_PROBLEM_WIDTH_FRACTION,
             command_output_height: DEFAULT_COMMAND_OUTPUT_HEIGHT,
             problem_scroll_handle: ScrollHandle::new(),
-            command_output: CommandOutputState::initial(&samples),
+            command_output: CommandOutputState::empty(),
             command_status: CommandStatus::Idle,
+            test_cases,
+            output_selection,
             presence: initial_presence,
             opponent_flash: None,
         };
         view.poll_room_after_delay(cx);
         view.tick_match_timer(cx);
         view
+    }
+
+    fn new_case_editor(text: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
+        cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 12, window, cx);
+            editor.set_text(text, window, cx);
+            editor.set_edit_predictions_disabled(true, cx);
+            editor.set_show_gutter(false, cx);
+            // Disable soft wrap: with wrapping, the editor's auto height depends on
+            // its width, so the detail scrollbar appearing re-wraps it, which
+            // toggles the scrollbar again — an infinite relayout loop that strobes
+            // the whole pane (including the toolbar buttons).
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+            editor
+        })
     }
 
     fn new_problem_markdown(
@@ -2235,7 +2204,22 @@ impl RduelView {
             return;
         }
 
+        // Persist the (possibly edited/added) test cases to disk so the runner
+        // judges against exactly what the user sees.
+        if let Err(error) = self.write_test_cases_to_disk(&rduel_project, cx) {
+            self.command_status = CommandStatus::Failed;
+            self.command_output = single_command_output_state(
+                "Test cases",
+                CommandOutputItemStatus::Failed,
+                format!("Failed to write test cases:\n{error:#}"),
+            );
+            self.output_selection = OutputSelection::Step(0);
+            cx.notify();
+            return;
+        }
+
         self.command_status = CommandStatus::Running;
+        self.output_selection = OutputSelection::Step(0);
         self.set_command_output(CommandOutputState::running(label), cx);
 
         let save_task =
@@ -2249,6 +2233,9 @@ impl RduelView {
             }
             .await;
             this.update_in(cx, |this, _window, cx| {
+                for case in &mut this.test_cases {
+                    case.result = None;
+                }
                 let mut output_state = match result {
                     Ok(output) => {
                         this.command_status = if output.success {
@@ -2267,9 +2254,13 @@ impl RduelView {
                                 submit_ready.source_path.display()
                             );
                         }
+                        for (index, case_result) in output.case_results {
+                            if let Some(case) = this.test_cases.get_mut(index) {
+                                case.result = Some(case_result);
+                            }
+                        }
                         CommandOutputState {
                             items: output.items,
-                            selected_index: Some(0),
                         }
                     }
                     Err(error) => {
@@ -2294,10 +2285,53 @@ impl RduelView {
                     });
                 }
 
-                this.set_command_output(output_state, cx);
+                this.command_output = output_state;
+                this.focus_after_run();
+                cx.notify();
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Selects the first failed test case after a run; falls back to the first
+    /// failed run step (e.g. a compile failure) and otherwise the first chip.
+    fn focus_after_run(&mut self) {
+        if let Some(index) = self
+            .test_cases
+            .iter()
+            .position(|case| matches!(&case.result, Some(result) if result.status == CommandOutputItemStatus::Failed))
+        {
+            self.output_selection = OutputSelection::Case(index);
+        } else if let Some(index) = self
+            .command_output
+            .items
+            .iter()
+            .position(|item| item.status == CommandOutputItemStatus::Failed)
+        {
+            self.output_selection = OutputSelection::Step(index);
+        } else if !self.test_cases.is_empty() {
+            self.output_selection = OutputSelection::Case(0);
+        } else if !self.command_output.items.is_empty() {
+            self.output_selection = OutputSelection::Step(0);
+        }
+    }
+
+    fn write_test_cases_to_disk(
+        &self,
+        rduel_project: &RduelProjectFiles,
+        cx: &App,
+    ) -> anyhow::Result<()> {
+        let cases: Vec<(String, String)> = self
+            .test_cases
+            .iter()
+            .map(|case| {
+                (
+                    case.input.read(cx).text(cx),
+                    case.expected.read(cx).text(cx),
+                )
+            })
+            .collect();
+        write_test_case_files(rduel_project, &cases)
     }
 
     fn start_server_submission_watch(&self, cx: &mut Context<Self>) {
@@ -2351,15 +2385,14 @@ impl RduelView {
         if let (Some(previous), Some(current)) = (previous_opponent, next.opponent.as_ref()) {
             let attempts_increased =
                 current.activity.attempt_count > previous.activity.attempt_count;
-            let newer_submission =
-                match (
-                    current.activity.last_submission_epoch,
-                    previous.activity.last_submission_epoch,
-                ) {
-                    (Some(current_epoch), Some(previous_epoch)) => current_epoch > previous_epoch,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
+            let newer_submission = match (
+                current.activity.last_submission_epoch,
+                previous.activity.last_submission_epoch,
+            ) {
+                (Some(current_epoch), Some(previous_epoch)) => current_epoch > previous_epoch,
+                (Some(_), None) => true,
+                _ => false,
+            };
             if attempts_increased || newer_submission {
                 let verdict = current
                     .activity
@@ -2597,9 +2630,14 @@ impl RduelView {
         cx: &mut Context<Self>,
     ) {
         let bounds_bottom = event.bounds.bottom().as_f32();
+        let bounds_top = event.bounds.top().as_f32();
         let pointer_y = event.event.position.y.as_f32();
+        // Allow the panel to span from a thin toolbar strip at the very bottom up
+        // to just below the code tab bar at the very top of the code area.
+        let available = (bounds_bottom - bounds_top).max(0.0);
+        let max_height = (available - CODE_AREA_TOP_RESERVE).max(MIN_COMMAND_OUTPUT_HEIGHT);
         let command_output_height =
-            (bounds_bottom - pointer_y).clamp(MIN_COMMAND_OUTPUT_HEIGHT, MAX_COMMAND_OUTPUT_HEIGHT);
+            (bounds_bottom - pointer_y).clamp(MIN_COMMAND_OUTPUT_HEIGHT, max_height);
 
         if (self.command_output_height - command_output_height).abs() > f32::EPSILON {
             self.command_output_height = command_output_height;
@@ -2696,6 +2734,18 @@ impl RduelView {
                                         copy_button_visibility: CopyButtonVisibility::Hidden,
                                         wrap_button_visibility: WrapButtonVisibility::Hidden,
                                         border: false,
+                                    })
+                                    .image_resolver(|dest_url| {
+                                        // Remote statement figures (AtCoder hosts them at
+                                        // absolute https URLs) need an explicit resolver; the
+                                        // markdown component only auto-loads `data:` images.
+                                        (dest_url.starts_with("http://")
+                                            || dest_url.starts_with("https://"))
+                                        .then(|| {
+                                            ImageSource::Resource(Resource::Uri(SharedUri::from(
+                                                dest_url.to_string(),
+                                            )))
+                                        })
                                     })
                                     .scroll_handle(self.problem_scroll_handle.clone()),
                             ),
@@ -2833,20 +2883,16 @@ impl RduelView {
 
     fn render_command_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_command_running = self.command_status.is_running();
-        let selected_item = self
-            .command_output
-            .selected_index
-            .and_then(|index| self.command_output.items.get(index));
-        let output_items = self
-            .command_output
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                self.render_command_output_item(index, item, cx)
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+
+        let mut chips: Vec<AnyElement> = Vec::new();
+        for (index, item) in self.command_output.items.iter().enumerate() {
+            chips.push(self.render_step_chip(index, item, cx).into_any_element());
+        }
+        for index in 0..self.test_cases.len() {
+            chips.push(self.render_case_chip(index, cx).into_any_element());
+        }
+        chips.push(self.render_add_case_chip(cx).into_any_element());
+
         v_flex()
             .h(px(self.command_output_height))
             .flex_none()
@@ -2863,11 +2909,12 @@ impl RduelView {
                     .border_color(cx.theme().colors().border)
                     .child(
                         h_flex()
+                            .id("rduel-chip-row")
                             .flex_1()
                             .min_w_0()
                             .gap_1p5()
-                            .overflow_hidden()
-                            .children(output_items),
+                            .overflow_x_scroll()
+                            .children(chips),
                     )
                     .child(
                         h_flex()
@@ -2899,9 +2946,21 @@ impl RduelView {
                         .border_1()
                         .border_color(cx.theme().colors().border)
                         .bg(cx.theme().colors().editor_background)
-                        .child(self.render_command_output_detail(selected_item, cx)),
+                        .child(self.render_output_detail(cx)),
                 ),
             )
+    }
+
+    fn render_output_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.output_selection {
+            OutputSelection::Step(index) => {
+                self.render_command_output_detail(self.command_output.items.get(index), cx)
+            }
+            OutputSelection::Case(index) => match self.test_cases.get(index) {
+                Some(case) => self.render_case_detail(index, case, cx),
+                None => Empty.into_any_element(),
+            },
+        }
     }
 
     fn render_command_output_detail(
@@ -2915,11 +2974,114 @@ impl RduelView {
 
         v_flex()
             .gap_2()
-            .child(Label::new(detail.heading.clone()).size(LabelSize::Default))
+            .when(!detail.heading.is_empty(), |this| {
+                this.child(Label::new(detail.heading.clone()).size(LabelSize::Default))
+            })
+            .when_some(detail.diff.as_ref(), |this, diff| {
+                this.child(self.render_output_diff(diff, cx))
+            })
             .children(detail.sections.iter().map(|section| {
                 self.render_command_output_detail_section(section, cx)
                     .into_any_element()
             }))
+            .into_any_element()
+    }
+
+    fn render_output_diff(&self, diff: &OutputDiff, cx: &mut Context<Self>) -> impl IntoElement {
+        let split = |text: &str| -> Vec<String> {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                text.split('\n').map(|line| line.to_string()).collect()
+            }
+        };
+        let expected_lines = split(diff.expected.as_ref());
+        let actual_lines = split(diff.actual.as_ref());
+        let line_count = expected_lines.len().max(actual_lines.len());
+
+        let deleted = cx.theme().status().deleted;
+        let deleted_bg = deleted.opacity(0.12);
+        let created = cx.theme().status().created;
+        let created_bg = created.opacity(0.12);
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for index in 0..line_count {
+            let expected_line = expected_lines.get(index).map(String::as_str);
+            let actual_line = actual_lines.get(index).map(String::as_str);
+            match (expected_line, actual_line) {
+                (Some(expected), Some(actual)) if expected == actual => {
+                    rows.push(self.render_diff_row(' ', expected, None, None, cx));
+                }
+                (expected, actual) => {
+                    if let Some(expected) = expected {
+                        rows.push(self.render_diff_row(
+                            '-',
+                            expected,
+                            Some(deleted),
+                            Some(deleted_bg),
+                            cx,
+                        ));
+                    }
+                    if let Some(actual) = actual {
+                        rows.push(self.render_diff_row(
+                            '+',
+                            actual,
+                            Some(created),
+                            Some(created_bg),
+                            cx,
+                        ));
+                    }
+                }
+            }
+        }
+
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Label::new("− Expected")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error),
+                    )
+                    .child(
+                        Label::new("＋ Output")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Success),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .rounded_sm()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().editor_background)
+                    .children(rows),
+            )
+    }
+
+    fn render_diff_row(
+        &self,
+        marker: char,
+        text: &str,
+        color: Option<gpui::Hsla>,
+        background: Option<gpui::Hsla>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = Label::new(format!("{marker} {text}"))
+            .size(LabelSize::Default)
+            .buffer_font(cx);
+        let label = match color {
+            Some(color) => label.color(Color::Custom(color)),
+            None => label.color(Color::Muted),
+        };
+        div()
+            .w_full()
+            .px_1p5()
+            .when_some(background, |this, background| this.bg(background))
+            .child(label)
             .into_any_element()
     }
 
@@ -2950,18 +3112,13 @@ impl RduelView {
             )
     }
 
-    fn render_command_output_item(
+    fn render_step_chip(
         &self,
         index: usize,
         item: &CommandOutputItem,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_selected = self.command_output.selected_index == Some(index);
-        let dot_color = match item.status {
-            CommandOutputItemStatus::Pending => cx.theme().colors().border_variant,
-            CommandOutputItemStatus::Passed => cx.theme().status().success,
-            CommandOutputItemStatus::Failed => cx.theme().status().error,
-        };
+        let is_selected = self.output_selection == OutputSelection::Step(index);
         let border_color = if is_selected {
             cx.theme().colors().text_accent
         } else {
@@ -2969,7 +3126,7 @@ impl RduelView {
         };
 
         h_flex()
-            .id(("rduel-command-output-item", index))
+            .id(("rduel-step-chip", index))
             .h(px(20.))
             .flex_none()
             .gap_1()
@@ -2980,17 +3137,238 @@ impl RduelView {
             .border_color(border_color)
             .bg(cx.theme().colors().element_background)
             .cursor_pointer()
-            .child(div().size(px(7.)).rounded_full().bg(dot_color))
+            .child(
+                div()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(status_dot_color(item.status, cx)),
+            )
             .child(Label::new(item.label.clone()).size(LabelSize::Default))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.command_output.selected_index = Some(index);
+                this.output_selection = OutputSelection::Step(index);
                 cx.notify();
             }))
     }
 
+    fn render_case_chip(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = self.test_cases[index]
+            .result
+            .as_ref()
+            .map(|result| result.status)
+            .unwrap_or(CommandOutputItemStatus::Pending);
+        let is_selected = self.output_selection == OutputSelection::Case(index);
+        let border_color = if is_selected {
+            cx.theme().colors().text_accent
+        } else {
+            cx.theme().colors().border
+        };
+
+        h_flex()
+            .id(("rduel-case-chip", index))
+            .h(px(20.))
+            .flex_none()
+            .gap_1()
+            .items_center()
+            .px_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(border_color)
+            .bg(cx.theme().colors().element_background)
+            .cursor_pointer()
+            .child(
+                div()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(status_dot_color(status, cx)),
+            )
+            .child(Label::new(format!("Case {index}")).size(LabelSize::Default))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.output_selection = OutputSelection::Case(index);
+                cx.notify();
+            }))
+    }
+
+    fn render_add_case_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("rduel-add-case")
+            .h(px(20.))
+            .flex_none()
+            .items_center()
+            .px_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().element_background)
+            .cursor_pointer()
+            .child(
+                Label::new("＋ Case")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.add_test_case(window, cx)))
+    }
+
+    fn render_case_detail(
+        &self,
+        index: usize,
+        case: &RduelTestCase,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let input_text = case.input.read(cx).text(cx);
+        let expected_text = case.expected.read(cx).text(cx);
+        let can_restore = case
+            .default
+            .as_ref()
+            .is_some_and(|default| default.input != input_text || default.output != expected_text);
+        let is_default = case.default.is_some();
+        let result_diff = case
+            .result
+            .as_ref()
+            .and_then(|result| result.actual.as_ref())
+            .map(|actual| OutputDiff {
+                expected: expected_text.trim_end().to_string().into(),
+                actual: actual.trim_end().to_string().into(),
+            });
+        let stderr = case
+            .result
+            .as_ref()
+            .and_then(|result| result.stderr.clone());
+
+        let editor_box = |editor: Entity<Editor>, cx: &mut Context<Self>| {
+            div()
+                .w_full()
+                .p_1p5()
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().editor_background)
+                .child(editor)
+        };
+
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(Label::new(format!("Case {index}")).size(LabelSize::Default))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .when(is_default, |this| {
+                                this.child(
+                                    Button::new(("rduel-case-restore", index), "Restore")
+                                        .disabled(!can_restore)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.restore_test_case(index, window, cx)
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new(("rduel-case-delete", index), "Delete").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.delete_test_case(index, cx)
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("Input")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(editor_box(case.input.clone(), cx)),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("Expected")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(editor_box(case.expected.clone(), cx)),
+            )
+            .when_some(case.result.as_ref(), |this, result| {
+                let color = match result.status {
+                    CommandOutputItemStatus::Passed => Color::Success,
+                    CommandOutputItemStatus::Warning => Color::Warning,
+                    _ => Color::Error,
+                };
+                this.child(
+                    Label::new(result.heading.clone())
+                        .size(LabelSize::Default)
+                        .color(color),
+                )
+            })
+            .when_some(result_diff, |this, diff| {
+                this.child(self.render_output_diff(&diff, cx))
+            })
+            .when_some(stderr, |this, stderr| {
+                this.child(self.render_command_output_detail_section(
+                    &CommandOutputDetailSection {
+                        title: "Stderr".into(),
+                        body: stderr.trim_end().to_string().into(),
+                    },
+                    cx,
+                ))
+            })
+            .into_any_element()
+    }
+
+    fn add_test_case(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = Self::new_case_editor("", window, cx);
+        let expected = Self::new_case_editor("", window, cx);
+        self.test_cases.push(RduelTestCase {
+            input,
+            expected,
+            default: None,
+            result: None,
+        });
+        self.output_selection = OutputSelection::Case(self.test_cases.len() - 1);
+        cx.notify();
+    }
+
+    fn delete_test_case(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.test_cases.len() {
+            return;
+        }
+        self.test_cases.remove(index);
+        self.output_selection = if self.test_cases.is_empty() {
+            OutputSelection::Step(0)
+        } else {
+            OutputSelection::Case(index.min(self.test_cases.len() - 1))
+        };
+        cx.notify();
+    }
+
+    fn restore_test_case(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(case) = self.test_cases.get(index) else {
+            return;
+        };
+        let Some(default) = case.default.clone() else {
+            return;
+        };
+        let input = case.input.clone();
+        let expected = case.expected.clone();
+        input.update(cx, |editor, cx| {
+            editor.set_text(default.input.as_str(), window, cx)
+        });
+        expected.update(cx, |editor, cx| {
+            editor.set_text(default.output.as_str(), window, cx)
+        });
+        cx.notify();
+    }
+
     fn render_versus_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let presence = self.presence.as_ref();
-        let started_at = presence.map(|presence| presence.started_at_second).unwrap_or(0);
+        let started_at = presence
+            .map(|presence| presence.started_at_second)
+            .unwrap_or(0);
         let elapsed = format_elapsed(started_at);
         let flash = self
             .opponent_flash
@@ -3034,7 +3412,11 @@ impl RduelView {
                                 .rounded_sm()
                                 .border_1()
                                 .border_color(cx.theme().status().error)
-                                .child(Label::new(message).size(LabelSize::Small).color(Color::Error)),
+                                .child(
+                                    Label::new(message)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Error),
+                                ),
                         )
                     })
                     .child(self.render_player_presence(
@@ -3077,7 +3459,11 @@ impl RduelView {
                 )
             })
             .when_some(verdict, |this, verdict| {
-                this.child(Label::new(verdict).size(LabelSize::Small).color(verdict_color))
+                this.child(
+                    Label::new(verdict)
+                        .size(LabelSize::Small)
+                        .color(verdict_color),
+                )
             })
             .when_some(last_epoch, |this, epoch| {
                 this.child(
