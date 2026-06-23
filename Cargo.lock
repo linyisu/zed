@@ -14928,6 +14928,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "sqlez",
  "time",
  "tokio",
  "uuid",

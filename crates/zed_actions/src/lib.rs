@@ -243,7 +243,9 @@ pub mod rduel {
         rduel,
         [
             /// Opens the Rduel contest workspace prototype.
-            OpenRduel
+            OpenRduel,
+            /// Opens Rduel match history.
+            OpenRduelHistory
         ]
     );
 }

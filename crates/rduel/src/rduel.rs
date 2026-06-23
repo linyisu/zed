@@ -1,5 +1,6 @@
 use std::{
     any::TypeId,
+    collections::HashMap,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -36,7 +37,7 @@ use workspace::{
     Item, ModalView, ToolbarItemEvent, ToolbarItemView, Workspace,
     item::{ItemBufferKind, ItemEvent, SaveOptions},
 };
-use zed_actions::rduel::OpenRduel;
+use zed_actions::rduel::{OpenRduel, OpenRduelHistory};
 
 const DEFAULT_PROBLEM_WIDTH_FRACTION: f32 = 0.42;
 const MIN_PROBLEM_WIDTH_FRACTION: f32 = 0.25;
@@ -146,6 +147,9 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenRduel, window, cx| {
             open_rduel(workspace, window, cx);
         });
+        workspace.register_action(|workspace, _: &OpenRduelHistory, window, cx| {
+            open_rduel_history(workspace, window, cx);
+        });
     })
     .detach();
 }
@@ -155,6 +159,13 @@ fn open_rduel(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
     let workspace_handle = cx.entity().downgrade();
     workspace.toggle_modal(window, cx, |window, cx| {
         RduelMatchModal::new(workspace_handle, window, cx)
+    });
+}
+
+fn open_rduel_history(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let workspace_handle = cx.entity().downgrade();
+    workspace.toggle_modal(window, cx, |_, cx| {
+        RduelHistoryModal::new(workspace_handle, cx)
     });
 }
 
@@ -213,6 +224,23 @@ fn open_rduel_session(
                 && let Err(error) = write_server_problem_to_project(rduel_project, &room.problem)
             {
                 log::error!("failed to write Rduel server problem: {error:#}");
+            }
+            if let Some(rduel_project) = rduel_project.as_ref() {
+                if let Some(main_rs) = session.initial_main_rs.as_deref()
+                    && let Err(error) = std::fs::write(&rduel_project.problem_rs_path, main_rs)
+                {
+                    log::error!("failed to restore Rduel history main.rs: {error:#}");
+                }
+                if let Some(cargo_toml) = session.initial_cargo_toml.as_deref() {
+                    let cargo_toml = session
+                        .room
+                        .as_ref()
+                        .map(|room| replace_problem_url(cargo_toml, &room.problem.url))
+                        .unwrap_or_else(|| cargo_toml.to_string());
+                    if let Err(error) = std::fs::write(&rduel_project.cargo_toml_path, cargo_toml) {
+                        log::error!("failed to restore Rduel history Cargo.toml: {error:#}");
+                    }
+                }
             }
 
             let main_rs_buffer = if let Some(rduel_project) = rduel_project.as_ref() {
@@ -666,6 +694,11 @@ struct RduelSession {
     token: String,
     room: Option<ServerRoom>,
     server_url: String,
+    initial_main_rs: Option<String>,
+    initial_cargo_toml: Option<String>,
+    opponent_main_rs: Option<(String, String)>,
+    initial_command_output: Option<CommandOutputState>,
+    is_history: bool,
 }
 
 #[derive(Clone)]
@@ -686,6 +719,18 @@ struct JoinRequest {
 #[derive(Serialize)]
 struct LeaveRequest {
     token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_rs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cargo_toml: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CodeSnapshotRequest {
+    player_id: String,
+    token: String,
+    main_rs: String,
+    cargo_toml: String,
 }
 
 #[derive(Deserialize)]
@@ -750,6 +795,44 @@ struct ServerPlayer {
 }
 
 #[derive(Clone, Deserialize)]
+struct MatchHistoryResponse {
+    matches: Vec<MatchHistoryEntry>,
+}
+
+#[derive(Clone, Deserialize)]
+struct MatchHistoryEntry {
+    room_id: String,
+    problem_id: String,
+    problem_title: String,
+    problem: ServerProblem,
+    started_at_second: i64,
+    finished_at_second: Option<i64>,
+    finish_reason: Option<String>,
+    winner_player_id: Option<String>,
+    players: [MatchHistoryPlayer; 2],
+}
+
+#[derive(Clone, Deserialize)]
+struct MatchHistoryPlayer {
+    player_id: String,
+    atcoder_user: String,
+    attempt_count: u32,
+    last_verdict: Option<String>,
+    last_submission_epoch: Option<i64>,
+    #[serde(default)]
+    submissions: Vec<MatchHistorySubmission>,
+    main_rs: Option<String>,
+    cargo_toml: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct MatchHistorySubmission {
+    id: i64,
+    epoch_second: i64,
+    verdict: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct ServerProblem {
     title: String,
     url: String,
@@ -796,10 +879,24 @@ enum RduelMatchCommand {
         server_url: String,
         room_id: String,
     },
+    UploadCodeSnapshot {
+        server_url: String,
+        room_id: String,
+        player_id: String,
+        token: String,
+        main_rs: String,
+        cargo_toml: String,
+    },
+    History {
+        server_url: String,
+        atcoder_user: Option<String>,
+    },
     Leave {
         server_url: String,
         player_id: String,
         token: String,
+        main_rs: Option<String>,
+        cargo_toml: Option<String>,
     },
 }
 
@@ -815,6 +912,9 @@ enum RduelMatchOutput {
     },
     RoomStatus {
         room: ServerRoom,
+    },
+    History {
+        matches: Vec<MatchHistoryEntry>,
     },
 }
 
@@ -956,6 +1056,8 @@ impl RduelMatchModal {
                 server_url,
                 player_id,
                 token,
+                main_rs: None,
+                cargo_toml: None,
             }
             .run()
         })
@@ -993,6 +1095,11 @@ impl RduelMatchModal {
                     token,
                     room: Some(room),
                     server_url: self.server_url.clone(),
+                    initial_main_rs: None,
+                    initial_cargo_toml: None,
+                    opponent_main_rs: None,
+                    initial_command_output: None,
+                    is_history: false,
                 };
                 let workspace = self.workspace.clone();
                 let window_handle = window.window_handle();
@@ -1010,6 +1117,7 @@ impl RduelMatchModal {
                 });
             }
             Ok(RduelMatchOutput::RoomStatus { .. }) => {}
+            Ok(RduelMatchOutput::History { .. }) => {}
             Err(error) => {
                 log::warn!("failed to match Rduel player: {error:#}");
                 self.status = "连接失败，请确认 Rduel 服务器已启动后重试。".into();
@@ -1043,7 +1151,7 @@ impl Render for RduelMatchModal {
             )
             .child(Label::new(self.status.clone()).color(Color::Muted))
             .child(
-                h_flex().justify_end().gap_2().child(
+                h_flex().justify_end().child(
                     Button::new("rduel-start-match", "Match")
                         .size(ButtonSize::Compact)
                         .style(ButtonStyle::Filled)
@@ -1095,6 +1203,331 @@ impl ModalView for RduelMatchModal {
         self.leave_matchmaking(cx);
         workspace::DismissDecision::Dismiss(true)
     }
+}
+
+struct RduelHistoryModal {
+    focus_handle: FocusHandle,
+    workspace: WeakEntity<Workspace>,
+    server_url: String,
+    atcoder_user: Option<String>,
+    status: SharedString,
+    matches: Vec<MatchHistoryEntry>,
+    is_loading: bool,
+}
+
+impl RduelHistoryModal {
+    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let settings = RduelSettings::get_global(cx);
+        let atcoder_user = settings.atcoder_user.trim();
+        let mut modal = Self {
+            focus_handle: cx.focus_handle(),
+            workspace,
+            server_url: settings.server_url.trim().to_string(),
+            atcoder_user: (!atcoder_user.is_empty()).then(|| atcoder_user.to_string()),
+            status: "Loading match history...".into(),
+            matches: Vec::new(),
+            is_loading: false,
+        };
+        modal.load(cx);
+        modal
+    }
+
+    fn load(&mut self, cx: &mut Context<Self>) {
+        if self.is_loading {
+            return;
+        }
+        self.is_loading = true;
+        self.status = "Loading match history...".into();
+        let server_url = self.server_url.clone();
+        let atcoder_user = self.atcoder_user.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    RduelMatchCommand::History {
+                        server_url,
+                        atcoder_user,
+                    }
+                    .run()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(RduelMatchOutput::History { matches }) => {
+                        this.status = if matches.is_empty() {
+                            "No match history found.".into()
+                        } else {
+                            SharedString::default()
+                        };
+                        this.matches = matches;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!("failed to load Rduel history: {error:#}");
+                        this.status = "Could not load match history from the server.".into();
+                    }
+                }
+                this.is_loading = false;
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_history_match(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.matches.get(index).cloned() else {
+            return;
+        };
+        let Some(session) =
+            rduel_session_from_history_entry(entry, self.atcoder_user.as_deref(), &self.server_url)
+        else {
+            self.status = "This match history entry has no players.".into();
+            cx.notify();
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let window_handle = window.window_handle();
+        cx.defer(move |cx| {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.hide_modal(window, cx);
+                        })
+                        .log_err();
+                    open_rduel_session(workspace, session, window, cx);
+                })
+                .log_err();
+        });
+    }
+
+    fn render_entry(
+        &self,
+        index: usize,
+        entry: &MatchHistoryEntry,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let outcome = history_outcome(entry, self.atcoder_user.as_deref());
+        let time = entry
+            .finished_at_second
+            .or(Some(entry.started_at_second))
+            .map(format_relative)
+            .unwrap_or_else(|| "unknown time".to_string());
+        let title = format!("{} {}", entry.problem_id, entry.problem_title);
+
+        h_flex()
+            .id(("rduel-history-match", index))
+            .h(px(40.))
+            .gap_3()
+            .items_center()
+            .px_3()
+            .rounded_sm()
+            .bg(cx.theme().colors().ghost_element_background)
+            .hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
+            .cursor_pointer()
+            .child(Label::new(title).size(LabelSize::Default).truncate())
+            .child(div().flex_1())
+            .child(Label::new(time).color(Color::Muted))
+            .child(Label::new(outcome).size(LabelSize::Default))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_history_match(index, window, cx);
+            }))
+    }
+}
+
+impl Render for RduelHistoryModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("RduelHistoryModal")
+            .track_focus(&self.focus_handle)
+            .elevation_3(cx)
+            .w(rems(44.))
+            .max_h(rems(36.))
+            .p_4()
+            .gap_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(Label::new("Rduel History").size(LabelSize::Large))
+                    .child(
+                        Button::new("rduel-history-refresh", "Refresh")
+                            .size(ButtonSize::Compact)
+                            .disabled(self.is_loading)
+                            .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
+                    ),
+            )
+            .when(!self.status.is_empty(), |this| {
+                this.child(Label::new(self.status.clone()).color(Color::Muted))
+            })
+            .child(div().overflow_hidden().child(
+                v_flex().gap_1().children(
+                    self.matches.iter().enumerate().map(|(index, entry)| {
+                        self.render_entry(index, entry, cx).into_any_element()
+                    }),
+                ),
+            ))
+            .on_action(cx.listener(|this, _: &Cancel, window, cx| {
+                let workspace = this.workspace.clone();
+                let window_handle = window.window_handle();
+                cx.defer(move |cx| {
+                    window_handle
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.hide_modal(window, cx);
+                                })
+                                .log_err();
+                        })
+                        .log_err();
+                });
+            }))
+    }
+}
+
+impl Focusable for RduelHistoryModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for RduelHistoryModal {}
+impl ModalView for RduelHistoryModal {}
+
+fn history_outcome(entry: &MatchHistoryEntry, atcoder_user: Option<&str>) -> SharedString {
+    let Some(atcoder_user) = atcoder_user else {
+        return "Finished".into();
+    };
+    let Some(winner_player_id) = entry.winner_player_id.as_deref() else {
+        return "Finished".into();
+    };
+    let Some(winner) = entry
+        .players
+        .iter()
+        .find(|player| player.player_id == winner_player_id)
+    else {
+        return "Finished".into();
+    };
+    if winner.atcoder_user == atcoder_user {
+        "Win".into()
+    } else {
+        "Loss".into()
+    }
+}
+
+fn rduel_session_from_history_entry(
+    entry: MatchHistoryEntry,
+    atcoder_user: Option<&str>,
+    server_url: &str,
+) -> Option<RduelSession> {
+    let local_index = atcoder_user
+        .and_then(|atcoder_user| {
+            entry
+                .players
+                .iter()
+                .position(|player| player.atcoder_user == atcoder_user)
+        })
+        .unwrap_or(0);
+    let local_player = entry.players.get(local_index)?;
+    let opponent_player = entry
+        .players
+        .iter()
+        .enumerate()
+        .find_map(|(index, player)| (index != local_index).then_some(player));
+    let opponent_main_rs = opponent_player.and_then(|player| {
+        player
+            .main_rs
+            .as_ref()
+            .filter(|main_rs| !main_rs.trim().is_empty())
+            .map(|main_rs| (player.atcoder_user.clone(), main_rs.clone()))
+    });
+    let players = entry.players.clone().map(|player| ServerPlayer {
+        id: player.player_id,
+        name: player.atcoder_user,
+    });
+    let player_activity = entry
+        .players
+        .iter()
+        .map(|player| {
+            (
+                player.player_id.clone(),
+                ServerPlayerActivity {
+                    attempt_count: player.attempt_count,
+                    last_verdict: player.last_verdict.clone(),
+                    last_submission_epoch: player.last_submission_epoch,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let initial_command_output = history_submission_output(&entry);
+    let room = ServerRoom {
+        id: entry.room_id,
+        players,
+        problem: entry.problem,
+        status: ServerRoomStatus::Finished,
+        winner_player_id: entry.winner_player_id,
+        finish_reason: entry
+            .finish_reason
+            .and_then(|reason| match reason.as_str() {
+                "accepted" => Some(ServerRoomFinishReason::Accepted),
+                "manual_complete" => Some(ServerRoomFinishReason::ManualComplete),
+                "player_left" => Some(ServerRoomFinishReason::PlayerLeft),
+                _ => None,
+            }),
+        winning_submission: None,
+        started_at_second: entry.started_at_second,
+        player_activity,
+    };
+
+    Some(RduelSession {
+        player_id: local_player.player_id.clone(),
+        token: String::new(),
+        room: Some(room),
+        server_url: server_url.to_string(),
+        initial_main_rs: local_player.main_rs.clone(),
+        initial_cargo_toml: local_player.cargo_toml.clone(),
+        opponent_main_rs,
+        initial_command_output,
+        is_history: true,
+    })
+}
+
+fn history_submission_output(entry: &MatchHistoryEntry) -> Option<CommandOutputState> {
+    let mut sections = Vec::new();
+    for player in &entry.players {
+        if player.submissions.is_empty() {
+            continue;
+        }
+        let body = player
+            .submissions
+            .iter()
+            .map(|submission| {
+                format!(
+                    "#{} · {} · {}",
+                    submission.id,
+                    submission.verdict,
+                    format_relative(submission.epoch_second)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(CommandOutputDetailSection {
+            title: player.atcoder_user.clone().into(),
+            body: body.into(),
+        });
+    }
+    if sections.is_empty() {
+        return None;
+    }
+
+    Some(CommandOutputState {
+        items: vec![CommandOutputItem {
+            label: "Submissions".into(),
+            status: CommandOutputItemStatus::Warning,
+            detail: Some(CommandOutputDetail::with_sections(
+                "Recorded submissions",
+                sections,
+            )),
+        }],
+    })
 }
 
 enum RduelCommand {
@@ -1318,14 +1751,60 @@ impl RduelMatchCommand {
                 let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "POST", &path, None)?;
                 Ok(RduelMatchOutput::RoomStatus { room })
             }
+            Self::UploadCodeSnapshot {
+                server_url,
+                room_id,
+                player_id,
+                token,
+                main_rs,
+                cargo_toml,
+            } => {
+                let path = format!("/rooms/{room_id}/code-snapshot");
+                let room: ServerRoom = rduel_http_json(
+                    &server_url,
+                    "POST",
+                    &path,
+                    Some(&CodeSnapshotRequest {
+                        player_id,
+                        token,
+                        main_rs,
+                        cargo_toml,
+                    }),
+                )?;
+                Ok(RduelMatchOutput::RoomStatus { room })
+            }
+            Self::History {
+                server_url,
+                atcoder_user,
+            } => {
+                let path = match atcoder_user {
+                    Some(atcoder_user) => format!("/history/users/{atcoder_user}?limit=50"),
+                    None => "/history?limit=50".to_string(),
+                };
+                let response: MatchHistoryResponse =
+                    rduel_http_json::<(), _>(&server_url, "GET", &path, None)?;
+                Ok(RduelMatchOutput::History {
+                    matches: response.matches,
+                })
+            }
             Self::Leave {
                 server_url,
                 player_id,
                 token,
+                main_rs,
+                cargo_toml,
             } => {
                 let path = format!("/players/{player_id}/leave");
-                let _: serde_json::Value =
-                    rduel_http_json(&server_url, "POST", &path, Some(&LeaveRequest { token }))?;
+                let _: serde_json::Value = rduel_http_json(
+                    &server_url,
+                    "POST",
+                    &path,
+                    Some(&LeaveRequest {
+                        token,
+                        main_rs,
+                        cargo_toml,
+                    }),
+                )?;
                 Ok(RduelMatchOutput::Waiting {
                     player_id,
                     token: None,
@@ -2038,7 +2517,31 @@ impl RduelView {
                 markdown: "No problem was received from the server.".into(),
                 samples: Vec::new(),
             });
-        let room_id = session.room.as_ref().map(|room| room.id.clone());
+        let room_id = if session.is_history {
+            None
+        } else {
+            session.room.as_ref().map(|room| room.id.clone())
+        };
+        let room_status = session
+            .room
+            .as_ref()
+            .map(|room| room.status.clone())
+            .unwrap_or(ServerRoomStatus::Playing);
+        let player_id = session.player_id.clone();
+        let token = (!session.token.is_empty()).then(|| session.token.clone());
+        let opponent_main_rs_editor =
+            session
+                .opponent_main_rs
+                .as_ref()
+                .map(|(atcoder_user, source_code)| {
+                    Self::new_opponent_main_rs_editor(
+                        source_code,
+                        atcoder_user,
+                        language_registry.clone(),
+                        window,
+                        cx,
+                    )
+                });
         let main_rs_buffer_for_view = main_rs_buffer.clone();
         let cargo_toml_buffer_for_view = cargo_toml_buffer.clone();
         let problem_markdown =
@@ -2075,7 +2578,12 @@ impl RduelView {
                 result: None,
             })
             .collect::<Vec<_>>();
-        let output_selection = if test_cases.is_empty() {
+        let initial_command_output = session
+            .initial_command_output
+            .unwrap_or_else(CommandOutputState::empty);
+        let output_selection = if !initial_command_output.items.is_empty() {
+            OutputSelection::Step(0)
+        } else if test_cases.is_empty() {
             OutputSelection::Step(0)
         } else {
             OutputSelection::Case(0)
@@ -2086,11 +2594,11 @@ impl RduelView {
             language_registry,
             room: RoomState {
                 match_state: MatchState {
-                    player_id: Some(session.player_id),
-                    token: Some(session.token),
+                    player_id: Some(player_id),
+                    token,
                     room_id,
                     server_url: session.server_url,
-                    room_status: ServerRoomStatus::Playing,
+                    room_status,
                 },
             },
             problem,
@@ -2100,7 +2608,7 @@ impl RduelView {
             cargo_toml_buffer: cargo_toml_buffer_for_view,
             main_rs_editor,
             cargo_toml_editor,
-            opponent_main_rs_editor: None,
+            opponent_main_rs_editor,
             workspace,
             search_target_editor: None,
             search_bar_subscriptions: None,
@@ -2109,15 +2617,17 @@ impl RduelView {
             problem_width_fraction: DEFAULT_PROBLEM_WIDTH_FRACTION,
             command_output_height: DEFAULT_COMMAND_OUTPUT_HEIGHT,
             problem_scroll_handle: ScrollHandle::new(),
-            command_output: CommandOutputState::empty(),
+            command_output: initial_command_output,
             command_status: CommandStatus::Idle,
             test_cases,
             output_selection,
             presence: initial_presence,
             opponent_flash: None,
         };
-        view.poll_room_after_delay(cx);
-        view.tick_match_timer(cx);
+        if view.room.match_state.room_status == ServerRoomStatus::Playing {
+            view.poll_room_after_delay(cx);
+            view.tick_match_timer(cx);
+        }
         view
     }
 
@@ -2548,6 +3058,7 @@ impl RduelView {
                             cx.write_to_clipboard(ClipboardItem::new_string(
                                 submit_ready.source_code,
                             ));
+                            this.upload_code_snapshot(cx);
                             cx.open_url(&submit_ready.submit_url);
                             this.start_server_submission_watch(cx);
                             log::info!(
@@ -2765,6 +3276,9 @@ impl RduelView {
                     Ok(RduelMatchOutput::Waiting { .. } | RduelMatchOutput::Matched { .. }) => {
                         this.poll_room_after_delay(cx);
                     }
+                    Ok(RduelMatchOutput::History { .. }) => {
+                        this.poll_room_after_delay(cx);
+                    }
                     Err(error) => {
                         log::debug!("failed to poll Rduel room: {error:#}");
                         this.poll_room_after_delay(cx);
@@ -2789,6 +3303,7 @@ impl RduelView {
     ) -> bool {
         self.add_opponent_solution_if_lost(&room, window, cx);
         if let Some(message) = self.apply_room_status(room) {
+            self.upload_code_snapshot(cx);
             drop(window.prompt(gpui::PromptLevel::Info, &message, None, &["OK"], cx));
         }
         self.room.match_state.room_status == ServerRoomStatus::Finished
@@ -2876,13 +3391,50 @@ impl RduelView {
         self.room.match_state.room_id.take();
         let token = self.room.match_state.token.take().unwrap_or_default();
         let server_url = self.room.match_state.server_url.clone();
+        let main_rs = Some(self.main_rs_buffer.read(cx).text());
+        let cargo_toml = Some(self.cargo_toml_buffer.read(cx).text());
         cx.background_spawn(async move {
             RduelMatchCommand::Leave {
                 server_url,
                 player_id,
                 token,
+                main_rs,
+                cargo_toml,
             }
             .run()
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn upload_code_snapshot(&self, cx: &mut Context<Self>) {
+        let (Some(room_id), Some(player_id), Some(token)) = (
+            self.room.match_state.room_id.clone(),
+            self.room.match_state.player_id.clone(),
+            self.room.match_state.token.clone(),
+        ) else {
+            return;
+        };
+        let server_url = self.room.match_state.server_url.clone();
+        let main_rs = self.main_rs_buffer.read(cx).text();
+        let cargo_toml = self.cargo_toml_buffer.read(cx).text();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    RduelMatchCommand::UploadCodeSnapshot {
+                        server_url,
+                        room_id,
+                        player_id,
+                        token,
+                        main_rs,
+                        cargo_toml,
+                    }
+                    .run()
+                })
+                .await;
+            if let Err(error) = result {
+                log::debug!("failed to upload Rduel code snapshot: {error:#}");
+            }
+            anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }

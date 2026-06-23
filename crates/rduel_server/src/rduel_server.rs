@@ -8,7 +8,7 @@ use std::{
 use anyhow::Context as _;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -22,6 +22,7 @@ use rand::prelude::IndexedRandom;
 use reqwest::header::COOKIE;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection};
 use std::cell::RefCell;
 use std::rc::Rc;
 use time::{OffsetDateTime, format_description::FormatItem};
@@ -39,6 +40,8 @@ struct Args {
     problem_config: PathBuf,
     #[arg(long)]
     session_file: Option<PathBuf>,
+    #[arg(long)]
+    history_db: Option<PathBuf>,
 }
 
 /// How long a finished room (and its players) is retained before being reaped.
@@ -61,7 +64,11 @@ async fn main() -> anyhow::Result<()> {
     let state = ServerState::new(
         load_problem_pool(&args.problem_config)?,
         load_atcoder_revel_session(args.session_file.as_deref())?,
-    );
+        args.history_db
+            .clone()
+            .unwrap_or_else(default_history_db_path),
+    )
+    .await?;
 
     {
         let rooms = state.rooms.clone();
@@ -87,15 +94,23 @@ async fn main() -> anyhow::Result<()> {
         .route("/players/:player_id/leave", post(leave_player))
         .route("/rooms/:room_id", get(room_state))
         .route("/rooms/:room_id/complete", post(complete_room))
+        .route("/rooms/:room_id/code-snapshot", post(upload_code_snapshot))
         .route(
             "/rooms/:room_id/watch-submissions",
             post(watch_room_submissions),
         )
+        .route("/history", get(match_history))
+        .route("/history/users/:atcoder_user", get(match_history_for_user))
         .with_state(state);
 
     log::info!(
-        "Rduel server listening on http://{address}; problem config: {}",
-        args.problem_config.display()
+        "Rduel server listening on http://{address}; problem config: {}; history db: {}",
+        args.problem_config.display(),
+        args.history_db
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(default_history_db_path)
+            .display()
     );
     axum::Server::bind(&address)
         .serve(app.into_make_service())
@@ -105,22 +120,325 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn default_history_db_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rduel-server")
+        .join("rduel_history.sqlite")
+}
+
 #[derive(Clone)]
 struct ServerState {
     rooms: Arc<Mutex<RduelRooms>>,
     atcoder_revel_session: Option<Arc<str>>,
+    history: MatchHistoryStore,
     /// Spaces out all outbound AtCoder requests across every room so the shared
     /// login session is not rate-limited or banned.
     atcoder_rate_limiter: RateLimiter,
 }
 
 impl ServerState {
-    fn new(problems: Vec<Problem>, atcoder_revel_session: Option<String>) -> Self {
-        Self {
+    async fn new(
+        problems: Vec<Problem>,
+        atcoder_revel_session: Option<String>,
+        history_db_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             rooms: Arc::new(Mutex::new(RduelRooms::new(problems))),
             atcoder_revel_session: atcoder_revel_session.map(Arc::from),
+            history: MatchHistoryStore::open(history_db_path).await?,
             atcoder_rate_limiter: RateLimiter::new(ATCODER_MIN_REQUEST_INTERVAL),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MatchHistoryStore {
+    db: ThreadSafeConnection,
+}
+
+struct MatchHistoryDb;
+
+impl Domain for MatchHistoryDb {
+    const NAME: &str = stringify!(MatchHistoryDb);
+
+    const MIGRATIONS: &[&str] = &["
+        CREATE TABLE rduel_match_history (
+            room_id TEXT PRIMARY KEY,
+            problem_id TEXT NOT NULL,
+            problem_title TEXT NOT NULL,
+            problem_url TEXT NOT NULL,
+            started_at_second INTEGER NOT NULL,
+            finished_at_second INTEGER,
+            status TEXT NOT NULL,
+            player1_id TEXT NOT NULL,
+            player1_name TEXT NOT NULL,
+            player2_id TEXT NOT NULL,
+            player2_name TEXT NOT NULL,
+            room_json TEXT NOT NULL
+        ) STRICT;
+
+        CREATE INDEX idx_rduel_match_history_started
+        ON rduel_match_history(started_at_second DESC);
+
+        CREATE INDEX idx_rduel_match_history_player1
+        ON rduel_match_history(player1_name, started_at_second DESC);
+
+        CREATE INDEX idx_rduel_match_history_player2
+        ON rduel_match_history(player2_name, started_at_second DESC);
+    "];
+}
+
+#[derive(Serialize)]
+struct MatchHistoryResponse {
+    matches: Vec<MatchHistoryEntry>,
+}
+
+#[derive(Clone, Serialize)]
+struct MatchHistoryEntry {
+    room_id: String,
+    problem_id: String,
+    problem_title: String,
+    problem_url: String,
+    problem: Problem,
+    started_at_second: i64,
+    finished_at_second: Option<i64>,
+    status: String,
+    finish_reason: Option<String>,
+    winner_player_id: Option<String>,
+    winning_atcoder_user: Option<String>,
+    winning_submission_id: Option<i64>,
+    winning_submission_epoch: Option<i64>,
+    winning_source_code: Option<String>,
+    players: [MatchHistoryPlayer; 2],
+}
+
+#[derive(Clone, Serialize)]
+struct MatchHistoryPlayer {
+    player_id: String,
+    atcoder_user: String,
+    attempt_count: u32,
+    last_verdict: Option<String>,
+    last_submission_epoch: Option<i64>,
+    submissions: Vec<PlayerSubmissionRecord>,
+    code_snapshot_epoch: Option<i64>,
+    main_rs: Option<String>,
+    cargo_toml: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    limit: Option<usize>,
+}
+
+impl MatchHistoryStore {
+    async fn open(path: PathBuf) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating Rduel history directory {}", parent.display())
+            })?;
         }
+
+        let db = ThreadSafeConnection::builder::<MatchHistoryDb>(&path.to_string_lossy(), true)
+            .with_db_initialization_query(
+                "
+                PRAGMA journal_mode=WAL;
+                PRAGMA busy_timeout=500;
+                PRAGMA synchronous=NORMAL;
+                ",
+            )
+            .with_connection_initialize_query("PRAGMA busy_timeout=500;")
+            .build()
+            .await
+            .with_context(|| format!("opening Rduel history database {}", path.display()))?;
+        Ok(Self { db })
+    }
+
+    async fn record_room(&self, room: Room) -> anyhow::Result<()> {
+        self.db
+            .write(move |connection| {
+                let room_json = serde_json::to_string(&room).context("serializing room history")?;
+                let [player1, player2] = room.players.clone();
+                let player1_name = room
+                    .atcoder_users
+                    .get(&player1.id)
+                    .cloned()
+                    .unwrap_or(player1.name);
+                let player2_name = room
+                    .atcoder_users
+                    .get(&player2.id)
+                    .cloned()
+                    .unwrap_or(player2.name);
+
+                let mut statement = Statement::prepare(
+                    connection,
+                    "
+                    INSERT OR REPLACE INTO rduel_match_history (
+                        room_id,
+                        problem_id,
+                        problem_title,
+                        problem_url,
+                        started_at_second,
+                        finished_at_second,
+                        status,
+                        player1_id,
+                        player1_name,
+                        player2_id,
+                        player2_name,
+                        room_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ",
+                )?;
+                statement.bind_text(1, &room.id)?;
+                statement.bind_text(2, &room.problem.id)?;
+                statement.bind_text(3, &room.problem.title)?;
+                statement.bind_text(4, &room.problem.url)?;
+                statement.bind_int64(5, room.started_at_second)?;
+                match room.finished_at_second {
+                    Some(finished_at_second) => statement.bind_int64(6, finished_at_second)?,
+                    None => statement.bind_null(6)?,
+                }
+                statement.bind_text(7, room.status.as_str())?;
+                statement.bind_text(8, &player1.id)?;
+                statement.bind_text(9, &player1_name)?;
+                statement.bind_text(10, &player2.id)?;
+                statement.bind_text(11, &player2_name)?;
+                statement.bind_text(12, &room_json)?;
+                statement.exec()
+            })
+            .await
+    }
+
+    async fn recent_matches(&self, limit: usize) -> anyhow::Result<Vec<MatchHistoryEntry>> {
+        let limit = normalized_history_limit(limit);
+        self.db
+            .write(move |connection| {
+                let mut select = connection.select_bound::<i64, (String, Option<i64>)>(
+                    "
+                    SELECT room_json, finished_at_second
+                    FROM rduel_match_history
+                    ORDER BY started_at_second DESC
+                    LIMIT ?
+                    ",
+                )?;
+                select(limit as i64)?
+                    .into_iter()
+                    .map(|(room_json, finished_at_second)| {
+                        let mut room: Room = serde_json::from_str(&room_json)
+                            .context("parsing stored Rduel room history")?;
+                        room.finished_at_second = finished_at_second;
+                        Ok(history_entry_from_room(room))
+                    })
+                    .collect()
+            })
+            .await
+    }
+
+    async fn matches_for_user(
+        &self,
+        atcoder_user: String,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MatchHistoryEntry>> {
+        let limit = normalized_history_limit(limit);
+        self.db
+            .write(move |connection| {
+                let mut select = connection
+                    .select_bound::<(String, String, i64), (String, Option<i64>)>(
+                        "
+                    SELECT room_json, finished_at_second
+                    FROM rduel_match_history
+                    WHERE player1_name = ? OR player2_name = ?
+                    ORDER BY started_at_second DESC
+                    LIMIT ?
+                    ",
+                    )?;
+                select((atcoder_user.clone(), atcoder_user, limit as i64))?
+                    .into_iter()
+                    .map(|(room_json, finished_at_second)| {
+                        let mut room: Room = serde_json::from_str(&room_json)
+                            .context("parsing stored Rduel room history")?;
+                        room.finished_at_second = finished_at_second;
+                        Ok(history_entry_from_room(room))
+                    })
+                    .collect()
+            })
+            .await
+    }
+}
+
+fn normalized_history_limit(limit: usize) -> usize {
+    limit.clamp(1, 200)
+}
+
+fn history_entry_from_room(room: Room) -> MatchHistoryEntry {
+    let [player1, player2] = room.players.clone();
+    MatchHistoryEntry {
+        room_id: room.id.clone(),
+        problem_id: room.problem.id.clone(),
+        problem_title: room.problem.title.clone(),
+        problem_url: room.problem.url.clone(),
+        problem: room.problem.clone(),
+        started_at_second: room.started_at_second,
+        finished_at_second: room.finished_at_second,
+        status: room.status.as_str().to_string(),
+        finish_reason: room
+            .finish_reason
+            .as_ref()
+            .map(|reason| reason.as_str().to_string()),
+        winner_player_id: room.winner_player_id.clone(),
+        winning_atcoder_user: room
+            .winning_submission
+            .as_ref()
+            .map(|submission| submission.atcoder_user.clone()),
+        winning_submission_id: room
+            .winning_submission
+            .as_ref()
+            .map(|submission| submission.submission_id),
+        winning_submission_epoch: room
+            .winning_submission
+            .as_ref()
+            .map(|submission| submission.epoch_second),
+        winning_source_code: room
+            .winning_submission
+            .as_ref()
+            .and_then(|submission| submission.source_code.clone()),
+        players: [
+            history_player_from_room(&room, &player1),
+            history_player_from_room(&room, &player2),
+        ],
+    }
+}
+
+fn history_player_from_room(room: &Room, player: &Player) -> MatchHistoryPlayer {
+    let activity = room
+        .player_activity
+        .get(&player.id)
+        .cloned()
+        .unwrap_or_default();
+    let code_snapshot = room.code_snapshots.get(&player.id);
+    MatchHistoryPlayer {
+        player_id: player.id.clone(),
+        atcoder_user: room
+            .atcoder_users
+            .get(&player.id)
+            .cloned()
+            .unwrap_or_else(|| player.name.clone()),
+        attempt_count: activity.attempt_count,
+        last_verdict: activity.last_verdict,
+        last_submission_epoch: activity.last_submission_epoch,
+        submissions: room
+            .player_submissions
+            .get(&player.id)
+            .cloned()
+            .unwrap_or_default(),
+        code_snapshot_epoch: code_snapshot.map(|snapshot| snapshot.captured_at_second),
+        main_rs: code_snapshot.map(|snapshot| snapshot.main_rs.clone()),
+        cargo_toml: code_snapshot.map(|snapshot| snapshot.cargo_toml.clone()),
     }
 }
 
@@ -306,6 +624,8 @@ impl RduelRooms {
                 (player.id.clone(), player.name.clone()),
             ]),
             player_activity: HashMap::new(),
+            player_submissions: HashMap::new(),
+            code_snapshots: HashMap::new(),
             polling_submissions: false,
             finished_at_second: None,
         };
@@ -510,15 +830,50 @@ impl RduelRooms {
         Some(room.clone())
     }
 
+    fn update_code_snapshot(
+        &mut self,
+        room_id: &str,
+        player_id: &str,
+        snapshot: PlayerCodeSnapshot,
+    ) -> Option<Room> {
+        let room = self.rooms.get_mut(room_id)?;
+        if !room.players.iter().any(|player| player.id == player_id) {
+            return None;
+        }
+        room.code_snapshots.insert(player_id.to_string(), snapshot);
+        Some(room.clone())
+    }
+
+    fn update_player_code_snapshot(
+        &mut self,
+        player_id: &str,
+        snapshot: PlayerCodeSnapshot,
+    ) -> Option<Room> {
+        let room_id = match self.players.get(player_id)? {
+            PlayerLocation::Room { room_id } => room_id.clone(),
+            PlayerLocation::Waiting | PlayerLocation::Matching => return None,
+        };
+        self.update_code_snapshot(&room_id, player_id, snapshot)
+    }
+
     /// Merges freshly polled submission activity into the room. Only players with
     /// new data are updated, so a transient fetch failure keeps the last value.
-    fn update_player_activity(&mut self, room_id: &str, activity: &[(String, PlayerActivity)]) {
+    fn update_player_activity(
+        &mut self,
+        room_id: &str,
+        activity: &[(String, PlayerActivity)],
+        submissions: &[(String, Vec<PlayerSubmissionRecord>)],
+    ) {
         let Some(room) = self.rooms.get_mut(room_id) else {
             return;
         };
         for (player_id, player_activity) in activity {
             room.player_activity
                 .insert(player_id.clone(), player_activity.clone());
+        }
+        for (player_id, player_submissions) in submissions {
+            room.player_submissions
+                .insert(player_id.clone(), player_submissions.clone());
         }
     }
 
@@ -592,9 +947,21 @@ struct CompleteRoomRequest {
 }
 
 #[derive(Deserialize)]
+struct CodeSnapshotRequest {
+    player_id: String,
+    token: String,
+    main_rs: String,
+    cargo_toml: String,
+}
+
+#[derive(Deserialize)]
 struct LeaveRequest {
     #[serde(default)]
     token: String,
+    #[serde(default)]
+    main_rs: Option<String>,
+    #[serde(default)]
+    cargo_toml: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -618,7 +985,7 @@ enum PlayerStateResponse {
     Matched { player_id: String, room: Room },
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Room {
     id: String,
     players: [Player; 2],
@@ -632,6 +999,10 @@ struct Room {
     /// Per-player live submission activity (`player_id` -> activity), surfaced to
     /// the client so each side can see the opponent submitting in real time.
     player_activity: HashMap<String, PlayerActivity>,
+    #[serde(default)]
+    player_submissions: HashMap<String, Vec<PlayerSubmissionRecord>>,
+    #[serde(default)]
+    code_snapshots: HashMap<String, PlayerCodeSnapshot>,
     #[serde(skip)]
     polling_submissions: bool,
     /// Unix second at which the room transitioned to `Finished`, used to reap
@@ -641,20 +1012,34 @@ struct Room {
 }
 
 /// A player's submission activity on the room problem since the match started.
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct PlayerActivity {
     attempt_count: u32,
     last_verdict: Option<String>,
     last_submission_epoch: Option<i64>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct PlayerSubmissionRecord {
+    id: i64,
+    epoch_second: i64,
+    verdict: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct PlayerCodeSnapshot {
+    captured_at_second: i64,
+    main_rs: String,
+    cargo_toml: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 struct Player {
     id: String,
     name: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Problem {
     id: String,
     title: String,
@@ -663,13 +1048,13 @@ struct Problem {
     samples: Vec<Sample>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Sample {
     input: String,
     output: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WinningSubmission {
     player_id: String,
     atcoder_user: String,
@@ -696,19 +1081,38 @@ struct ProblemConfig {
     tasks: Vec<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RoomStatus {
     Playing,
     Finished,
 }
 
-#[derive(Clone, Serialize)]
+impl RoomStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Playing => "playing",
+            Self::Finished => "finished",
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RoomFinishReason {
     Accepted,
     ManualComplete,
     PlayerLeft,
+}
+
+impl RoomFinishReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::ManualComplete => "manual_complete",
+            Self::PlayerLeft => "player_left",
+        }
+    }
 }
 
 fn unix_now() -> i64 {
@@ -772,12 +1176,23 @@ async fn leave_player(
     Path(player_id): Path<String>,
     Json(request): Json<LeaveRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let outcome = {
+    let (snapshot_room, outcome) = {
         let mut rooms = state.rooms.lock().await;
         if !rooms.token_matches(&player_id, &request.token) {
             return Err(ApiError::Unauthorized("invalid player token"));
         }
-        rooms.leave_player(&player_id)
+        let snapshot_room = match (request.main_rs, request.cargo_toml) {
+            (Some(main_rs), Some(cargo_toml)) => rooms.update_player_code_snapshot(
+                &player_id,
+                PlayerCodeSnapshot {
+                    captured_at_second: unix_now(),
+                    main_rs,
+                    cargo_toml,
+                },
+            ),
+            _ => None,
+        };
+        (snapshot_room, rooms.leave_player(&player_id))
     };
     Ok(match outcome {
         LeaveOutcome::LeftWaiting => {
@@ -790,9 +1205,13 @@ async fn leave_player(
                 room.id,
                 room.winner_player_id
             );
+            record_room_history(state.history.clone(), room.clone());
             Json(serde_json::json!({ "left": true, "state": "room", "room": room }))
         }
         LeaveOutcome::RoomAlreadyFinished(room) => {
+            if let Some(snapshot_room) = snapshot_room {
+                record_room_history(state.history.clone(), snapshot_room);
+            }
             Json(serde_json::json!({ "left": false, "state": "finished", "room": room }))
         }
         LeaveOutcome::NotFound => Json(serde_json::json!({ "left": false })),
@@ -829,7 +1248,71 @@ async fn complete_room(
         request.player_id,
         room.winner_player_id
     );
+    record_room_history(state.history.clone(), room.clone());
     Ok(Json(room))
+}
+
+async fn upload_code_snapshot(
+    State(state): State<ServerState>,
+    Path(room_id): Path<String>,
+    Json(request): Json<CodeSnapshotRequest>,
+) -> Result<Json<Room>, ApiError> {
+    let room = {
+        let mut rooms = state.rooms.lock().await;
+        if !rooms.token_matches(&request.player_id, &request.token) {
+            return Err(ApiError::Unauthorized("invalid player token"));
+        }
+        rooms
+            .update_code_snapshot(
+                &room_id,
+                &request.player_id,
+                PlayerCodeSnapshot {
+                    captured_at_second: unix_now(),
+                    main_rs: request.main_rs,
+                    cargo_toml: request.cargo_toml,
+                },
+            )
+            .ok_or(ApiError::NotFound("room or player was not found"))?
+    };
+
+    if matches!(room.status, RoomStatus::Finished) {
+        record_room_history(state.history.clone(), room.clone());
+    }
+    Ok(Json(room))
+}
+
+async fn match_history(
+    State(state): State<ServerState>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<MatchHistoryResponse>, ApiError> {
+    let matches = state
+        .history
+        .recent_matches(query.limit.unwrap_or(50))
+        .await
+        .map_err(|error| ApiError::Internal("failed to load match history", error))?;
+    Ok(Json(MatchHistoryResponse { matches }))
+}
+
+async fn match_history_for_user(
+    State(state): State<ServerState>,
+    Path(atcoder_user): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<MatchHistoryResponse>, ApiError> {
+    let matches = state
+        .history
+        .matches_for_user(atcoder_user, query.limit.unwrap_or(50))
+        .await
+        .map_err(|error| ApiError::Internal("failed to load match history", error))?;
+    Ok(Json(MatchHistoryResponse { matches }))
+}
+
+fn record_room_history(history: MatchHistoryStore, room: Room) {
+    tokio::spawn(async move {
+        let room_id = room.id.clone();
+        if let Err(error) = history.record_room(room).await {
+            log::warn!("failed to record Rduel room history for room {room_id}: {error:#}");
+        }
+    });
 }
 
 async fn watch_room_submissions(
@@ -888,16 +1371,20 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
         )
         .await;
 
-        let mut rooms = state.rooms.lock().await;
-        rooms.update_player_activity(&room_id, &poll.activity);
-        if let Some((player_id, submission)) = poll.winner {
-            if let Some(room) = rooms.apply_submission_ac(&room_id, &player_id, submission) {
-                log::info!(
-                    "Rduel room {room_id} finished; winner: {:?}, problem: {}",
-                    room.winner_player_id,
-                    room.problem.id
-                );
-            }
+        let finished_room = {
+            let mut rooms = state.rooms.lock().await;
+            rooms.update_player_activity(&room_id, &poll.activity, &poll.submissions);
+            poll.winner.and_then(|(player_id, submission)| {
+                rooms.apply_submission_ac(&room_id, &player_id, submission)
+            })
+        };
+        if let Some(room) = finished_room {
+            log::info!(
+                "Rduel room {room_id} finished; winner: {:?}, problem: {}",
+                room.winner_player_id,
+                room.problem.id
+            );
+            record_room_history(state.history.clone(), room);
         }
     }
 }
@@ -907,6 +1394,7 @@ async fn poll_room_submissions(state: ServerState, room_id: String) {
 struct SubmissionPoll {
     winner: Option<(String, AtCoderSubmission)>,
     activity: Vec<(String, PlayerActivity)>,
+    submissions: Vec<(String, Vec<PlayerSubmissionRecord>)>,
 }
 
 async fn poll_room_submission_state(
@@ -917,6 +1405,7 @@ async fn poll_room_submission_state(
 ) -> SubmissionPoll {
     let mut winner: Option<(String, AtCoderSubmission)> = None;
     let mut activity = Vec::new();
+    let mut submission_records = Vec::new();
 
     for player in &room.players {
         let Some(atcoder_user) = room.atcoder_users.get(&player.id) else {
@@ -948,6 +1437,7 @@ async fn poll_room_submission_state(
         };
 
         let mut player_activity = PlayerActivity::default();
+        let mut player_submission_records = Vec::new();
         for submission in &submissions {
             if submission.problem_id != room.problem.id
                 || submission.epoch_second < room.started_at_second
@@ -956,6 +1446,11 @@ async fn poll_room_submission_state(
             }
 
             player_activity.attempt_count += 1;
+            player_submission_records.push(PlayerSubmissionRecord {
+                id: submission.id,
+                epoch_second: submission.epoch_second,
+                verdict: submission.result.clone(),
+            });
             if player_activity
                 .last_submission_epoch
                 .is_none_or(|epoch| submission.epoch_second >= epoch)
@@ -974,6 +1469,7 @@ async fn poll_room_submission_state(
             }
         }
         activity.push((player.id.clone(), player_activity));
+        submission_records.push((player.id.clone(), player_submission_records));
     }
 
     if let Some((_, submission)) = winner.as_mut() {
@@ -997,7 +1493,11 @@ async fn poll_room_submission_state(
         }
     }
 
-    SubmissionPoll { winner, activity }
+    SubmissionPoll {
+        winner,
+        activity,
+        submissions: submission_records,
+    }
 }
 
 async fn fetch_user_submissions(
@@ -1207,6 +1707,7 @@ fn html_selector(selector: &str) -> anyhow::Result<Selector> {
 enum ApiError {
     NotFound(&'static str),
     Unauthorized(&'static str),
+    Internal(&'static str, anyhow::Error),
 }
 
 impl IntoResponse for ApiError {
@@ -1222,6 +1723,14 @@ impl IntoResponse for ApiError {
                 Json(serde_json::json!({ "error": message })),
             )
                 .into_response(),
+            Self::Internal(message, error) => {
+                log::error!("{message}: {error:#}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": message })),
+                )
+                    .into_response()
+            }
         }
     }
 }
@@ -1881,6 +2390,7 @@ mod tests {
                     last_submission_epoch: Some(100),
                 },
             )],
+            &[],
         );
         let activity = &rooms.rooms[&room_id].player_activity;
         assert_eq!(activity["player-1"].attempt_count, 2);
@@ -1898,6 +2408,7 @@ mod tests {
                     last_submission_epoch: Some(200),
                 },
             )],
+            &[],
         );
         let activity = &rooms.rooms[&room_id].player_activity;
         assert_eq!(activity["player-1"].attempt_count, 2);
