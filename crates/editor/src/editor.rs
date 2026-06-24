@@ -1121,6 +1121,7 @@ pub struct Editor {
     /// Whether we are temporarily displaying a diff other than git's
     temporary_diff_override: bool,
     selection_mark_mode: bool,
+    serialize_selection_changes: bool,
     toggle_fold_multiple_buffers: Task<()>,
     _scroll_cursor_center_top_bottom_task: Task<()>,
     serialize_selections: Task<()>,
@@ -2341,6 +2342,7 @@ impl Editor {
             registered_buffers: HashMap::default(),
             _scroll_cursor_center_top_bottom_task: Task::ready(()),
             selection_mark_mode: false,
+            serialize_selection_changes: true,
             toggle_fold_multiple_buffers: Task::ready(()),
             serialize_selections: Task::ready(()),
             serialize_folds: Task::ready(()),
@@ -3073,6 +3075,10 @@ impl Editor {
                     .restore_unsaved_buffers,
             )
         })
+    }
+
+    pub fn set_should_serialize_selection_changes(&mut self, should_serialize: bool) {
+        self.serialize_selection_changes = should_serialize;
     }
 
     fn should_serialize_buffer(&self) -> bool {

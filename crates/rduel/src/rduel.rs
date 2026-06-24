@@ -2554,6 +2554,7 @@ impl RduelView {
             let mut editor =
                 Editor::for_multibuffer(main_rs_multibuffer, Some(project.clone()), window, cx);
             editor.set_edit_predictions_disabled(true, cx);
+            editor.set_should_serialize_selection_changes(false);
             editor
         });
         let cargo_toml_multibuffer = cx.new(|cx| {
@@ -2563,6 +2564,7 @@ impl RduelView {
             let mut editor =
                 Editor::for_multibuffer(cargo_toml_multibuffer, Some(project.clone()), window, cx);
             editor.set_edit_predictions_disabled(true, cx);
+            editor.set_should_serialize_selection_changes(false);
             editor
         });
         let initial_presence = session
