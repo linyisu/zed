@@ -250,6 +250,18 @@ pub mod rduel {
     );
 }
 
+pub mod rpractice {
+    use gpui::actions;
+
+    actions!(
+        rpractice,
+        [
+            /// Opens the Rpractice solo practice mode.
+            OpenRpractice
+        ]
+    );
+}
+
 pub mod workspace {
     use gpui::actions;
 

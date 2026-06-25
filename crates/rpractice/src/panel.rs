@@ -1,6 +1,7 @@
 // Panel module - Problem list sidebar
 
-use gpui::{prelude::*, actions, EventEmitter, FocusHandle, Focusable, Render, WeakEntity};
+use anyhow::Result;
+use gpui::{prelude::*, actions, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render, WeakEntity};
 use ui::prelude::*;
 use workspace::{Workspace, dock::{Panel, PanelEvent, DockPosition}};
 
@@ -19,6 +20,16 @@ impl RpracticePanel {
             focus_handle: cx.focus_handle(),
             workspace,
         }
+    }
+
+    pub async fn load(
+        workspace: WeakEntity<Workspace>,
+        mut cx: AsyncWindowContext,
+    ) -> Result<Entity<Self>> {
+        workspace.update_in(&mut cx, |workspace, _window, cx| {
+            let workspace_handle = cx.entity().downgrade();
+            cx.new(|cx| RpracticePanel::new(workspace_handle, cx))
+        })
     }
 }
 

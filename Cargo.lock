@@ -15633,6 +15633,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpractice"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "editor",
+ "fs",
+ "gpui",
+ "html_to_markdown",
+ "language",
+ "log",
+ "markdown",
+ "menu",
+ "project",
+ "schemars 1.0.4",
+ "scraper",
+ "search",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "sqlez",
+ "text",
+ "time",
+ "tokio",
+ "ui",
+ "util",
+ "workspace",
+ "zed-reqwest",
+ "zed_actions",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23173,6 +23207,7 @@ dependencies = [
  "repl",
  "reqwest_client",
  "rope",
+ "rpractice",
  "search",
  "semver",
  "serde",

@@ -23,6 +23,7 @@ use zed_actions::{
     assistant::ToggleFocus,
     command_palette,
     rduel::{OpenRduel, OpenRduelHistory},
+    rpractice::OpenRpractice,
 };
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
@@ -163,7 +164,7 @@ impl SectionEntry {
     }
 }
 
-const CONTENT: (Section<6>, Section<3>) = (
+const CONTENT: (Section<7>, Section<3>) = (
     Section {
         title: "Get Started",
         entries: [
@@ -189,6 +190,12 @@ const CONTENT: (Section<6>, Section<3>) = (
                 icon: IconName::ListCollapse,
                 title: "Open Command Palette",
                 action: &command_palette::Toggle,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::Code,
+                title: "Open Rpractice",
+                action: &OpenRpractice,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
