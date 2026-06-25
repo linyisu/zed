@@ -169,6 +169,7 @@ members = [
     "crates/reqwest_client",
     "crates/rduel",
     "crates/rduel_server",
+    "crates/rpractice",
     "crates/rope",
     "crates/rpc",
     "crates/sandbox",
@@ -431,6 +432,7 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
 rope = { path = "crates/rope" }
 rpc = { path = "crates/rpc" }
 rduel = { path = "crates/rduel" }
+rpractice = { path = "crates/rpractice" }
 skill_creator = { path = "crates/skill_creator" }
 scheduler = { path = "crates/scheduler" }
 sandbox = { path = "crates/sandbox" }
