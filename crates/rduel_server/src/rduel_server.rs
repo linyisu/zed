@@ -1884,8 +1884,8 @@ fn extract_problem_title(html: &str) -> Option<String> {
     if title.is_empty() { None } else { Some(title) }
 }
 
-fn format_problem_display_title(problem_id: &str, title: &str) -> String {
-    format!("{problem_id} 「{title}」")
+fn format_problem_display_title(_problem_id: &str, title: &str) -> String {
+    format!("「{title}」")
 }
 
 fn extract_html_title(html: &str) -> Option<&str> {
@@ -2493,7 +2493,7 @@ mod tests {
     fn formats_problem_display_title() {
         assert_eq!(
             format_problem_display_title("abc073_c", "Write and Erase"),
-            "abc073_c 「Write and Erase」"
+            "「Write and Erase」"
         );
     }
 }

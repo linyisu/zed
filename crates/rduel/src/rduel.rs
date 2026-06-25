@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context as _;
 use editor::{
     Editor, EditorMode, MultiBuffer, SizingBehavior,
     actions::{ConfirmRename, Rename},
@@ -52,6 +53,8 @@ const DEFAULT_RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
 const SAMPLE_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the "opponent submitted" banner stays visible.
 const OPPONENT_FLASH_DURATION: Duration = Duration::from_secs(5);
+/// Interval for automatic code snapshot uploads during a match.
+const CODE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct RduelSettings {
@@ -179,6 +182,46 @@ fn cleanup_legacy_rduel_worktree(workspace: &mut Workspace, cx: &mut Context<Wor
     workspace.project().update(cx, |project, cx| {
         project.remove_worktree_for_main_worktree_path(&legacy_problem_path, cx);
         project.remove_worktree_for_main_worktree_path(&legacy_contest_path, cx);
+    });
+}
+
+/// Helper to hide modal and execute a callback. Reduces boilerplate.
+fn hide_modal_and_then<F>(
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+    callback: F,
+) where
+    F: FnOnce(WeakEntity<Workspace>, &mut Window, &mut App) + 'static,
+{
+    let window_handle = window.window_handle();
+    cx.defer(move |cx| {
+        window_handle
+            .update(cx, |_, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.hide_modal(window, cx);
+                    })
+                    .log_err();
+                callback(workspace, window, cx);
+            })
+            .log_err();
+    });
+}
+
+/// Helper to just hide modal without additional action.
+fn hide_modal(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
+    let window_handle = window.window_handle();
+    cx.defer(move |cx| {
+        window_handle
+            .update(cx, |_, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.hide_modal(window, cx);
+                    })
+                    .log_err();
+            })
+            .log_err();
     });
 }
 
@@ -458,6 +501,7 @@ struct RduelView {
     output_selection: OutputSelection,
     presence: Option<RoomPresence>,
     opponent_flash: Option<OpponentFlash>,
+    last_snapshot_upload: Option<Instant>,
 }
 
 /// A live snapshot of both players used to render the versus header.
@@ -660,6 +704,7 @@ struct RoomState {
 }
 
 struct RduelProblem {
+    id: SharedString,
     title: SharedString,
     markdown: SharedString,
     samples: Vec<RduelSample>,
@@ -674,6 +719,7 @@ struct RduelSample {
 impl RduelProblem {
     fn from_server(problem: &ServerProblem) -> Self {
         Self {
+            id: problem.id.clone().into(),
             title: problem.title.clone().into(),
             markdown: problem.statement_markdown.clone().into(),
             samples: problem
@@ -834,6 +880,7 @@ struct MatchHistorySubmission {
 
 #[derive(Clone, Deserialize)]
 struct ServerProblem {
+    id: String,
     title: String,
     url: String,
     statement_markdown: String,
@@ -1102,18 +1149,8 @@ impl RduelMatchModal {
                     is_history: false,
                 };
                 let workspace = self.workspace.clone();
-                let window_handle = window.window_handle();
-                cx.defer(move |cx| {
-                    window_handle
-                        .update(cx, |_, window, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.hide_modal(window, cx);
-                                })
-                                .log_err();
-                            open_rduel_session(workspace, session, window, cx);
-                        })
-                        .log_err();
+                hide_modal_and_then(workspace, window, cx, |workspace, window, cx| {
+                    open_rduel_session(workspace, session, window, cx);
                 });
             }
             Ok(RduelMatchOutput::RoomStatus { .. }) => {}
@@ -1170,19 +1207,7 @@ impl Render for RduelMatchModal {
                 }
             }))
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
-                let workspace = this.workspace.clone();
-                let window_handle = window.window_handle();
-                cx.defer(move |cx| {
-                    window_handle
-                        .update(cx, |_, window, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.hide_modal(window, cx);
-                                })
-                                .log_err();
-                        })
-                        .log_err();
-                });
+                hide_modal(this.workspace.clone(), window, cx);
             }))
     }
 }
@@ -1285,18 +1310,8 @@ impl RduelHistoryModal {
             return;
         };
         let workspace = self.workspace.clone();
-        let window_handle = window.window_handle();
-        cx.defer(move |cx| {
-            window_handle
-                .update(cx, |_, window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.hide_modal(window, cx);
-                        })
-                        .log_err();
-                    open_rduel_session(workspace, session, window, cx);
-                })
-                .log_err();
+        hide_modal_and_then(workspace, window, cx, |workspace, window, cx| {
+            open_rduel_session(workspace, session, window, cx);
         });
     }
 
@@ -1312,7 +1327,42 @@ impl RduelHistoryModal {
             .or(Some(entry.started_at_second))
             .map(format_relative)
             .unwrap_or_else(|| "unknown time".to_string());
+
         let title = format!("{} {}", entry.problem_id, entry.problem_title);
+
+        // Find local player info for additional stats
+        let local_player = self.atcoder_user.as_deref().and_then(|atcoder_user| {
+            entry.players.iter().find(|p| p.atcoder_user == atcoder_user)
+        });
+
+        // Build stats string (attempts, duration, verdict)
+        let mut stats_parts = Vec::new();
+
+        if let Some(player) = local_player {
+            if player.attempt_count > 0 {
+                stats_parts.push(format!("{}次提交", player.attempt_count));
+            }
+            if let Some(verdict) = &player.last_verdict {
+                stats_parts.push(verdict.clone());
+            }
+        }
+
+        if let (Some(start), Some(end)) = (Some(entry.started_at_second), entry.finished_at_second) {
+            let duration_sec = (end - start).max(0);
+            let minutes = duration_sec / 60;
+            let seconds = duration_sec % 60;
+            if minutes > 0 {
+                stats_parts.push(format!("{}:{:02}", minutes, seconds));
+            } else {
+                stats_parts.push(format!("{}秒", seconds));
+            }
+        }
+
+        let stats = if stats_parts.is_empty() {
+            String::new()
+        } else {
+            stats_parts.join(" · ")
+        };
 
         h_flex()
             .id(("rduel-history-match", index))
@@ -1326,6 +1376,9 @@ impl RduelHistoryModal {
             .cursor_pointer()
             .child(Label::new(title).size(LabelSize::Default).truncate())
             .child(div().flex_1())
+            .when(!stats.is_empty(), |this| {
+                this.child(Label::new(stats).color(Color::Muted).size(LabelSize::Small))
+            })
             .child(Label::new(time).color(Color::Muted))
             .child(Label::new(outcome).size(LabelSize::Default))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1358,27 +1411,22 @@ impl Render for RduelHistoryModal {
             .when(!self.status.is_empty(), |this| {
                 this.child(Label::new(self.status.clone()).color(Color::Muted))
             })
-            .child(div().overflow_hidden().child(
-                v_flex().gap_1().children(
-                    self.matches.iter().enumerate().map(|(index, entry)| {
-                        self.render_entry(index, entry, cx).into_any_element()
-                    }),
-                ),
-            ))
+            .child(
+                div()
+                    .id("rduel-history-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex().gap_1().children(
+                            self.matches.iter().enumerate().map(|(index, entry)| {
+                                self.render_entry(index, entry, cx).into_any_element()
+                            }),
+                        ),
+                    ),
+            )
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
-                let workspace = this.workspace.clone();
-                let window_handle = window.window_handle();
-                cx.defer(move |cx| {
-                    window_handle
-                        .update(cx, |_, window, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.hide_modal(window, cx);
-                                })
-                                .log_err();
-                        })
-                        .log_err();
-                });
+                hide_modal(this.workspace.clone(), window, cx);
             }))
     }
 }
@@ -1824,44 +1872,101 @@ where
     B: Serialize,
     R: for<'de> Deserialize<'de>,
 {
-    let endpoint = parse_local_http_endpoint(server_url, path)?;
-    let body = match body {
-        Some(body) => serde_json::to_string(body)?,
+    rduel_http_json_with_retry(server_url, method, path, body, 2)
+}
+
+fn rduel_http_json_with_retry<B, R>(
+    server_url: &str,
+    method: &str,
+    path: &str,
+    body: Option<&B>,
+    max_retries: usize,
+) -> anyhow::Result<R>
+where
+    B: Serialize,
+    R: for<'de> Deserialize<'de>,
+{
+    let mut last_error = None;
+    for attempt in 0..=max_retries {
+        match rduel_http_json_single_attempt(server_url, method, path, body) {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                // Don't retry on client errors (4xx) or serialization errors
+                let error_str = error.to_string();
+                if error_str.contains("HTTP 4") || error_str.contains("JSON") {
+                    return Err(error);
+                }
+
+                last_error = Some(error);
+                if attempt < max_retries {
+                    // Brief delay before retry (exponential backoff)
+                    std::thread::sleep(Duration::from_millis(100 * (1 << attempt)));
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("HTTP request failed after retries")))
+}
+
+fn rduel_http_json_single_attempt<B, R>(
+    server_url: &str,
+    method: &str,
+    path: &str,
+    body: Option<&B>,
+) -> anyhow::Result<R>
+where
+    B: Serialize,
+    R: for<'de> Deserialize<'de>,
+{
+    let endpoint = parse_local_http_endpoint(server_url, path)
+        .context("Failed to parse server URL")?;
+    let body_str = match body {
+        Some(body) => serde_json::to_string(body)
+            .context("Failed to serialize request body")?,
         None => String::new(),
     };
     let request = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         endpoint.path,
         endpoint.host_header,
-        body.len(),
-        body
+        body_str.len(),
+        body_str
     );
 
     let socket_address = (endpoint.host.as_str(), endpoint.port)
-        .to_socket_addrs()?
+        .to_socket_addrs()
+        .context("Failed to resolve server address")?
         .next()
-        .ok_or_else(|| anyhow::anyhow!("Rduel server address did not resolve"))?;
-    let mut stream = TcpStream::connect_timeout(&socket_address, Duration::from_secs(3))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    stream.write_all(request.as_bytes())?;
+        .ok_or_else(|| anyhow::anyhow!("Server address did not resolve to any IP"))?;
+
+    let mut stream = TcpStream::connect_timeout(&socket_address, Duration::from_secs(5))
+        .context("Failed to connect to server")?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))
+        .context("Failed to set read timeout")?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))
+        .context("Failed to set write timeout")?;
+    stream.write_all(request.as_bytes())
+        .context("Failed to send request to server")?;
 
     let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    stream.read_to_string(&mut response)
+        .context("Failed to read response from server")?;
     let (head, body) = response
         .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("server returned an invalid HTTP response"))?;
+        .ok_or_else(|| anyhow::anyhow!("Server returned invalid HTTP response (missing header/body separator)"))?;
     let status = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| anyhow::anyhow!("server returned an invalid HTTP status"))?;
+        .ok_or_else(|| anyhow::anyhow!("Server returned invalid HTTP status line"))?;
     if !(200..300).contains(&status) {
-        return Err(anyhow::anyhow!("server returned HTTP {status}: {body}"));
+        return Err(anyhow::anyhow!("Server returned HTTP {status}: {body}"));
     }
 
-    Ok(serde_json::from_str(body)?)
+    serde_json::from_str(body)
+        .with_context(|| format!("Failed to parse server response: {}", body.chars().take(200).collect::<String>()))
 }
 
 struct LocalHttpEndpoint {
@@ -2513,6 +2618,7 @@ impl RduelView {
             .as_ref()
             .map(|room| RduelProblem::from_server(&room.problem))
             .unwrap_or_else(|| RduelProblem {
+                id: "Rduel".into(),
                 title: "Rduel".into(),
                 markdown: "No problem was received from the server.".into(),
                 samples: Vec::new(),
@@ -2625,10 +2731,12 @@ impl RduelView {
             output_selection,
             presence: initial_presence,
             opponent_flash: None,
+            last_snapshot_upload: None,
         };
         if view.room.match_state.room_status == ServerRoomStatus::Playing {
             view.poll_room_after_delay(cx);
             view.tick_match_timer(cx);
+            view.schedule_snapshot_upload(cx);
         }
         view
     }
@@ -3408,7 +3516,7 @@ impl RduelView {
         .detach_and_log_err(cx);
     }
 
-    fn upload_code_snapshot(&self, cx: &mut Context<Self>) {
+    fn upload_code_snapshot(&mut self, cx: &mut Context<Self>) {
         let (Some(room_id), Some(player_id), Some(token)) = (
             self.room.match_state.room_id.clone(),
             self.room.match_state.player_id.clone(),
@@ -3416,6 +3524,15 @@ impl RduelView {
         ) else {
             return;
         };
+
+        // Check if enough time has passed since last upload
+        if let Some(last_upload) = self.last_snapshot_upload {
+            if last_upload.elapsed() < CODE_SNAPSHOT_INTERVAL {
+                return;
+            }
+        }
+
+        self.last_snapshot_upload = Some(Instant::now());
         let server_url = self.room.match_state.server_url.clone();
         let main_rs = self.main_rs_buffer.read(cx).text();
         let cargo_toml = self.cargo_toml_buffer.read(cx).text();
@@ -3434,8 +3551,26 @@ impl RduelView {
                 })
                 .await;
             if let Err(error) = result {
-                log::debug!("failed to upload Rduel code snapshot: {error:#}");
+                log::warn!("Failed to upload Rduel code snapshot: {error:#}");
             }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn schedule_snapshot_upload(&self, cx: &mut Context<Self>) {
+        if self.room.match_state.room_status != ServerRoomStatus::Playing {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CODE_SNAPSHOT_INTERVAL).await;
+            this.update(cx, |this, cx| {
+                if this.room.match_state.room_status == ServerRoomStatus::Playing {
+                    this.upload_code_snapshot(cx);
+                    this.schedule_snapshot_upload(cx);
+                }
+            })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -3602,7 +3737,7 @@ impl RduelView {
                     .px_4()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(Label::new(self.problem.title.clone()).size(LabelSize::Default)),
+                    .child(Label::new(format!("{} {}", self.problem.id, self.problem.title)).size(LabelSize::Default)),
             )
             .child(
                 h_flex()
@@ -4514,7 +4649,9 @@ impl Item for RduelView {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        self.has_unsaved_solution_buffers(cx)
+        // Consider the item dirty if match is still playing to prevent accidental close
+        self.room.match_state.room_status == ServerRoomStatus::Playing
+            || self.has_unsaved_solution_buffers(cx)
     }
 
     fn can_save(&self, _cx: &App) -> bool {
@@ -4597,7 +4734,37 @@ impl Item for RduelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
-        self.save_solution_editors(options, project, window, cx)
+        // If match is still playing, this is called as part of the close confirmation flow.
+        // We need to prompt the user before allowing the close.
+        if self.room.match_state.room_status == ServerRoomStatus::Playing {
+            let answer = window.prompt(
+                gpui::PromptLevel::Warning,
+                "Leave active match?",
+                Some("Leaving the match will forfeit and your opponent will win. Are you sure?"),
+                &["Leave and Forfeit", "Cancel"],
+                cx,
+            );
+            cx.spawn_in(window, async move |this, cx| {
+                match answer.await {
+                    Ok(0) => {
+                        // User confirmed - leave the match and mark as not dirty
+                        this.update_in(cx, |this, window, cx| {
+                            this.leave_active_match(cx);
+                            this.room.match_state.room_status = ServerRoomStatus::Finished;
+                            // Now save the actual buffers
+                            this.save_solution_editors(options, project, window, cx)
+                        })?
+                        .await
+                    }
+                    _ => {
+                        // User cancelled - return error to prevent close
+                        Err(anyhow::anyhow!("User cancelled leaving the match"))
+                    }
+                }
+            })
+        } else {
+            self.save_solution_editors(options, project, window, cx)
+        }
     }
 
     fn reload(
@@ -4703,5 +4870,150 @@ mod tests {
             atcoder_submit_url("https://atcoder.jp/contests/abc073/tasks/abc073_c"),
             Some("https://atcoder.jp/contests/abc073/submit?taskScreenName=abc073_c".to_string())
         );
+    }
+
+    #[test]
+    fn atcoder_submit_url_handles_invalid_urls() {
+        assert_eq!(atcoder_submit_url("not a url"), None);
+        assert_eq!(atcoder_submit_url("https://example.com"), None);
+        assert_eq!(
+            atcoder_submit_url("https://atcoder.jp/contests/abc073"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_local_http_endpoint_with_ipv4() {
+        let endpoint = parse_local_http_endpoint("http://127.0.0.1:8787", "/api/join").unwrap();
+        assert_eq!(endpoint.host, "127.0.0.1");
+        assert_eq!(endpoint.port, 8787);
+        assert_eq!(endpoint.path, "/api/join");
+        assert_eq!(endpoint.host_header, "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn parse_local_http_endpoint_with_localhost() {
+        let endpoint = parse_local_http_endpoint("http://localhost:8080", "/test").unwrap();
+        assert_eq!(endpoint.host, "localhost");
+        assert_eq!(endpoint.port, 8080);
+        assert_eq!(endpoint.path, "/test");
+    }
+
+    #[test]
+    fn parse_local_http_endpoint_default_port() {
+        let endpoint = parse_local_http_endpoint("http://example.com", "/api").unwrap();
+        assert_eq!(endpoint.host, "example.com");
+        assert_eq!(endpoint.port, 80);
+    }
+
+    #[test]
+    fn parse_local_http_endpoint_with_ipv6() {
+        let endpoint = parse_local_http_endpoint("http://[::1]:8080", "/api").unwrap();
+        assert_eq!(endpoint.host, "::1");
+        assert_eq!(endpoint.port, 8080);
+    }
+
+    #[test]
+    fn parse_local_http_endpoint_rejects_non_http() {
+        assert!(parse_local_http_endpoint("https://example.com", "/").is_err());
+        assert!(parse_local_http_endpoint("ftp://example.com", "/").is_err());
+    }
+
+    #[test]
+    fn parse_local_http_endpoint_rejects_empty_host() {
+        assert!(parse_local_http_endpoint("http://", "/").is_err());
+    }
+
+    #[test]
+    fn format_relative_time() {
+        // Test recent times
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        assert_eq!(format_relative(now), "0秒前");
+        assert_eq!(format_relative(now - 30), "30秒前");
+        assert_eq!(format_relative(now - 90), "1分钟前");
+        assert_eq!(format_relative(now - 150), "2分钟前");
+        assert_eq!(format_relative(now - 3600), "1小时前");
+        assert_eq!(format_relative(now - 7200), "2小时前");
+    }
+
+    #[test]
+    fn history_outcome_shows_correct_status() {
+        let server_problem = ServerProblem {
+            id: "abc001_a".to_string(),
+            title: "Test Problem".to_string(),
+            url: "https://atcoder.jp/contests/abc001/tasks/abc001_a".to_string(),
+            statement_markdown: "# Problem".to_string(),
+            samples: vec![],
+        };
+
+        let entry_won = MatchHistoryEntry {
+            room_id: "room1".to_string(),
+            problem_id: "abc001_a".to_string(),
+            problem_title: "Test Problem".to_string(),
+            problem: server_problem.clone(),
+            started_at_second: 0,
+            finished_at_second: Some(100),
+            finish_reason: Some("manual_complete".to_string()),
+            winner_player_id: Some("player1".to_string()),
+            players: [
+                MatchHistoryPlayer {
+                    player_id: "player1".to_string(),
+                    atcoder_user: "user1".to_string(),
+                    attempt_count: 1,
+                    last_verdict: Some("AC".to_string()),
+                    last_submission_epoch: Some(100),
+                    submissions: vec![],
+                    main_rs: None,
+                    cargo_toml: None,
+                },
+                MatchHistoryPlayer {
+                    player_id: "player2".to_string(),
+                    atcoder_user: "user2".to_string(),
+                    attempt_count: 0,
+                    last_verdict: None,
+                    last_submission_epoch: None,
+                    submissions: vec![],
+                    main_rs: None,
+                    cargo_toml: None,
+                },
+            ],
+        };
+
+        assert_eq!(history_outcome(&entry_won, Some("user1")), "Win");
+        assert_eq!(history_outcome(&entry_won, Some("user2")), "Loss");
+
+        let entry_unfinished = MatchHistoryEntry {
+            finished_at_second: None,
+            winner_player_id: None,
+            ..entry_won.clone()
+        };
+        assert_eq!(history_outcome(&entry_unfinished, Some("user1")), "Finished");
+    }
+
+    #[test]
+    fn rduel_problem_from_server_converts_correctly() {
+        let server_problem = ServerProblem {
+            id: "abc001_a".to_string(),
+            title: "Test Problem".to_string(),
+            url: "https://atcoder.jp/contests/abc001/tasks/abc001_a".to_string(),
+            statement_markdown: "# Problem".to_string(),
+            samples: vec![
+                ServerSample {
+                    input: "1 2".to_string(),
+                    output: "3".to_string(),
+                },
+            ],
+        };
+
+        let problem = RduelProblem::from_server(&server_problem);
+        assert_eq!(problem.title, "Test Problem");
+        assert_eq!(problem.markdown, "# Problem");
+        assert_eq!(problem.samples.len(), 1);
+        assert_eq!(problem.samples[0].input, "1 2");
+        assert_eq!(problem.samples[0].output, "3");
     }
 }
