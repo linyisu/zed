@@ -5256,6 +5256,7 @@ mod tests {
                 "project_search",
                 "project_symbols",
                 "projects",
+                "rduel",
                 "recent_projects",
                 "remote_debug",
                 "repl",

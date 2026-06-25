@@ -2051,12 +2051,27 @@ fn format_elapsed(started_at_second: i64) -> String {
 /// Formats how long ago a submission happened, in Chinese.
 fn format_relative(epoch_second: i64) -> String {
     let delta = (unix_now() - epoch_second).max(0);
-    if delta < 60 {
-        format!("{delta}秒前")
-    } else if delta < 3600 {
-        format!("{}分钟前", delta / 60)
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+
+    if delta < MINUTE {
+        format!("{}秒前", delta)
+    } else if delta < HOUR {
+        format!("{}分钟前", delta / MINUTE)
+    } else if delta < DAY {
+        format!("{}小时前", delta / HOUR)
+    } else if delta < WEEK {
+        format!("{}天前", delta / DAY)
+    } else if delta < MONTH {
+        format!("{}周前", delta / WEEK)
+    } else if delta < YEAR {
+        format!("{}月前", delta / MONTH)
     } else {
-        format!("{}小时前", delta / 3600)
+        format!("{}年前", delta / YEAR)
     }
 }
 
@@ -4938,6 +4953,14 @@ mod tests {
         assert_eq!(format_relative(now - 150), "2分钟前");
         assert_eq!(format_relative(now - 3600), "1小时前");
         assert_eq!(format_relative(now - 7200), "2小时前");
+        assert_eq!(format_relative(now - 86400), "1天前");
+        assert_eq!(format_relative(now - 86400 * 3), "3天前");
+        assert_eq!(format_relative(now - 86400 * 7), "1周前");
+        assert_eq!(format_relative(now - 86400 * 14), "2周前");
+        assert_eq!(format_relative(now - 86400 * 30), "1月前");
+        assert_eq!(format_relative(now - 86400 * 60), "2月前");
+        assert_eq!(format_relative(now - 86400 * 365), "1年前");
+        assert_eq!(format_relative(now - 86400 * 730), "2年前");
     }
 
     #[test]
