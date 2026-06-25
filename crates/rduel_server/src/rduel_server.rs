@@ -377,10 +377,17 @@ fn normalized_history_limit(limit: usize) -> usize {
 
 fn history_entry_from_room(room: Room) -> MatchHistoryEntry {
     let [player1, player2] = room.players.clone();
+    // Store clean title without problem_id prefix and without 「」 symbols
+    let clean_title = room.problem.title
+        .strip_prefix(&format!("{} ", room.problem.id))
+        .unwrap_or(&room.problem.title)
+        .trim_start_matches('「')
+        .trim_end_matches('」')
+        .to_string();
     MatchHistoryEntry {
         room_id: room.id.clone(),
         problem_id: room.problem.id.clone(),
-        problem_title: room.problem.title.clone(),
+        problem_title: clean_title,
         problem_url: room.problem.url.clone(),
         problem: room.problem.clone(),
         started_at_second: room.started_at_second,
