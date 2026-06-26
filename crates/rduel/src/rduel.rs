@@ -1,6 +1,6 @@
 use std::{
     any::TypeId,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -20,7 +20,7 @@ use gpui::{
     MouseUpEvent, Render, Resource, ScrollHandle, SharedString, SharedUri, Subscription,
     WeakEntity, Window, div, px,
 };
-use language::{Buffer, LanguageRegistry};
+use language::{Buffer, BufferEditSource, BufferEvent, LanguageRegistry};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle, WrapButtonVisibility,
@@ -53,8 +53,11 @@ const DEFAULT_RDUEL_SERVER_URL: &str = "http://127.0.0.1:8787";
 const SAMPLE_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the "opponent submitted" banner stays visible.
 const OPPONENT_FLASH_DURATION: Duration = Duration::from_secs(5);
-/// Interval for automatic code snapshot uploads during a match.
-const CODE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+const ROOM_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const WATCH_ROOM_POLL_INTERVAL: Duration = Duration::from_millis(80);
+const SUBMISSION_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const CODE_SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(40);
+const CODE_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_millis(40);
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct RduelSettings {
@@ -486,10 +489,12 @@ struct RduelView {
     cargo_toml_buffer: Entity<Buffer>,
     main_rs_editor: Entity<Editor>,
     cargo_toml_editor: Entity<Editor>,
+    opponent_main_rs_buffer: Option<Entity<Buffer>>,
     opponent_main_rs_editor: Option<Entity<Editor>>,
     workspace: WeakEntity<Workspace>,
     search_target_editor: Option<Entity<Editor>>,
     search_bar_subscriptions: Option<(EntityId, Vec<Subscription>)>,
+    solution_buffer_subscriptions: Vec<Subscription>,
     active_code_tab: ActiveCodeTab,
     layout_order: LayoutOrder,
     problem_width_fraction: f32,
@@ -502,6 +507,9 @@ struct RduelView {
     presence: Option<RoomPresence>,
     opponent_flash: Option<OpponentFlash>,
     last_snapshot_upload: Option<Instant>,
+    pending_snapshot_upload_started_at: Option<Instant>,
+    last_observed_opponent_snapshot_millis: Option<i64>,
+    local_code_is_watched: bool,
     submission_watch_started_at: Option<i64>,
 }
 
@@ -864,6 +872,12 @@ struct CodeSnapshotRequest {
 }
 
 #[derive(Serialize)]
+struct CodeWatchRequest {
+    viewer_id: String,
+    token: String,
+}
+
+#[derive(Serialize)]
 struct SubmissionCheckRequest {
     player_id: String,
     token: String,
@@ -904,7 +918,13 @@ struct ServerRoom {
     #[serde(default)]
     started_at_second: i64,
     #[serde(default)]
+    active_player_ids: HashSet<String>,
+    #[serde(default)]
     player_activity: std::collections::HashMap<String, ServerPlayerActivity>,
+    #[serde(default)]
+    code_snapshots: HashMap<String, ServerPlayerCodeSnapshot>,
+    #[serde(default)]
+    code_watched_player_ids: HashSet<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -923,6 +943,16 @@ struct ServerPlayerActivity {
     last_verdict: Option<String>,
     #[serde(default)]
     last_submission_epoch: Option<i64>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ServerPlayerCodeSnapshot {
+    captured_at_second: i64,
+    #[serde(default)]
+    captured_at_millis: i64,
+    main_rs: String,
+    #[serde(rename = "cargo_toml")]
+    _cargo_toml: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1025,6 +1055,12 @@ enum RduelMatchCommand {
     PollRoom {
         server_url: String,
         room_id: String,
+    },
+    WatchCode {
+        server_url: String,
+        room_id: String,
+        viewer_id: String,
+        token: String,
     },
     WatchSubmissions {
         server_url: String,
@@ -1638,7 +1674,10 @@ fn rduel_session_from_history_entry(
             }),
         winning_submission: None,
         started_at_second: entry.started_at_second,
+        active_player_ids: HashSet::new(),
         player_activity,
+        code_snapshots: HashMap::new(),
+        code_watched_player_ids: HashSet::new(),
     };
 
     Some(RduelSession {
@@ -1897,6 +1936,21 @@ impl RduelMatchCommand {
                 let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "GET", &path, None)?;
                 Ok(RduelMatchOutput::RoomStatus { room })
             }
+            Self::WatchCode {
+                server_url,
+                room_id,
+                viewer_id,
+                token,
+            } => {
+                let path = format!("/rooms/{room_id}/watch-code");
+                let room: ServerRoom = rduel_http_json(
+                    &server_url,
+                    "POST",
+                    &path,
+                    Some(&CodeWatchRequest { viewer_id, token }),
+                )?;
+                Ok(RduelMatchOutput::RoomStatus { room })
+            }
             Self::WatchSubmissions {
                 server_url,
                 room_id,
@@ -2072,12 +2126,21 @@ where
         .write_all(request.as_bytes())
         .context("Failed to send request to server")?;
 
-    let mut response = String::new();
+    let mut response = Vec::new();
     stream
-        .read_to_string(&mut response)
+        .read_to_end(&mut response)
         .context("Failed to read response from server")?;
-    let (head, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
-        anyhow::anyhow!("Server returned invalid HTTP response (missing header/body separator)")
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        anyhow::bail!("Server returned invalid HTTP response (missing header/body separator)");
+    };
+    let head = std::str::from_utf8(&response[..header_end])
+        .context("Server returned non-UTF-8 HTTP response headers")?;
+    let body = &response[header_end + 4..];
+    let decoded_body = decode_http_body(head, body).with_context(|| {
+        format!(
+            "Failed to decode server response body: {}",
+            response_body_preview(body)
+        )
     })?;
     let status = head
         .lines()
@@ -2086,15 +2149,78 @@ where
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| anyhow::anyhow!("Server returned invalid HTTP status line"))?;
     if !(200..300).contains(&status) {
-        return Err(anyhow::anyhow!("Server returned HTTP {status}: {body}"));
+        return Err(anyhow::anyhow!(
+            "Server returned HTTP {status}: {}",
+            response_body_preview(&decoded_body)
+        ));
     }
 
-    serde_json::from_str(body).with_context(|| {
+    serde_json::from_slice(&decoded_body).with_context(|| {
         format!(
             "Failed to parse server response: {}",
-            body.chars().take(200).collect::<String>()
+            response_body_preview(&decoded_body)
         )
     })
+}
+
+fn response_body_preview(body: &[u8]) -> String {
+    let preview = String::from_utf8_lossy(body)
+        .chars()
+        .take(200)
+        .collect::<String>();
+    if preview.is_empty() {
+        "<empty>".to_string()
+    } else {
+        preview
+    }
+}
+
+fn response_header_contains(head: &str, name: &str, value: &str) -> bool {
+    head.lines().any(|line| {
+        let Some((header_name, header_value)) = line.split_once(':') else {
+            return false;
+        };
+        header_name.trim().eq_ignore_ascii_case(name)
+            && header_value.to_ascii_lowercase().contains(value)
+    })
+}
+
+fn decode_http_body(head: &str, body: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if !response_header_contains(head, "transfer-encoding", "chunked") {
+        return Ok(body.to_vec());
+    }
+
+    let mut cursor = 0;
+    let mut decoded = Vec::new();
+    loop {
+        let Some(line_end) = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|position| cursor + position)
+        else {
+            anyhow::bail!("chunked response ended before a chunk header");
+        };
+        let header = std::str::from_utf8(&body[cursor..line_end])
+            .context("chunked response header was not UTF-8")?;
+        let size_text = header.split(';').next().unwrap_or(header).trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .with_context(|| format!("invalid chunk size: {size_text}"))?;
+        cursor = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if body.len() < cursor + size + 2 {
+            anyhow::bail!("chunked response ended before a chunk body completed");
+        }
+        decoded.extend_from_slice(&body[cursor..cursor + size]);
+        cursor += size;
+        if body.get(cursor..cursor + 2) != Some(b"\r\n") {
+            anyhow::bail!("chunked response chunk was not followed by CRLF");
+        }
+        cursor += 2;
+    }
+
+    Ok(decoded)
 }
 
 struct LocalHttpEndpoint {
@@ -2809,19 +2935,20 @@ impl RduelView {
             })
             .unwrap_or_else(|| session.player_id.clone());
         let token = (!session.token.is_empty()).then(|| session.token.clone());
-        let opponent_main_rs_editor =
-            session
-                .opponent_main_rs
-                .as_ref()
-                .map(|(atcoder_user, source_code)| {
-                    Self::new_opponent_main_rs_editor(
-                        source_code,
-                        atcoder_user,
-                        language_registry.clone(),
-                        window,
-                        cx,
-                    )
-                });
+        let (opponent_main_rs_buffer, opponent_main_rs_editor) = session
+            .opponent_main_rs
+            .as_ref()
+            .map(|(atcoder_user, source_code)| {
+                Self::new_opponent_main_rs_editor(
+                    source_code,
+                    atcoder_user,
+                    language_registry.clone(),
+                    window,
+                    cx,
+                )
+            })
+            .map(|(buffer, editor)| (Some(buffer), Some(editor)))
+            .unwrap_or((None, None));
         let main_rs_buffer_for_view = main_rs_buffer.clone();
         let cargo_toml_buffer_for_view = cargo_toml_buffer.clone();
         let problem_markdown =
@@ -2873,7 +3000,7 @@ impl RduelView {
         } else {
             OutputSelection::Case(0)
         };
-        let view = Self {
+        let mut view = Self {
             focus_handle: cx.focus_handle(),
             project,
             language_registry,
@@ -2894,10 +3021,12 @@ impl RduelView {
             cargo_toml_buffer: cargo_toml_buffer_for_view,
             main_rs_editor,
             cargo_toml_editor,
+            opponent_main_rs_buffer,
             opponent_main_rs_editor,
             workspace,
             search_target_editor: None,
             search_bar_subscriptions: None,
+            solution_buffer_subscriptions: Vec::new(),
             active_code_tab: ActiveCodeTab::MainRs,
             layout_order: LayoutOrder::ProblemLeft,
             problem_width_fraction: DEFAULT_PROBLEM_WIDTH_FRACTION,
@@ -2910,12 +3039,17 @@ impl RduelView {
             presence: initial_presence,
             opponent_flash: None,
             last_snapshot_upload: None,
+            pending_snapshot_upload_started_at: None,
+            last_observed_opponent_snapshot_millis: None,
+            local_code_is_watched: false,
             submission_watch_started_at: None,
         };
-        if view.room.match_state.room_status == ServerRoomStatus::Playing {
+        if view.room.match_state.room_id.is_some() {
             view.poll_room_after_delay(cx);
+        }
+        if view.is_locally_active_in_room() {
             view.tick_match_timer(cx);
-            view.schedule_snapshot_upload(cx);
+            view.subscribe_solution_buffer_edits(cx);
         }
         view
     }
@@ -3039,6 +3173,7 @@ impl RduelView {
         };
         self.active_code_tab = ActiveCodeTab::OpponentMainRs;
         editor.read(cx).focus_handle(cx).focus(window, cx);
+        self.request_opponent_code_watch(cx);
         cx.notify();
     }
 
@@ -3217,7 +3352,7 @@ impl RduelView {
         language_registry: Arc<LanguageRegistry>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<Editor> {
+    ) -> (Entity<Buffer>, Entity<Editor>) {
         let title = if atcoder_user.trim().is_empty() {
             "opponent/main.rs".to_string()
         } else {
@@ -3235,13 +3370,15 @@ impl RduelView {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
-        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(title.into()));
-        cx.new(|cx| {
+        let multi_buffer =
+            cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx).with_title(title.into()));
+        let editor = cx.new(|cx| {
             let mut editor = Editor::for_multibuffer(multi_buffer, None, window, cx);
             editor.set_read_only(true);
             editor.set_edit_predictions_disabled(true, cx);
             editor
-        })
+        });
+        (buffer, editor)
     }
 
     fn submit_solution(&mut self, _: &SubmitSolution, window: &mut Window, cx: &mut Context<Self>) {
@@ -3516,7 +3653,9 @@ impl RduelView {
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(3)).await;
+            cx.background_executor()
+                .timer(SUBMISSION_POLL_INTERVAL)
+                .await;
             let server_url_for_request = server_url.clone();
             let room_id_for_request = room_id.clone();
             let player_id_for_request = player_id.clone();
@@ -3629,6 +3768,165 @@ impl RduelView {
         self.presence = Some(next);
     }
 
+    fn opponent_player<'a>(&self, room: &'a ServerRoom) -> Option<&'a ServerPlayer> {
+        let local_player_id = self.room.match_state.player_id.as_deref();
+        room.players
+            .iter()
+            .find(|player| Some(player.id.as_str()) != local_player_id)
+    }
+
+    fn opponent_is_active(&self, room: &ServerRoom) -> bool {
+        self.opponent_player(room)
+            .is_some_and(|player| room.active_player_ids.contains(&player.id))
+    }
+
+    fn should_keep_polling_room(&self, room: &ServerRoom) -> bool {
+        room.status == ServerRoomStatus::Playing || self.opponent_is_active(room)
+    }
+
+    fn update_local_code_watch_state(&mut self, room: &ServerRoom, cx: &mut Context<Self>) {
+        let is_watched = self
+            .room
+            .match_state
+            .player_id
+            .as_ref()
+            .is_some_and(|player_id| room.code_watched_player_ids.contains(player_id));
+        let became_watched = is_watched && !self.local_code_is_watched;
+        self.local_code_is_watched = is_watched;
+        if became_watched {
+            self.upload_code_snapshot(cx);
+        }
+    }
+
+    fn update_opponent_code_snapshot(
+        &mut self,
+        room: &ServerRoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if room.status != ServerRoomStatus::Finished {
+            return;
+        }
+        let Some(opponent) = self.opponent_player(room) else {
+            return;
+        };
+        let Some(snapshot) = room.code_snapshots.get(&opponent.id) else {
+            return;
+        };
+        let snapshot_millis = if snapshot.captured_at_millis > 0 {
+            snapshot.captured_at_millis
+        } else {
+            snapshot.captured_at_second.saturating_mul(1_000)
+        };
+        if self
+            .last_observed_opponent_snapshot_millis
+            .is_some_and(|millis| millis >= snapshot_millis)
+        {
+            return;
+        }
+
+        self.last_observed_opponent_snapshot_millis = Some(snapshot_millis);
+        if let Some(buffer) = self.opponent_main_rs_buffer.as_ref() {
+            if buffer.read(cx).text() != snapshot.main_rs {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_text(snapshot.main_rs.clone(), cx);
+                });
+            }
+        } else {
+            let (buffer, editor) = Self::new_opponent_main_rs_editor(
+                &snapshot.main_rs,
+                &opponent.name,
+                self.language_registry.clone(),
+                window,
+                cx,
+            );
+            self.opponent_main_rs_buffer = Some(buffer);
+            self.opponent_main_rs_editor = Some(editor);
+        }
+    }
+
+    fn focus_opponent_code_if_available(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.opponent_main_rs_editor.is_some() {
+            self.select_opponent_main_rs(&SelectOpponentMainRs, window, cx);
+        }
+    }
+
+    fn request_opponent_code_watch(&self, cx: &mut Context<Self>) {
+        let (Some(room_id), Some(viewer_id), Some(token), server_url) = (
+            self.room.match_state.room_id.clone(),
+            self.room.match_state.player_id.clone(),
+            self.room.match_state.token.clone(),
+            self.room.match_state.server_url.clone(),
+        ) else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    RduelMatchCommand::WatchCode {
+                        server_url,
+                        room_id,
+                        viewer_id,
+                        token,
+                    }
+                    .run()
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(RduelMatchOutput::RoomStatus { room }) => {
+                        this.update_room_presence(&room);
+                        this.update_local_code_watch_state(&room, cx);
+                        this.handle_room_status(room, window, cx);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::debug!("failed to request Rduel opponent code watch: {error:#}");
+                    }
+                }
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn ensure_opponent_code_editor(
+        &mut self,
+        room: &ServerRoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.opponent_main_rs_editor.is_some() || room.status != ServerRoomStatus::Finished {
+            return;
+        }
+        let Some(opponent) = self.opponent_player(room) else {
+            return;
+        };
+        let source_code = room
+            .code_snapshots
+            .get(&opponent.id)
+            .map(|snapshot| snapshot.main_rs.as_str())
+            .unwrap_or("");
+        let (buffer, editor) = Self::new_opponent_main_rs_editor(
+            source_code,
+            &opponent.name,
+            self.language_registry.clone(),
+            window,
+            cx,
+        );
+        self.opponent_main_rs_buffer = Some(buffer);
+        self.opponent_main_rs_editor = Some(editor);
+    }
+
+    fn is_watching_opponent_code(&self) -> bool {
+        self.active_code_tab == ActiveCodeTab::OpponentMainRs
+            && self.opponent_main_rs_editor.is_some()
+    }
+
     /// Re-renders once per second so the elapsed-time clock advances and a stale
     /// opponent flash is cleared. Stops when the match finishes.
     fn tick_match_timer(&self, cx: &mut Context<Self>) {
@@ -3660,24 +3958,47 @@ impl RduelView {
         ) else {
             return;
         };
+        let is_watching_opponent_code = self.is_watching_opponent_code();
+        let poll_interval = if is_watching_opponent_code {
+            WATCH_ROOM_POLL_INTERVAL
+        } else {
+            ROOM_POLL_INTERVAL
+        };
+        let command = if is_watching_opponent_code {
+            match (
+                self.room.match_state.player_id.clone(),
+                self.room.match_state.token.clone(),
+            ) {
+                (Some(viewer_id), Some(token)) => RduelMatchCommand::WatchCode {
+                    server_url,
+                    room_id,
+                    viewer_id,
+                    token,
+                },
+                _ => RduelMatchCommand::PollRoom {
+                    server_url,
+                    room_id,
+                },
+            }
+        } else {
+            RduelMatchCommand::PollRoom {
+                server_url,
+                room_id,
+            }
+        };
 
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(3)).await;
-            let result = cx
-                .background_spawn(async move {
-                    RduelMatchCommand::PollRoom {
-                        server_url,
-                        room_id,
-                    }
-                    .run()
-                })
-                .await;
+            cx.background_executor().timer(poll_interval).await;
+            let result = cx.background_spawn(async move { command.run() }).await;
 
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(RduelMatchOutput::RoomStatus { room }) => {
                         this.update_room_presence(&room);
-                        if !this.handle_room_status(room, window, cx) {
+                        this.update_local_code_watch_state(&room, cx);
+                        let keep_polling = this.should_keep_polling_room(&room);
+                        this.handle_room_status(room, window, cx);
+                        if keep_polling {
                             this.poll_room_after_delay(cx);
                         }
                     }
@@ -3712,10 +4033,20 @@ impl RduelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.update_opponent_code_snapshot(&room, window, cx);
         self.add_opponent_solution_if_lost(&room, window, cx);
+        self.ensure_opponent_code_editor(&room, window, cx);
         if let Some(message) = self.apply_room_status(room) {
-            self.upload_code_snapshot(cx);
-            drop(window.prompt(gpui::PromptLevel::Info, &message, None, &["OK"], cx));
+            self.force_upload_code_snapshot(cx);
+            let answer = window.prompt(gpui::PromptLevel::Info, &message, None, &["OK"], cx);
+            cx.spawn_in(window, async move |this, cx| {
+                answer.await.log_err();
+                this.update_in(cx, |this, window, cx| {
+                    this.focus_opponent_code_if_available(window, cx);
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
         }
         self.room.match_state.room_status == ServerRoomStatus::Finished
     }
@@ -3744,13 +4075,15 @@ impl RduelView {
             return;
         };
 
-        self.opponent_main_rs_editor = Some(Self::new_opponent_main_rs_editor(
+        let (buffer, editor) = Self::new_opponent_main_rs_editor(
             source_code,
             &winning_submission.atcoder_user,
             self.language_registry.clone(),
             window,
             cx,
-        ));
+        );
+        self.opponent_main_rs_buffer = Some(buffer);
+        self.opponent_main_rs_editor = Some(editor);
     }
 
     fn apply_room_status(&mut self, room: ServerRoom) -> Option<String> {
@@ -3793,7 +4126,7 @@ impl RduelView {
     }
 
     fn leave_active_match(&mut self, cx: &mut Context<Self>) {
-        if self.room.match_state.room_status != ServerRoomStatus::Playing {
+        if self.room.match_state.room_id.is_none() {
             return;
         }
         let Some(player_id) = self.room.match_state.player_id.take() else {
@@ -3817,7 +4150,56 @@ impl RduelView {
         .detach_and_log_err(cx);
     }
 
+    fn is_locally_active_in_room(&self) -> bool {
+        self.room.match_state.room_id.is_some()
+            && self.room.match_state.player_id.is_some()
+            && self.room.match_state.token.is_some()
+    }
+
+    fn subscribe_solution_buffer_edits(&mut self, cx: &mut Context<Self>) {
+        if !self.solution_buffer_subscriptions.is_empty() {
+            return;
+        }
+        self.solution_buffer_subscriptions = vec![
+            cx.subscribe(&self.main_rs_buffer, |this, _, event: &BufferEvent, cx| {
+                if matches!(
+                    event,
+                    BufferEvent::Edited {
+                        source: BufferEditSource::User | BufferEditSource::Agent,
+                    }
+                ) {
+                    this.schedule_snapshot_upload(cx);
+                }
+            }),
+            cx.subscribe(
+                &self.cargo_toml_buffer,
+                |this, _, event: &BufferEvent, cx| {
+                    if matches!(
+                        event,
+                        BufferEvent::Edited {
+                            source: BufferEditSource::User | BufferEditSource::Agent,
+                        }
+                    ) {
+                        this.schedule_snapshot_upload(cx);
+                    }
+                },
+            ),
+        ];
+    }
+
     fn upload_code_snapshot(&mut self, cx: &mut Context<Self>) {
+        self.upload_code_snapshot_with_force(false, cx);
+    }
+
+    fn force_upload_code_snapshot(&mut self, cx: &mut Context<Self>) {
+        self.upload_code_snapshot_with_force(true, cx);
+    }
+
+    fn upload_code_snapshot_with_force(&mut self, force: bool, cx: &mut Context<Self>) {
+        if !self.is_locally_active_in_room() || (!force && !self.local_code_is_watched) {
+            self.pending_snapshot_upload_started_at = None;
+            return;
+        }
         let (Some(room_id), Some(player_id), Some(token)) = (
             self.room.match_state.room_id.clone(),
             self.room.match_state.player_id.clone(),
@@ -3826,14 +4208,14 @@ impl RduelView {
             return;
         };
 
-        // Check if enough time has passed since last upload
         if let Some(last_upload) = self.last_snapshot_upload {
-            if last_upload.elapsed() < CODE_SNAPSHOT_INTERVAL {
+            if last_upload.elapsed() < CODE_SNAPSHOT_MIN_INTERVAL {
                 return;
             }
         }
 
         self.last_snapshot_upload = Some(Instant::now());
+        self.pending_snapshot_upload_started_at = None;
         let server_url = self.room.match_state.server_url.clone();
         let main_rs = self.main_rs_buffer.read(cx).text();
         let cargo_toml = self.cargo_toml_buffer.read(cx).text();
@@ -3859,17 +4241,21 @@ impl RduelView {
         .detach_and_log_err(cx);
     }
 
-    fn schedule_snapshot_upload(&self, cx: &mut Context<Self>) {
-        if self.room.match_state.room_status != ServerRoomStatus::Playing {
+    fn schedule_snapshot_upload(&mut self, cx: &mut Context<Self>) {
+        if !self.is_locally_active_in_room()
+            || !self.local_code_is_watched
+            || self.pending_snapshot_upload_started_at.is_some()
+        {
             return;
         }
 
+        let scheduled_at = Instant::now();
+        self.pending_snapshot_upload_started_at = Some(scheduled_at);
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(CODE_SNAPSHOT_INTERVAL).await;
+            cx.background_executor().timer(CODE_SNAPSHOT_DEBOUNCE).await;
             this.update(cx, |this, cx| {
-                if this.room.match_state.room_status == ServerRoomStatus::Playing {
+                if this.pending_snapshot_upload_started_at == Some(scheduled_at) {
                     this.upload_code_snapshot(cx);
-                    this.schedule_snapshot_upload(cx);
                 }
             })?;
             anyhow::Ok(())
@@ -4207,6 +4593,20 @@ impl RduelView {
                     cx,
                 ))
             })
+            .child(div().flex_1())
+            .when(
+                self.room.match_state.room_status == ServerRoomStatus::Finished,
+                |this| {
+                    this.child(
+                        Button::new("rduel-rematch", "Again")
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Filled)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_rematch(window, cx)),
+                            ),
+                    )
+                },
+            )
     }
 
     fn render_code_tab(
@@ -4762,7 +5162,6 @@ impl RduelView {
         let started_at = presence
             .map(|presence| presence.started_at_second)
             .unwrap_or(0);
-        let is_finished = self.room.match_state.room_status == ServerRoomStatus::Finished;
         let elapsed = format_elapsed(started_at);
         let flash = self
             .opponent_flash
@@ -4810,18 +5209,6 @@ impl RduelView {
                                     Label::new(message)
                                         .size(LabelSize::Small)
                                         .color(Color::Error),
-                                ),
-                        )
-                    })
-                    .when(is_finished, |this| {
-                        this.child(
-                            Button::new("rduel-rematch", "Again")
-                                .size(ButtonSize::Compact)
-                                .style(ButtonStyle::Filled)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.open_rematch(window, cx)
-                                    }),
                                 ),
                         )
                     })
@@ -4974,7 +5361,8 @@ impl Item for RduelView {
 
     fn is_dirty(&self, cx: &App) -> bool {
         // Consider the item dirty if match is still playing to prevent accidental close
-        self.room.match_state.room_status == ServerRoomStatus::Playing
+        (self.room.match_state.room_status == ServerRoomStatus::Playing
+            && self.room.match_state.room_id.is_some())
             || self.has_unsaved_solution_buffers(cx)
     }
 
@@ -5174,6 +5562,25 @@ mod tests {
             rcontest::atcoder_submit_url("https://atcoder.jp/contests/abc073"),
             None
         );
+    }
+
+    #[test]
+    fn decode_http_body_returns_identity_body() {
+        let body = decode_http_body("HTTP/1.1 200 OK\r\nContent-Length: 11", b"{\"ok\":true}")
+            .expect("identity body should decode");
+
+        assert_eq!(body, b"{\"ok\":true}");
+    }
+
+    #[test]
+    fn decode_http_body_decodes_chunked_body() {
+        let body = decode_http_body(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked",
+            b"7\r\n{\"ok\":t\r\n4\r\nrue}\r\n0\r\n\r\n",
+        )
+        .expect("chunked body should decode");
+
+        assert_eq!(body, b"{\"ok\":true}");
     }
 
     #[test]

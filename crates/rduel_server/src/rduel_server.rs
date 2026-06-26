@@ -40,6 +40,7 @@ struct Args {
 const ROOM_TTL_SECONDS: i64 = 600;
 /// How often the background sweeper reaps finished rooms.
 const ROOM_REAP_INTERVAL_SECONDS: u64 = 60;
+const CODE_WATCH_TTL_MILLIS: i64 = 1_000;
 /// Minimum spacing between any two outbound AtCoder requests, server-wide.
 const ATCODER_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(700);
 /// Hard cap on AtCoder submission pages fetched per user per poll. The newest
@@ -85,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/players/:player_id", get(player_state))
         .route("/players/:player_id/leave", post(leave_player))
         .route("/rooms/:room_id", get(room_state))
+        .route("/rooms/:room_id/watch-code", post(watch_room_code))
         .route("/rooms/:room_id/complete", post(complete_room))
         .route("/rooms/:room_id/code-snapshot", post(upload_code_snapshot))
         .route(
@@ -628,6 +630,8 @@ impl RduelRooms {
             player_activity: HashMap::new(),
             player_submissions: HashMap::new(),
             code_snapshots: HashMap::new(),
+            code_watched_player_ids: HashSet::new(),
+            code_watchers: HashMap::new(),
             finished_at_second: None,
         };
         let room_id = room.id.clone();
@@ -721,7 +725,11 @@ impl RduelRooms {
                         return LeaveOutcome::NotFound;
                     };
                     if !matches!(room.status, RoomStatus::Playing) {
-                        return LeaveOutcome::RoomAlreadyFinished(room.clone());
+                        room.active_player_ids.remove(player_id);
+                        Self::refresh_code_watches(room);
+                        let room = room.clone();
+                        self.forget_player(player_id);
+                        return LeaveOutcome::RoomAlreadyFinished(room);
                     }
                     room.active_player_ids.remove(player_id);
                     if room.active_player_ids.is_empty() {
@@ -729,8 +737,10 @@ impl RduelRooms {
                         room.winner_player_id = None;
                         room.finish_reason = Some(RoomFinishReason::PlayerLeft);
                         room.finished_at_second = Some(unix_now());
+                        Self::refresh_code_watches(room);
                         LeaveOutcome::LastActivePlayerLeft(room.clone())
                     } else {
+                        Self::refresh_code_watches(room);
                         LeaveOutcome::LeftActiveRoom(room.clone())
                     }
                 };
@@ -762,8 +772,44 @@ impl RduelRooms {
         removed_count
     }
 
-    fn room_state(&self, room_id: &str) -> Option<Room> {
-        self.rooms.get(room_id).cloned()
+    fn room_state(&mut self, room_id: &str) -> Option<Room> {
+        let room = self.rooms.get_mut(room_id)?;
+        Self::refresh_code_watches(room);
+        Some(room.clone())
+    }
+
+    fn watch_opponent_code(&mut self, room_id: &str, viewer_id: &str) -> Option<Room> {
+        let room = self.rooms.get_mut(room_id)?;
+        if !room.players.iter().any(|player| player.id == viewer_id) {
+            return None;
+        }
+        if room.active_player_ids.contains(viewer_id) {
+            let expires_at = unix_now_millis() + CODE_WATCH_TTL_MILLIS;
+            for player in &room.players {
+                if player.id != viewer_id && room.active_player_ids.contains(&player.id) {
+                    room.code_watchers
+                        .entry(player.id.clone())
+                        .or_default()
+                        .insert(viewer_id.to_string(), expires_at);
+                }
+            }
+        }
+        Self::refresh_code_watches(room);
+        Some(room.clone())
+    }
+
+    fn refresh_code_watches(room: &mut Room) {
+        let now = unix_now_millis();
+        room.code_watchers.retain(|watched_player_id, watchers| {
+            if !room.active_player_ids.contains(watched_player_id) {
+                return false;
+            }
+            watchers.retain(|watcher_id, expires_at| {
+                *expires_at >= now && room.active_player_ids.contains(watcher_id)
+            });
+            !watchers.is_empty()
+        });
+        room.code_watched_player_ids = room.code_watchers.keys().cloned().collect();
     }
 
     fn complete_room(&mut self, room_id: &str, player_id: &str) -> Option<Room> {
@@ -959,6 +1005,12 @@ struct SubmissionCheckRequest {
     from_second: i64,
 }
 
+#[derive(Deserialize)]
+struct CodeWatchRequest {
+    viewer_id: String,
+    token: String,
+}
+
 #[derive(Serialize)]
 struct SubmissionCheckResponse {
     room: Room,
@@ -997,7 +1049,7 @@ struct Room {
     finish_reason: Option<RoomFinishReason>,
     winning_submission: Option<WinningSubmission>,
     atcoder_users: HashMap<String, String>,
-    #[serde(skip)]
+    #[serde(default)]
     active_player_ids: HashSet<String>,
     /// Per-player live submission activity (`player_id` -> activity), surfaced to
     /// the client so each side can see the opponent submitting in real time.
@@ -1006,6 +1058,10 @@ struct Room {
     player_submissions: HashMap<String, Vec<PlayerSubmissionRecord>>,
     #[serde(default)]
     code_snapshots: HashMap<String, PlayerCodeSnapshot>,
+    #[serde(default)]
+    code_watched_player_ids: HashSet<String>,
+    #[serde(skip)]
+    code_watchers: HashMap<String, HashMap<String, i64>>,
     /// Unix second at which the room transitioned to `Finished`, used to reap
     /// finished rooms (and their players) after a TTL.
     #[serde(skip)]
@@ -1030,6 +1086,7 @@ struct PlayerSubmissionRecord {
 #[derive(Clone, Deserialize, Serialize)]
 struct PlayerCodeSnapshot {
     captured_at_second: i64,
+    captured_at_millis: i64,
     main_rs: String,
     cargo_toml: String,
 }
@@ -1130,6 +1187,10 @@ fn unix_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
+fn unix_now_millis() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
@@ -1197,6 +1258,7 @@ async fn leave_player(
                 &player_id,
                 PlayerCodeSnapshot {
                     captured_at_second: unix_now(),
+                    captured_at_millis: unix_now_millis(),
                     main_rs,
                     cargo_toml,
                 },
@@ -1240,11 +1302,26 @@ async fn room_state(
     State(state): State<ServerState>,
     Path(room_id): Path<String>,
 ) -> Result<Json<Room>, ApiError> {
-    let rooms = state.rooms.lock().await;
+    let mut rooms = state.rooms.lock().await;
     rooms
         .room_state(&room_id)
         .map(Json)
         .ok_or(ApiError::NotFound("room was not found"))
+}
+
+async fn watch_room_code(
+    State(state): State<ServerState>,
+    Path(room_id): Path<String>,
+    Json(request): Json<CodeWatchRequest>,
+) -> Result<Json<Room>, ApiError> {
+    let mut rooms = state.rooms.lock().await;
+    if !rooms.token_matches(&request.viewer_id, &request.token) {
+        return Err(ApiError::Unauthorized("invalid player token"));
+    }
+    rooms
+        .watch_opponent_code(&room_id, &request.viewer_id)
+        .map(Json)
+        .ok_or(ApiError::NotFound("room or player was not found"))
 }
 
 async fn complete_room(
@@ -1286,6 +1363,7 @@ async fn upload_code_snapshot(
                 &request.player_id,
                 PlayerCodeSnapshot {
                     captured_at_second: unix_now(),
+                    captured_at_millis: unix_now_millis(),
                     main_rs: request.main_rs,
                     cargo_toml: request.cargo_toml,
                 },
@@ -1339,7 +1417,7 @@ async fn watch_room_submissions(
     Json(request): Json<SubmissionCheckRequest>,
 ) -> Result<Json<SubmissionCheckResponse>, ApiError> {
     let room = {
-        let rooms = state.rooms.lock().await;
+        let mut rooms = state.rooms.lock().await;
         if !rooms.token_matches(&request.player_id, &request.token) {
             return Err(ApiError::Unauthorized("invalid player token"));
         }
@@ -1882,6 +1960,73 @@ mod tests {
             rooms.players.get("player-2"),
             Some(PlayerLocation::Room { room_id }) if room_id == &room.id
         ));
+    }
+
+    #[test]
+    fn leaving_finished_room_marks_player_offline() {
+        let mut rooms = test_rooms();
+        rooms.join(join_request("player-1", "atcoder-user-a"));
+        let JoinDecision::CreateRoom { opponent, player } =
+            rooms.join(join_request("player-2", "atcoder-user-b"))
+        else {
+            panic!("expected a CreateRoom decision");
+        };
+        let problem = rooms.problems[0].clone();
+        let JoinResponse::Matched { room, .. } = rooms.create_room(opponent, player, problem)
+        else {
+            panic!("expected a Matched response");
+        };
+        rooms
+            .apply_submission_ac(
+                &room.id,
+                "player-1",
+                AtCoderSubmission {
+                    id: 1,
+                    problem_id: room.problem.id.clone(),
+                    epoch_second: unix_now(),
+                    result: "AC".to_string(),
+                    source_code: Some("fn main() {}".to_string()),
+                },
+            )
+            .expect("room should finish");
+
+        let LeaveOutcome::RoomAlreadyFinished(room) = rooms.leave_player("player-2") else {
+            panic!("expected a finished room leave outcome");
+        };
+
+        assert!(matches!(room.status, RoomStatus::Finished));
+        assert!(room.active_player_ids.contains("player-1"));
+        assert!(!room.active_player_ids.contains("player-2"));
+        assert!(!rooms.players.contains_key("player-2"));
+    }
+
+    #[test]
+    fn code_watch_marks_only_opponent_and_clears_when_watcher_leaves() {
+        let mut rooms = test_rooms();
+        rooms.join(join_request("player-1", "atcoder-user-a"));
+        let JoinDecision::CreateRoom { opponent, player } =
+            rooms.join(join_request("player-2", "atcoder-user-b"))
+        else {
+            panic!("expected a CreateRoom decision");
+        };
+        let problem = rooms.problems[0].clone();
+        let JoinResponse::Matched { room, .. } = rooms.create_room(opponent, player, problem)
+        else {
+            panic!("expected a Matched response");
+        };
+
+        let room = rooms
+            .watch_opponent_code(&room.id, "player-1")
+            .expect("room should exist");
+
+        assert!(room.code_watched_player_ids.contains("player-2"));
+        assert!(!room.code_watched_player_ids.contains("player-1"));
+
+        let LeaveOutcome::LeftActiveRoom(room) = rooms.leave_player("player-1") else {
+            panic!("expected player-1 to leave");
+        };
+
+        assert!(room.code_watched_player_ids.is_empty());
     }
 
     #[test]
