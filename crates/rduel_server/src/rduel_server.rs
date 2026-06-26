@@ -1158,6 +1158,15 @@ async fn join_matchmaking(
         }
     };
 
+    if let JoinResponse::Matched { room, .. } = &response
+        && let Err(error) = start_room_submission_polling(&state, room.id.clone()).await
+    {
+        log::warn!(
+            "failed to start AtCoder submission polling for Rduel room {}: {error:?}",
+            room.id
+        );
+    }
+
     Json(response)
 }
 
@@ -1320,6 +1329,15 @@ async fn watch_room_submissions(
     State(state): State<ServerState>,
     Path(room_id): Path<String>,
 ) -> Result<Json<Room>, ApiError> {
+    start_room_submission_polling(&state, room_id)
+        .await
+        .map(Json)
+}
+
+async fn start_room_submission_polling(
+    state: &ServerState,
+    room_id: String,
+) -> Result<Room, ApiError> {
     let (room, should_start_polling) = {
         let mut rooms = state.rooms.lock().await;
         rooms
@@ -1329,10 +1347,10 @@ async fn watch_room_submissions(
 
     if should_start_polling {
         log::info!("Rduel room {room_id} started watching AtCoder submissions");
-        tokio::spawn(poll_room_submissions(state, room_id));
+        tokio::spawn(poll_room_submissions(state.clone(), room_id));
     }
 
-    Ok(Json(room))
+    Ok(room)
 }
 
 async fn select_problem_for_server(state: &ServerState) -> anyhow::Result<Problem> {
@@ -1596,6 +1614,7 @@ async fn fetch_submission_source(
         .await
 }
 
+#[derive(Debug)]
 enum ApiError {
     NotFound(&'static str),
     Unauthorized(&'static str),

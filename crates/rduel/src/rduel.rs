@@ -526,10 +526,19 @@ struct OpponentFlash {
 }
 
 impl RoomPresence {
-    fn from_room(room: &ServerRoom, local_player_id: Option<&str>) -> Self {
+    fn from_room(
+        room: &ServerRoom,
+        local_player_id: Option<&str>,
+        local_atcoder_user: Option<&str>,
+    ) -> Self {
+        let local_index = room
+            .players
+            .iter()
+            .position(|player| Some(player.id.as_str()) == local_player_id)
+            .or_else(|| unique_player_index_by_name(room, local_atcoder_user));
         let mut local = None;
         let mut opponent = None;
-        for player in &room.players {
+        for (index, player) in room.players.iter().enumerate() {
             let presence = PlayerPresence {
                 name: player.name.clone(),
                 activity: room
@@ -538,7 +547,7 @@ impl RoomPresence {
                     .cloned()
                     .unwrap_or_default(),
             };
-            if Some(player.id.as_str()) == local_player_id {
+            if Some(index) == local_index {
                 local = Some(presence);
             } else {
                 opponent = Some(presence);
@@ -550,6 +559,50 @@ impl RoomPresence {
             opponent,
         }
     }
+}
+
+fn unique_player_index_by_name(room: &ServerRoom, atcoder_user: Option<&str>) -> Option<usize> {
+    let atcoder_user = atcoder_user?.trim();
+    if atcoder_user.is_empty() {
+        return None;
+    }
+
+    let mut matching_indices = room
+        .players
+        .iter()
+        .enumerate()
+        .filter_map(|(index, player)| (player.name == atcoder_user).then_some(index));
+    let index = matching_indices.next()?;
+    matching_indices.next().is_none().then_some(index)
+}
+
+fn resolve_local_player_id(
+    room: &ServerRoom,
+    player_id: String,
+    local_atcoder_user: Option<&str>,
+) -> String {
+    if room.players.iter().any(|player| player.id == player_id) {
+        return player_id;
+    }
+
+    if let Some(index) = unique_player_index_by_name(room, local_atcoder_user) {
+        let resolved_player_id = room.players[index].id.clone();
+        log::warn!(
+            "Rduel room {} returned local player id {} which is not in the room; recovered as {} by AtCoder user {}",
+            room.id,
+            player_id,
+            resolved_player_id,
+            room.players[index].name
+        );
+        return resolved_player_id;
+    }
+
+    log::warn!(
+        "Rduel room {} returned local player id {} which is not in the room",
+        room.id,
+        player_id
+    );
+    player_id
 }
 
 #[derive(Clone)]
@@ -753,6 +806,7 @@ struct MatchState {
     token: Option<String>,
     room_id: Option<String>,
     server_url: String,
+    local_atcoder_user: Option<String>,
     room_status: ServerRoomStatus,
 }
 
@@ -2658,7 +2712,29 @@ impl RduelView {
             .as_ref()
             .map(|room| room.status.clone())
             .unwrap_or(ServerRoomStatus::Playing);
-        let player_id = session.player_id.clone();
+        let configured_atcoder_user = RduelSettings::get_global(cx).atcoder_user.clone();
+        let local_atcoder_user = if session.is_history {
+            session.room.as_ref().and_then(|room| {
+                room.players
+                    .iter()
+                    .find(|player| player.id == session.player_id)
+                    .map(|player| player.name.clone())
+            })
+        } else {
+            let configured_atcoder_user = configured_atcoder_user.trim();
+            (!configured_atcoder_user.is_empty()).then(|| configured_atcoder_user.to_string())
+        };
+        let player_id = session
+            .room
+            .as_ref()
+            .map(|room| {
+                resolve_local_player_id(
+                    room,
+                    session.player_id.clone(),
+                    local_atcoder_user.as_deref(),
+                )
+            })
+            .unwrap_or_else(|| session.player_id.clone());
         let token = (!session.token.is_empty()).then(|| session.token.clone());
         let opponent_main_rs_editor =
             session
@@ -2698,10 +2774,13 @@ impl RduelView {
             editor.set_should_serialize_selection_changes(false);
             editor
         });
-        let initial_presence = session
-            .room
-            .as_ref()
-            .map(|room| RoomPresence::from_room(room, Some(session.player_id.as_str())));
+        let initial_presence = session.room.as_ref().map(|room| {
+            RoomPresence::from_room(
+                room,
+                Some(player_id.as_str()),
+                local_atcoder_user.as_deref(),
+            )
+        });
         let test_cases = samples
             .iter()
             .map(|sample| RduelTestCase {
@@ -2731,6 +2810,7 @@ impl RduelView {
                     token,
                     room_id,
                     server_url: session.server_url,
+                    local_atcoder_user,
                     room_status,
                 },
             },
@@ -3323,7 +3403,11 @@ impl RduelView {
     /// banner when the opponent has made a new submission since the last poll.
     fn update_room_presence(&mut self, room: &ServerRoom) {
         let local_id = self.room.match_state.player_id.as_deref();
-        let next = RoomPresence::from_room(room, local_id);
+        let next = RoomPresence::from_room(
+            room,
+            local_id,
+            self.room.match_state.local_atcoder_user.as_deref(),
+        );
 
         let previous_opponent = self
             .presence
@@ -4763,37 +4847,7 @@ impl Item for RduelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
-        // If match is still playing, this is called as part of the close confirmation flow.
-        // We need to prompt the user before allowing the close.
-        if self.room.match_state.room_status == ServerRoomStatus::Playing {
-            let answer = window.prompt(
-                gpui::PromptLevel::Warning,
-                "Leave active match?",
-                Some("Leaving the match will forfeit and your opponent will win. Are you sure?"),
-                &["Leave and Forfeit", "Cancel"],
-                cx,
-            );
-            cx.spawn_in(window, async move |this, cx| {
-                match answer.await {
-                    Ok(0) => {
-                        // User confirmed - leave the match and mark as not dirty
-                        this.update_in(cx, |this, window, cx| {
-                            this.leave_active_match(cx);
-                            this.room.match_state.room_status = ServerRoomStatus::Finished;
-                            // Now save the actual buffers
-                            this.save_solution_editors(options, project, window, cx)
-                        })?
-                        .await
-                    }
-                    _ => {
-                        // User cancelled - return error to prevent close
-                        Err(anyhow::anyhow!("User cancelled leaving the match"))
-                    }
-                }
-            })
-        } else {
-            self.save_solution_editors(options, project, window, cx)
-        }
+        self.save_solution_editors(options, project, window, cx)
     }
 
     fn reload(
