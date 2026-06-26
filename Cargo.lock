@@ -15652,8 +15652,6 @@ name = "rpractice"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "clap",
  "editor",
  "fs",
  "futures 0.3.32",
@@ -15673,7 +15671,6 @@ dependencies = [
  "smol",
  "sqlez",
  "text",
- "tokio",
  "toml 0.8.23",
  "ui",
  "util",

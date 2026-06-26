@@ -22,6 +22,14 @@ const ATCODER_PROBLEMS_URL: &str = "https://kenkoooo.com/atcoder/resources/probl
 const ATCODER_CONTESTS_URL: &str = "https://kenkoooo.com/atcoder/resources/contests.json";
 pub const DEFAULT_MAX_SUBMISSION_PAGES: u32 = 3;
 
+pub fn is_final_atcoder_verdict(verdict: &str) -> bool {
+    let verdict = verdict.trim();
+    !verdict.is_empty()
+        && verdict != "WJ"
+        && !verdict.eq_ignore_ascii_case("judging")
+        && !verdict.eq_ignore_ascii_case("waiting for judging")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Problem {
     pub id: String,
@@ -1385,6 +1393,18 @@ $c_{1,0}$ $c_{1,1}$        $1$ 行目から $2$ 行目にわたって、盤面�
         assert_eq!(submissions[0].id, 76975342);
         assert_eq!(submissions[0].verdict, "AC");
         assert_eq!(submissions[0].epoch_second, 1782495156);
+    }
+
+    #[test]
+    fn identifies_final_atcoder_verdicts() {
+        assert!(!is_final_atcoder_verdict(""));
+        assert!(!is_final_atcoder_verdict("WJ"));
+        assert!(!is_final_atcoder_verdict("Judging"));
+        assert!(!is_final_atcoder_verdict("Waiting for Judging"));
+        assert!(is_final_atcoder_verdict("AC"));
+        assert!(is_final_atcoder_verdict("WA"));
+        assert!(is_final_atcoder_verdict("TLE"));
+        assert!(is_final_atcoder_verdict("CE"));
     }
 
     #[test]

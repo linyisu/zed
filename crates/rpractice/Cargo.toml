@@ -36,8 +36,4 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
-
-axum = { version = "0.6", features = ["json"] }
-clap = { workspace = true, features = ["derive"] }
 sqlez.workspace = true
-tokio = { workspace = true, features = ["full"] }

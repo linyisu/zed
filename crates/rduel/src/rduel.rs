@@ -502,6 +502,7 @@ struct RduelView {
     presence: Option<RoomPresence>,
     opponent_flash: Option<OpponentFlash>,
     last_snapshot_upload: Option<Instant>,
+    submission_watch_started_at: Option<i64>,
 }
 
 /// A live snapshot of both players used to render the versus header.
@@ -700,6 +701,35 @@ fn single_command_output_state(
     }
 }
 
+fn submission_output_item(submission: &ServerPlayerSubmissionRecord) -> CommandOutputItem {
+    let verdict = if submission.verdict.trim().is_empty() {
+        "Unknown"
+    } else {
+        submission.verdict.trim()
+    };
+    let status = if verdict == "AC" {
+        CommandOutputItemStatus::Passed
+    } else {
+        CommandOutputItemStatus::Warning
+    };
+    CommandOutputItem {
+        label: "Submission".into(),
+        status,
+        detail: Some(CommandOutputDetail::with_sections(
+            format!("Detected AtCoder submission: {verdict}"),
+            vec![CommandOutputDetailSection {
+                title: "Submission".into(),
+                body: format!(
+                    "{verdict:<8} {}  #{}",
+                    format_relative(submission.epoch_second),
+                    submission.id
+                )
+                .into(),
+            }],
+        )),
+    }
+}
+
 impl CommandOutputDetail {
     fn new(heading: impl Into<SharedString>) -> Self {
         Self {
@@ -833,6 +863,13 @@ struct CodeSnapshotRequest {
     cargo_toml: String,
 }
 
+#[derive(Serialize)]
+struct SubmissionCheckRequest {
+    player_id: String,
+    token: String,
+    from_second: i64,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum JoinResponse {
@@ -886,6 +923,19 @@ struct ServerPlayerActivity {
     last_verdict: Option<String>,
     #[serde(default)]
     last_submission_epoch: Option<i64>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ServerPlayerSubmissionRecord {
+    id: i64,
+    epoch_second: i64,
+    verdict: String,
+}
+
+#[derive(Deserialize)]
+struct ServerSubmissionCheckResponse {
+    room: ServerRoom,
+    detected_submission: Option<ServerPlayerSubmissionRecord>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -979,6 +1029,9 @@ enum RduelMatchCommand {
     WatchSubmissions {
         server_url: String,
         room_id: String,
+        player_id: String,
+        token: String,
+        from_second: i64,
     },
     UploadCodeSnapshot {
         server_url: String,
@@ -1013,6 +1066,10 @@ enum RduelMatchOutput {
     },
     RoomStatus {
         room: ServerRoom,
+    },
+    SubmissionCheck {
+        room: ServerRoom,
+        detected_submission: Option<ServerPlayerSubmissionRecord>,
     },
     History {
         matches: Vec<MatchHistoryEntry>,
@@ -1208,6 +1265,7 @@ impl RduelMatchModal {
                 });
             }
             Ok(RduelMatchOutput::RoomStatus { .. }) => {}
+            Ok(RduelMatchOutput::SubmissionCheck { .. }) => {}
             Ok(RduelMatchOutput::History { .. }) => {}
             Err(error) => {
                 log::warn!("failed to match Rduel player: {error:#}");
@@ -1842,10 +1900,25 @@ impl RduelMatchCommand {
             Self::WatchSubmissions {
                 server_url,
                 room_id,
+                player_id,
+                token,
+                from_second,
             } => {
                 let path = format!("/rooms/{room_id}/watch-submissions");
-                let room: ServerRoom = rduel_http_json::<(), _>(&server_url, "POST", &path, None)?;
-                Ok(RduelMatchOutput::RoomStatus { room })
+                let response: ServerSubmissionCheckResponse = rduel_http_json(
+                    &server_url,
+                    "POST",
+                    &path,
+                    Some(&SubmissionCheckRequest {
+                        player_id,
+                        token,
+                        from_second,
+                    }),
+                )?;
+                Ok(RduelMatchOutput::SubmissionCheck {
+                    room: response.room,
+                    detected_submission: response.detected_submission,
+                })
             }
             Self::UploadCodeSnapshot {
                 server_url,
@@ -2837,6 +2910,7 @@ impl RduelView {
             presence: initial_presence,
             opponent_flash: None,
             last_snapshot_upload: None,
+            submission_watch_started_at: None,
         };
         if view.room.match_state.room_status == ServerRoomStatus::Playing {
             view.poll_room_after_delay(cx);
@@ -3262,6 +3336,7 @@ impl RduelView {
                 for case in &mut this.test_cases {
                     case.result = None;
                 }
+                let mut start_submission_watch = false;
                 let mut output_state = match result {
                     Ok(output) => {
                         this.command_status = if output.success {
@@ -3275,7 +3350,7 @@ impl RduelView {
                             ));
                             this.upload_code_snapshot(cx);
                             cx.open_url(&submit_ready.submit_url);
-                            this.start_server_submission_watch(cx);
+                            start_submission_watch = true;
                             log::info!(
                                 "prepared Rduel submit for {}",
                                 submit_ready.source_path.display()
@@ -3313,6 +3388,9 @@ impl RduelView {
                 }
 
                 this.command_output = output_state;
+                if start_submission_watch {
+                    this.start_server_submission_watch(cx);
+                }
                 this.focus_after_run();
                 cx.notify();
             })
@@ -3361,34 +3439,145 @@ impl RduelView {
         write_test_case_files(rduel_project, &cases)
     }
 
-    fn start_server_submission_watch(&self, cx: &mut Context<Self>) {
-        let (Some(room_id), server_url) = (
+    fn upsert_submission_output_item(
+        &mut self,
+        item: CommandOutputItem,
+        select_item: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let index = match self
+            .command_output
+            .items
+            .iter()
+            .position(|existing| existing.label.as_ref() == "Submission")
+        {
+            Some(index) => {
+                self.command_output.items[index] = item;
+                index
+            }
+            None => {
+                self.command_output.items.push(item);
+                self.command_output.items.len().saturating_sub(1)
+            }
+        };
+        if select_item {
+            self.output_selection = OutputSelection::Step(index);
+        }
+        cx.notify();
+    }
+
+    fn start_server_submission_watch(&mut self, cx: &mut Context<Self>) {
+        if self.room.match_state.room_status != ServerRoomStatus::Playing {
+            return;
+        }
+        let (Some(room_id), Some(player_id), Some(token), server_url) = (
             self.room.match_state.room_id.clone(),
+            self.room.match_state.player_id.clone(),
+            self.room.match_state.token.clone(),
             self.room.match_state.server_url.clone(),
         ) else {
+            self.upsert_submission_output_item(
+                CommandOutputItem {
+                    label: "Submission".into(),
+                    status: CommandOutputItemStatus::Failed,
+                    detail: Some(CommandOutputDetail::new(
+                        "Could not start submission detection for this room.",
+                    )),
+                },
+                true,
+                cx,
+            );
             return;
         };
 
+        let from_second = unix_now();
+        self.submission_watch_started_at = Some(from_second);
+        self.upsert_submission_output_item(
+            CommandOutputItem {
+                label: "Submission".into(),
+                status: CommandOutputItemStatus::Pending,
+                detail: Some(CommandOutputDetail::new(
+                    "Waiting for the next AtCoder submission...",
+                )),
+            },
+            true,
+            cx,
+        );
+        self.poll_submission_after_delay(room_id, player_id, token, server_url, from_second, cx);
+    }
+
+    fn poll_submission_after_delay(
+        &self,
+        room_id: String,
+        player_id: String,
+        token: String,
+        server_url: String,
+        from_second: i64,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let server_url_for_request = server_url.clone();
+            let room_id_for_request = room_id.clone();
+            let player_id_for_request = player_id.clone();
+            let token_for_request = token.clone();
             let result = cx
                 .background_spawn(async move {
                     RduelMatchCommand::WatchSubmissions {
-                        server_url,
-                        room_id,
+                        server_url: server_url_for_request,
+                        room_id: room_id_for_request,
+                        player_id: player_id_for_request,
+                        token: token_for_request,
+                        from_second,
                     }
                     .run()
                 })
                 .await;
 
             this.update_in(cx, |this, window, cx| {
+                if this.submission_watch_started_at != Some(from_second) {
+                    return;
+                }
                 match result {
-                    Ok(RduelMatchOutput::RoomStatus { room }) => {
+                    Ok(RduelMatchOutput::SubmissionCheck {
+                        room,
+                        detected_submission,
+                    }) => {
                         this.update_room_presence(&room);
-                        this.handle_room_status(room, window, cx);
+                        let is_finished = this.handle_room_status(room, window, cx);
+                        if let Some(submission) = detected_submission {
+                            this.submission_watch_started_at = None;
+                            this.upsert_submission_output_item(
+                                submission_output_item(&submission),
+                                true,
+                                cx,
+                            );
+                        } else if !is_finished {
+                            this.poll_submission_after_delay(
+                                room_id,
+                                player_id,
+                                token,
+                                server_url,
+                                from_second,
+                                cx,
+                            );
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        log::debug!("failed to watch Rduel submissions: {error:#}");
+                        this.submission_watch_started_at = None;
+                        log::warn!("failed to check Rduel submission: {error:#}");
+                        this.upsert_submission_output_item(
+                            CommandOutputItem {
+                                label: "Submission".into(),
+                                status: CommandOutputItemStatus::Failed,
+                                detail: Some(CommandOutputDetail::new(format!(
+                                    "Could not check AtCoder submissions:\n{error:#}"
+                                ))),
+                            },
+                            true,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -3496,6 +3685,9 @@ impl RduelView {
                         this.poll_room_after_delay(cx);
                     }
                     Ok(RduelMatchOutput::History { .. }) => {
+                        this.poll_room_after_delay(cx);
+                    }
+                    Ok(RduelMatchOutput::SubmissionCheck { .. }) => {
                         this.poll_room_after_delay(cx);
                     }
                     Err(error) => {
@@ -4117,7 +4309,7 @@ impl RduelView {
                             .child(self.render_action_button(
                                 "rduel-submit",
                                 IconName::Send,
-                                "Send",
+                                "Submit",
                                 is_command_running,
                                 cx,
                             )),
@@ -4559,11 +4751,18 @@ impl RduelView {
         cx.notify();
     }
 
+    fn open_rematch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| open_rduel(workspace, window, cx))
+            .log_err();
+    }
+
     fn render_versus_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let presence = self.presence.as_ref();
         let started_at = presence
             .map(|presence| presence.started_at_second)
             .unwrap_or(0);
+        let is_finished = self.room.match_state.room_status == ServerRoomStatus::Finished;
         let elapsed = format_elapsed(started_at);
         let flash = self
             .opponent_flash
@@ -4611,6 +4810,18 @@ impl RduelView {
                                     Label::new(message)
                                         .size(LabelSize::Small)
                                         .color(Color::Error),
+                                ),
+                        )
+                    })
+                    .when(is_finished, |this| {
+                        this.child(
+                            Button::new("rduel-rematch", "Again")
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Filled)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.open_rematch(window, cx)
+                                    }),
                                 ),
                         )
                     })

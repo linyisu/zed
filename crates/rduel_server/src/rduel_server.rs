@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::Arc,
@@ -624,10 +624,10 @@ impl RduelRooms {
                 (opponent.id.clone(), opponent.name.clone()),
                 (player.id.clone(), player.name.clone()),
             ]),
+            active_player_ids: HashSet::from([opponent.id.clone(), player.id.clone()]),
             player_activity: HashMap::new(),
             player_submissions: HashMap::new(),
             code_snapshots: HashMap::new(),
-            polling_submissions: false,
             finished_at_second: None,
         };
         let room_id = room.id.clone();
@@ -715,24 +715,27 @@ impl RduelRooms {
                 LeaveOutcome::LeftWaiting
             }
             Some(PlayerLocation::Room { room_id }) => {
-                let Some(room) = self.rooms.get_mut(&room_id) else {
-                    self.forget_player(player_id);
-                    return LeaveOutcome::NotFound;
+                let outcome = {
+                    let Some(room) = self.rooms.get_mut(&room_id) else {
+                        self.forget_player(player_id);
+                        return LeaveOutcome::NotFound;
+                    };
+                    if !matches!(room.status, RoomStatus::Playing) {
+                        return LeaveOutcome::RoomAlreadyFinished(room.clone());
+                    }
+                    room.active_player_ids.remove(player_id);
+                    if room.active_player_ids.is_empty() {
+                        room.status = RoomStatus::Finished;
+                        room.winner_player_id = None;
+                        room.finish_reason = Some(RoomFinishReason::PlayerLeft);
+                        room.finished_at_second = Some(unix_now());
+                        LeaveOutcome::LastActivePlayerLeft(room.clone())
+                    } else {
+                        LeaveOutcome::LeftActiveRoom(room.clone())
+                    }
                 };
-                if !matches!(room.status, RoomStatus::Playing) {
-                    return LeaveOutcome::RoomAlreadyFinished(room.clone());
-                }
-                let Some(winner) = room.players.iter().find(|player| player.id != player_id) else {
-                    return LeaveOutcome::NotFound;
-                };
-
-                room.status = RoomStatus::Finished;
-                room.winner_player_id = Some(winner.id.clone());
-                room.finish_reason = Some(RoomFinishReason::PlayerLeft);
-                room.finished_at_second = Some(unix_now());
-                let finished_room = room.clone();
                 self.forget_player(player_id);
-                LeaveOutcome::ForfeitedRoom(finished_room)
+                outcome
             }
             None => LeaveOutcome::NotFound,
         }
@@ -761,23 +764,6 @@ impl RduelRooms {
 
     fn room_state(&self, room_id: &str) -> Option<Room> {
         self.rooms.get(room_id).cloned()
-    }
-
-    fn start_submission_watch(&mut self, room_id: &str) -> Option<(Room, bool)> {
-        let room = self.rooms.get_mut(room_id)?;
-        let should_start_polling = !room.polling_submissions;
-        if should_start_polling {
-            room.polling_submissions = true;
-        }
-        Some((room.clone(), should_start_polling))
-    }
-
-    /// Clears the polling flag when a poll task stops, so a later watch request
-    /// can spawn a fresh poller instead of being permanently suppressed.
-    fn stop_submission_watch(&mut self, room_id: &str) {
-        if let Some(room) = self.rooms.get_mut(room_id) {
-            room.polling_submissions = false;
-        }
     }
 
     fn complete_room(&mut self, room_id: &str, player_id: &str) -> Option<Room> {
@@ -918,7 +904,8 @@ enum JoinDecision {
 
 enum LeaveOutcome {
     LeftWaiting,
-    ForfeitedRoom(Room),
+    LeftActiveRoom(Room),
+    LastActivePlayerLeft(Room),
     RoomAlreadyFinished(Room),
     NotFound,
 }
@@ -965,6 +952,19 @@ struct LeaveRequest {
     cargo_toml: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SubmissionCheckRequest {
+    player_id: String,
+    token: String,
+    from_second: i64,
+}
+
+#[derive(Serialize)]
+struct SubmissionCheckResponse {
+    room: Room,
+    detected_submission: Option<PlayerSubmissionRecord>,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum JoinResponse {
@@ -997,6 +997,8 @@ struct Room {
     finish_reason: Option<RoomFinishReason>,
     winning_submission: Option<WinningSubmission>,
     atcoder_users: HashMap<String, String>,
+    #[serde(skip)]
+    active_player_ids: HashSet<String>,
     /// Per-player live submission activity (`player_id` -> activity), surfaced to
     /// the client so each side can see the opponent submitting in real time.
     player_activity: HashMap<String, PlayerActivity>,
@@ -1004,8 +1006,6 @@ struct Room {
     player_submissions: HashMap<String, Vec<PlayerSubmissionRecord>>,
     #[serde(default)]
     code_snapshots: HashMap<String, PlayerCodeSnapshot>,
-    #[serde(skip)]
-    polling_submissions: bool,
     /// Unix second at which the room transitioned to `Finished`, used to reap
     /// finished rooms (and their players) after a TTL.
     #[serde(skip)]
@@ -1072,6 +1072,16 @@ struct AtCoderSubmission {
     problem_id: String,
     result: String,
     source_code: Option<String>,
+}
+
+impl From<AtCoderSubmission> for PlayerSubmissionRecord {
+    fn from(submission: AtCoderSubmission) -> Self {
+        Self {
+            id: submission.id,
+            epoch_second: submission.epoch_second,
+            verdict: submission.result,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1158,15 +1168,6 @@ async fn join_matchmaking(
         }
     };
 
-    if let JoinResponse::Matched { room, .. } = &response
-        && let Err(error) = start_room_submission_polling(&state, room.id.clone()).await
-    {
-        log::warn!(
-            "failed to start AtCoder submission polling for Rduel room {}: {error:?}",
-            room.id
-        );
-    }
-
     Json(response)
 }
 
@@ -1209,11 +1210,18 @@ async fn leave_player(
             log::info!("Rduel waiting player {player_id} left matchmaking");
             Json(serde_json::json!({ "left": true, "state": "waiting" }))
         }
-        LeaveOutcome::ForfeitedRoom(room) => {
+        LeaveOutcome::LeftActiveRoom(room) => {
             log::info!(
-                "Rduel player {player_id} left active room {}; winner: {:?}",
+                "Rduel player {player_id} left active room {}; remaining active players: {}",
                 room.id,
-                room.winner_player_id
+                room.active_player_ids.len()
+            );
+            Json(serde_json::json!({ "left": true, "state": "room", "room": room }))
+        }
+        LeaveOutcome::LastActivePlayerLeft(room) => {
+            log::info!(
+                "last active Rduel player {player_id} left room {}; room finished without a winner",
+                room.id
             );
             record_room_history(state.history.clone(), room.clone());
             Json(serde_json::json!({ "left": true, "state": "room", "room": room }))
@@ -1328,29 +1336,83 @@ fn record_room_history(history: MatchHistoryStore, room: Room) {
 async fn watch_room_submissions(
     State(state): State<ServerState>,
     Path(room_id): Path<String>,
-) -> Result<Json<Room>, ApiError> {
-    start_room_submission_polling(&state, room_id)
-        .await
-        .map(Json)
-}
-
-async fn start_room_submission_polling(
-    state: &ServerState,
-    room_id: String,
-) -> Result<Room, ApiError> {
-    let (room, should_start_polling) = {
-        let mut rooms = state.rooms.lock().await;
-        rooms
-            .start_submission_watch(&room_id)
-            .ok_or(ApiError::NotFound("room was not found"))?
+    Json(request): Json<SubmissionCheckRequest>,
+) -> Result<Json<SubmissionCheckResponse>, ApiError> {
+    let room = {
+        let rooms = state.rooms.lock().await;
+        if !rooms.token_matches(&request.player_id, &request.token) {
+            return Err(ApiError::Unauthorized("invalid player token"));
+        }
+        let room = rooms
+            .room_state(&room_id)
+            .ok_or(ApiError::NotFound("room was not found"))?;
+        if !room
+            .players
+            .iter()
+            .any(|player| player.id == request.player_id)
+        {
+            return Err(ApiError::NotFound("player was not found in room"));
+        }
+        room
     };
 
-    if should_start_polling {
-        log::info!("Rduel room {room_id} started watching AtCoder submissions");
-        tokio::spawn(poll_room_submissions(state.clone(), room_id));
+    if !matches!(room.status, RoomStatus::Playing)
+        || !room.active_player_ids.contains(&request.player_id)
+    {
+        return Ok(Json(SubmissionCheckResponse {
+            room,
+            detected_submission: None,
+        }));
     }
 
-    Ok(room)
+    let poll = poll_player_submission_state(
+        &room,
+        &request.player_id,
+        request.from_second,
+        state.atcoder_revel_session.as_deref(),
+        &state.atcoder_rate_limiter,
+    )
+    .await
+    .map_err(|error| ApiError::Internal("failed to check AtCoder submissions", error))?;
+
+    let (room, detected_submission) = {
+        let mut rooms = state.rooms.lock().await;
+        rooms.update_player_activity(&room_id, &[poll.activity], &[poll.submissions]);
+        let detected_submission = poll
+            .detected_submission
+            .clone()
+            .map(PlayerSubmissionRecord::from);
+        let room = if let Some(submission) = poll.detected_submission {
+            if submission.result == "AC" {
+                rooms
+                    .apply_submission_ac(&room_id, &request.player_id, submission)
+                    .ok_or(ApiError::NotFound("room or player was not found"))?
+            } else {
+                rooms
+                    .room_state(&room_id)
+                    .ok_or(ApiError::NotFound("room was not found"))?
+            }
+        } else {
+            rooms
+                .room_state(&room_id)
+                .ok_or(ApiError::NotFound("room was not found"))?
+        };
+        (room, detected_submission)
+    };
+
+    if matches!(room.status, RoomStatus::Finished) {
+        log::info!(
+            "Rduel room {room_id} finished; winner: {:?}, problem: {}",
+            room.winner_player_id,
+            room.problem.id
+        );
+        record_room_history(state.history.clone(), room.clone());
+    }
+
+    Ok(Json(SubmissionCheckResponse {
+        room,
+        detected_submission,
+    }))
 }
 
 async fn select_problem_for_server(state: &ServerState) -> anyhow::Result<Problem> {
@@ -1361,137 +1423,69 @@ async fn select_problem_for_server(state: &ServerState) -> anyhow::Result<Proble
     select_problem(&problems).await
 }
 
-async fn poll_room_submissions(state: ServerState, room_id: String) {
-    log::info!("started AtCoder submission polling for Rduel room {room_id}");
-    let mut ticker = interval(Duration::from_secs(3));
-    let mut last_fetch_errors = HashMap::new();
-    loop {
-        ticker.tick().await;
-
-        let room = {
-            let mut rooms = state.rooms.lock().await;
-            let Some(room) = rooms.room_state(&room_id) else {
-                log::warn!("stopping Rduel polling because room {room_id} no longer exists");
-                return;
-            };
-            if !matches!(room.status, RoomStatus::Playing) {
-                rooms.stop_submission_watch(&room_id);
-                log::info!("stopping Rduel polling because room {room_id} is finished");
-                return;
-            }
-            room
-        };
-
-        let poll = poll_room_submission_state(
-            &room,
-            state.atcoder_revel_session.as_deref(),
-            &state.atcoder_rate_limiter,
-            &mut last_fetch_errors,
-        )
-        .await;
-
-        let finished_room = {
-            let mut rooms = state.rooms.lock().await;
-            rooms.update_player_activity(&room_id, &poll.activity, &poll.submissions);
-            poll.winner.and_then(|(player_id, submission)| {
-                rooms.apply_submission_ac(&room_id, &player_id, submission)
-            })
-        };
-        if let Some(room) = finished_room {
-            log::info!(
-                "Rduel room {room_id} finished; winner: {:?}, problem: {}",
-                room.winner_player_id,
-                room.problem.id
-            );
-            record_room_history(state.history.clone(), room);
-        }
-    }
+struct PlayerSubmissionPoll {
+    activity: (String, PlayerActivity),
+    submissions: (String, Vec<PlayerSubmissionRecord>),
+    detected_submission: Option<AtCoderSubmission>,
 }
 
-/// The result of one polling pass: the earliest AC across both players (if any)
-/// and each player's current submission activity.
-struct SubmissionPoll {
-    winner: Option<(String, AtCoderSubmission)>,
-    activity: Vec<(String, PlayerActivity)>,
-    submissions: Vec<(String, Vec<PlayerSubmissionRecord>)>,
-}
-
-async fn poll_room_submission_state(
+async fn poll_player_submission_state(
     room: &Room,
+    player_id: &str,
+    from_second: i64,
     atcoder_revel_session: Option<&str>,
     rate_limiter: &RateLimiter,
-    last_fetch_errors: &mut HashMap<String, String>,
-) -> SubmissionPoll {
-    let mut winner: Option<(String, AtCoderSubmission)> = None;
-    let mut activity = Vec::new();
-    let mut submission_records = Vec::new();
+) -> anyhow::Result<PlayerSubmissionPoll> {
+    let atcoder_user = room
+        .atcoder_users
+        .get(player_id)
+        .ok_or_else(|| anyhow::anyhow!("AtCoder user was not found for player {player_id}"))?;
+    let submissions = fetch_user_submissions(
+        atcoder_user,
+        &room.problem,
+        atcoder_revel_session,
+        room.started_at_second,
+        rate_limiter,
+    )
+    .await?;
 
-    for player in &room.players {
-        let Some(atcoder_user) = room.atcoder_users.get(&player.id) else {
-            continue;
-        };
-        let submissions = match fetch_user_submissions(
-            atcoder_user,
-            &room.problem,
-            atcoder_revel_session,
-            room.started_at_second,
-            rate_limiter,
-        )
-        .await
+    let mut player_activity = PlayerActivity::default();
+    let mut player_submission_records = Vec::new();
+    let mut detected_submission = None;
+    for submission in &submissions {
+        if submission.problem_id != room.problem.id
+            || submission.epoch_second < room.started_at_second
         {
-            Ok(submissions) => {
-                last_fetch_errors.remove(atcoder_user);
-                submissions
-            }
-            Err(error) => {
-                let error = format!("{error:#}");
-                if last_fetch_errors.get(atcoder_user) != Some(&error) {
-                    log::warn!("failed to fetch submissions for {atcoder_user}: {error}");
-                    last_fetch_errors.insert(atcoder_user.clone(), error);
-                } else {
-                    log::debug!("still failing to fetch submissions for {atcoder_user}: {error}");
-                }
-                continue;
-            }
-        };
-
-        let mut player_activity = PlayerActivity::default();
-        let mut player_submission_records = Vec::new();
-        for submission in &submissions {
-            if submission.problem_id != room.problem.id
-                || submission.epoch_second < room.started_at_second
-            {
-                continue;
-            }
-
-            player_activity.attempt_count += 1;
-            player_submission_records.push(PlayerSubmissionRecord {
-                id: submission.id,
-                epoch_second: submission.epoch_second,
-                verdict: submission.result.clone(),
-            });
-            if player_activity
-                .last_submission_epoch
-                .is_none_or(|epoch| submission.epoch_second >= epoch)
-            {
-                player_activity.last_submission_epoch = Some(submission.epoch_second);
-                player_activity.last_verdict = Some(submission.result.clone());
-            }
-
-            if submission.result == "AC" {
-                let should_replace = winner
-                    .as_ref()
-                    .is_none_or(|(_, earliest)| submission.epoch_second < earliest.epoch_second);
-                if should_replace {
-                    winner = Some((player.id.clone(), submission.clone()));
-                }
-            }
+            continue;
         }
-        activity.push((player.id.clone(), player_activity));
-        submission_records.push((player.id.clone(), player_submission_records));
+
+        player_activity.attempt_count += 1;
+        player_submission_records.push(PlayerSubmissionRecord::from(submission.clone()));
+        if player_activity
+            .last_submission_epoch
+            .is_none_or(|epoch| submission.epoch_second >= epoch)
+        {
+            player_activity.last_submission_epoch = Some(submission.epoch_second);
+            player_activity.last_verdict = Some(submission.result.clone());
+        }
+
+        if submission.epoch_second >= from_second
+            && rcontest::is_final_atcoder_verdict(&submission.result)
+            && detected_submission
+                .as_ref()
+                .is_none_or(|detected: &AtCoderSubmission| {
+                    submission.epoch_second < detected.epoch_second
+                        || (submission.epoch_second == detected.epoch_second
+                            && submission.id < detected.id)
+                })
+        {
+            detected_submission = Some(submission.clone());
+        }
     }
 
-    if let Some((_, submission)) = winner.as_mut() {
+    if let Some(submission) = detected_submission.as_mut()
+        && submission.result == "AC"
+    {
         match fetch_submission_source(
             &room.problem,
             submission.id,
@@ -1512,11 +1506,11 @@ async fn poll_room_submission_state(
         }
     }
 
-    SubmissionPoll {
-        winner,
-        activity,
-        submissions: submission_records,
-    }
+    Ok(PlayerSubmissionPoll {
+        activity: (player_id.to_string(), player_activity),
+        submissions: (player_id.to_string(), player_submission_records),
+        detected_submission,
+    })
 }
 
 async fn fetch_user_submissions(
@@ -1858,6 +1852,36 @@ mod tests {
         assert!(rooms.rooms.is_empty());
         assert_eq!(rooms.waiting_players.len(), 1);
         assert_eq!(rooms.waiting_players[0].id, "player-2");
+    }
+
+    #[test]
+    fn leaving_active_room_keeps_match_playing_for_remaining_player() {
+        let mut rooms = test_rooms();
+        rooms.join(join_request("player-1", "atcoder-user-a"));
+        let JoinDecision::CreateRoom { opponent, player } =
+            rooms.join(join_request("player-2", "atcoder-user-b"))
+        else {
+            panic!("expected a CreateRoom decision");
+        };
+        let problem = rooms.problems[0].clone();
+        let JoinResponse::Matched { room: _, .. } = rooms.create_room(opponent, player, problem)
+        else {
+            panic!("expected a Matched response");
+        };
+
+        let LeaveOutcome::LeftActiveRoom(room) = rooms.leave_player("player-1") else {
+            panic!("expected player to leave active room without finishing it");
+        };
+
+        assert!(matches!(room.status, RoomStatus::Playing));
+        assert!(room.winner_player_id.is_none());
+        assert!(room.active_player_ids.contains("player-2"));
+        assert!(!room.active_player_ids.contains("player-1"));
+        assert!(!rooms.players.contains_key("player-1"));
+        assert!(matches!(
+            rooms.players.get("player-2"),
+            Some(PlayerLocation::Room { room_id }) if room_id == &room.id
+        ));
     }
 
     #[test]

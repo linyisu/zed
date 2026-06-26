@@ -120,6 +120,9 @@ pub struct RpracticeView {
     test_cases: Vec<PracticeTestCase>,
     output_selection: OutputSelection,
     is_fetching_submissions: bool,
+    submission_fetch_problem_id: Option<String>,
+    submission_watch_started_at: Option<i64>,
+    submission_watch_problem_id: Option<String>,
     search_target_editor: Option<Entity<Editor>>,
     search_bar_subscriptions: Option<(EntityId, Vec<Subscription>)>,
     status: SharedString,
@@ -747,6 +750,45 @@ fn format_submission_rows(submissions: &[fetcher::ProblemSubmission]) -> String 
         .join("\n")
 }
 
+fn first_submission_since(
+    submissions: &[fetcher::ProblemSubmission],
+    from_second: i64,
+) -> Option<&fetcher::ProblemSubmission> {
+    submissions
+        .iter()
+        .filter(|submission| submission.epoch_second >= from_second)
+        .min_by_key(|submission| (submission.epoch_second, submission.id))
+}
+
+fn detected_submission_output_item(submission: &fetcher::ProblemSubmission) -> CommandOutputItem {
+    let verdict = if submission.verdict.trim().is_empty() {
+        "Unknown"
+    } else {
+        submission.verdict.trim()
+    };
+    CommandOutputItem {
+        label: "Submissions".into(),
+        status: if verdict == "AC" {
+            CommandOutputItemStatus::Passed
+        } else {
+            CommandOutputItemStatus::Warning
+        },
+        detail: Some(CommandOutputDetail::with_sections(
+            format!("Detected AtCoder submission: {verdict}"),
+            vec![CommandOutputDetailSection {
+                title: "Submission".into(),
+                body: format!(
+                    "{verdict:<8} {}  #{}  {}",
+                    format_relative(submission.epoch_second),
+                    submission.id,
+                    submission.url
+                )
+                .into(),
+            }],
+        )),
+    }
+}
+
 fn configured_atcoder_user(cx: &App) -> Option<String> {
     if let Ok(atcoder_user) = std::env::var("ATCODER_USER")
         && !atcoder_user.trim().is_empty()
@@ -856,6 +898,9 @@ impl RpracticeView {
             test_cases: Vec::new(),
             output_selection: OutputSelection::Step(0),
             is_fetching_submissions: false,
+            submission_fetch_problem_id: None,
+            submission_watch_started_at: None,
+            submission_watch_problem_id: None,
             search_target_editor: None,
             search_bar_subscriptions: None,
             status: "Loading problem list...".into(),
@@ -1156,6 +1201,7 @@ impl RpracticeView {
         self.status = SharedString::default();
         self.search_target_editor = Some(source_editor);
         self.start_practice_session(problem.id, cx);
+        self.fetch_submissions(cx);
         cx.notify();
     }
 
@@ -1324,7 +1370,7 @@ impl RpracticeView {
                             this.command_output = CommandOutputState {
                                 items: output.items,
                             };
-                            this.fetch_submissions(cx);
+                            this.start_submission_watch(cx);
                         } else {
                             this.command_output = CommandOutputState {
                                 items: output.items,
@@ -1376,7 +1422,15 @@ impl RpracticeView {
     }
 
     fn fetch_submissions(&mut self, cx: &mut Context<Self>) {
-        if self.is_fetching_submissions {
+        if self.submission_watch_started_at.is_some() {
+            return;
+        }
+
+        if self.is_fetching_submissions
+            && self.selected_problem.as_ref().is_some_and(|problem| {
+                self.submission_fetch_problem_id.as_deref() == Some(problem.id.as_str())
+            })
+        {
             return;
         }
 
@@ -1409,7 +1463,9 @@ impl RpracticeView {
             return;
         };
 
+        let fetch_problem_id = problem.id.clone();
         self.is_fetching_submissions = true;
+        self.submission_fetch_problem_id = Some(fetch_problem_id.clone());
         self.upsert_submissions_item(
             CommandOutputItem {
                 label: "Submissions".into(),
@@ -1436,16 +1492,160 @@ impl RpracticeView {
                 .await;
 
             this.update(cx, |this, cx| {
+                let is_current_fetch =
+                    this.submission_fetch_problem_id.as_deref() == Some(fetch_problem_id.as_str());
+                if !is_current_fetch {
+                    return;
+                }
                 this.is_fetching_submissions = false;
-                let has_ac = result.as_ref().is_ok_and(|submissions| {
-                    submissions
-                        .iter()
-                        .any(|submission| submission.verdict.trim() == "AC")
-                });
+                this.submission_fetch_problem_id = None;
+                if this.submission_watch_started_at.is_some()
+                    || !this
+                        .selected_problem
+                        .as_ref()
+                        .is_some_and(|selected_problem| selected_problem.id == fetch_problem_id)
+                {
+                    cx.notify();
+                    return;
+                }
                 let item = submissions_output_item(&atcoder_user, &problem, result);
                 this.upsert_submissions_item(item, true, cx);
-                if has_ac {
-                    this.finish_practice_session(cx);
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn start_submission_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(problem) = self.selected_problem.clone() else {
+            return;
+        };
+        let Some(atcoder_user) = configured_atcoder_user(cx) else {
+            self.upsert_submissions_item(
+                CommandOutputItem {
+                    label: "Submissions".into(),
+                    status: CommandOutputItemStatus::Failed,
+                    detail: Some(CommandOutputDetail::new(
+                        "AtCoder user is not configured. Set it in Rduel first.",
+                    )),
+                },
+                true,
+                cx,
+            );
+            return;
+        };
+
+        let from_second = unix_now();
+        self.submission_fetch_problem_id = None;
+        self.submission_watch_started_at = Some(from_second);
+        self.submission_watch_problem_id = Some(problem.id.clone());
+        self.is_fetching_submissions = true;
+        self.upsert_submissions_item(
+            CommandOutputItem {
+                label: "Submissions".into(),
+                status: CommandOutputItemStatus::Pending,
+                detail: Some(CommandOutputDetail::new(
+                    "Waiting for the next AtCoder submission...",
+                )),
+            },
+            true,
+            cx,
+        );
+        self.poll_submission_after_delay(atcoder_user, problem, from_second, cx);
+    }
+
+    fn poll_submission_after_delay(
+        &self,
+        atcoder_user: String,
+        problem: Problem,
+        from_second: i64,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let result = cx
+                .background_spawn({
+                    let atcoder_user = atcoder_user.clone();
+                    let problem = problem.clone();
+                    async move {
+                        fetcher::fetch_problem_submissions(
+                            &atcoder_user,
+                            &problem,
+                            SUBMISSION_FETCH_LIMIT,
+                        )
+                    }
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                let is_current_watch = this.submission_watch_started_at == Some(from_second)
+                    && this.submission_watch_problem_id.as_deref() == Some(problem.id.as_str());
+                if !is_current_watch {
+                    return;
+                }
+                if !this
+                    .selected_problem
+                    .as_ref()
+                    .is_some_and(|selected_problem| selected_problem.id == problem.id)
+                {
+                    this.submission_watch_started_at = None;
+                    this.submission_watch_problem_id = None;
+                    this.is_fetching_submissions = false;
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(submissions) => {
+                        if let Some(submission) =
+                            first_submission_since(&submissions, from_second).cloned()
+                        {
+                            if !fetcher::is_final_atcoder_verdict(&submission.verdict) {
+                                this.poll_submission_after_delay(
+                                    atcoder_user,
+                                    problem,
+                                    from_second,
+                                    cx,
+                                );
+                                return;
+                            }
+                            let has_ac = submission.verdict.trim() == "AC";
+                            this.submission_watch_started_at = None;
+                            this.submission_watch_problem_id = None;
+                            this.is_fetching_submissions = false;
+                            this.upsert_submissions_item(
+                                detected_submission_output_item(&submission),
+                                true,
+                                cx,
+                            );
+                            if has_ac {
+                                this.finish_practice_session(cx);
+                            }
+                        } else {
+                            this.poll_submission_after_delay(
+                                atcoder_user,
+                                problem,
+                                from_second,
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        this.submission_watch_started_at = None;
+                        this.submission_watch_problem_id = None;
+                        this.is_fetching_submissions = false;
+                        this.upsert_submissions_item(
+                            CommandOutputItem {
+                                label: "Submissions".into(),
+                                status: CommandOutputItemStatus::Failed,
+                                detail: Some(CommandOutputDetail::new(format!(
+                                    "Could not fetch submissions:\n{error:#}"
+                                ))),
+                            },
+                            true,
+                            cx,
+                        );
+                    }
                 }
                 cx.notify();
             })?;
@@ -1503,7 +1703,7 @@ impl RpracticeView {
         };
 
         self.spawn_practice_command(
-            "Send",
+            "Submit",
             PracticeCommand::Submit {
                 files,
                 cases: self.test_case_texts(cx),
@@ -3218,7 +3418,7 @@ impl RpracticeView {
                             .child(self.render_action_button(
                                 "rpractice-submit",
                                 IconName::Send,
-                                "Send",
+                                "Submit",
                                 is_command_running,
                                 cx,
                             ))
