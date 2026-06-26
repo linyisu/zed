@@ -922,7 +922,7 @@ pub fn parse_atcoder_submissions_page(
     let document = Html::parse_document(html);
     let row_selector = html_selector("table.table-bordered tbody tr")?;
     let time_selector = html_selector("td:first-child time")?;
-    let problem_selector = html_selector("td:nth-child(3) a")?;
+    let link_selector = html_selector("td a")?;
     let result_selector = html_selector("td:nth-child(7)")?;
     let details_selector = html_selector("td:last-child a.submission-details-link")?;
     let time_format = time::format_description::parse(
@@ -932,17 +932,13 @@ pub fn parse_atcoder_submissions_page(
 
     let mut submissions = Vec::new();
     for row in document.select(&row_selector) {
-        let Some(problem_link) = row.select(&problem_selector).next() else {
-            continue;
-        };
-        let Some(problem_href) = problem_link.value().attr("href") else {
-            continue;
-        };
-        if !problem_href
-            .split(['?', '#'])
-            .next()
-            .is_some_and(|href| href.ends_with(&format!("/tasks/{problem_id}")))
-        {
+        let has_problem_link = row.select(&link_selector).any(|link| {
+            link.value()
+                .attr("href")
+                .and_then(|href| href.split(['?', '#']).next())
+                .is_some_and(|href| href.ends_with(&format!("/tasks/{problem_id}")))
+        });
+        if !has_problem_link {
             continue;
         }
 
@@ -1361,6 +1357,34 @@ $c_{1,0}$ $c_{1,1}$        $1$ 行目から $2$ 行目にわたって、盤面�
             submissions[0].url,
             "https://atcoder.jp/contests/abc073/submissions/123456789"
         );
+    }
+
+    #[test]
+    fn parses_filtered_atcoder_submissions_page() {
+        let html = r#"
+<table class="table table-bordered">
+  <tbody>
+    <tr>
+      <td class="no-break"><time class="fixtime fixtime-second">2026-06-27 02:32:36+0900</time></td>
+      <td><a href="/contests/abc179/tasks/abc179_a">A - Plural Form</a></td>
+      <td><a href="/users/linyisu1024">linyisu1024</a></td>
+      <td><a href="/contests/abc179/submissions?f.Language=6088&amp;f.Task=abc179_a&amp;f.User=linyisu1024">Rust</a></td>
+      <td class="text-right submission-score" data-id="76975342">100</td>
+      <td class="text-right">190 Byte</td>
+      <td class="text-center"><span class="label label-success">AC</span></td>
+      <td class="text-right">1 ms</td>
+      <td class="text-right">2068 KiB</td>
+      <td class="text-center"><a href="/contests/abc179/submissions/76975342" class="submission-details-link">Detail</a></td>
+    </tr>
+  </tbody>
+</table>
+"#;
+        let submissions = parse_atcoder_submissions_page(html, "abc179", "abc179_a").unwrap();
+
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].id, 76975342);
+        assert_eq!(submissions[0].verdict, "AC");
+        assert_eq!(submissions[0].epoch_second, 1782495156);
     }
 
     #[test]
