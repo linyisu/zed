@@ -2076,6 +2076,15 @@ fn format_relative(epoch_second: i64) -> String {
     }
 }
 
+fn format_problem_heading(problem_id: &str, title: &str) -> String {
+    let title = title.trim().trim_start_matches('「').trim_end_matches('」');
+    if title.is_empty() {
+        problem_id.to_string()
+    } else {
+        format!("{problem_id} 「{title}」")
+    }
+}
+
 async fn run_process(
     label: &'static str,
     current_dir: &Path,
@@ -3704,30 +3713,30 @@ impl RduelView {
         &self,
         id: &'static str,
         icon: IconName,
+        label: &'static str,
         disabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let background_color = cx.theme().colors().ghost_element_background;
         h_flex()
             .id(id)
             .h(px(28.))
-            .w(px(28.))
             .items_center()
-            .justify_center()
+            .gap_1()
+            .px_2()
             .rounded_sm()
-            .bg(background_color)
+            .bg(cx.theme().colors().ghost_element_background)
             .when(!disabled, |this| {
                 this.hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
                     .cursor_pointer()
             })
             .when(disabled, |this| this.opacity(0.5))
             .child(Icon::new(icon).size(IconSize::Small))
+            .child(Label::new(label).size(LabelSize::Default))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if disabled {
                     return;
                 }
                 match id {
-                    "rduel-toggle-layout" => this.toggle_layout(&ToggleLayout, window, cx),
                     "rduel-run-samples" => this.run_samples(&RunSamples, window, cx),
                     "rduel-submit" => this.submit_solution(&SubmitSolution, window, cx),
                     _ => {}
@@ -3747,15 +3756,20 @@ impl RduelView {
             .min_w(px(280.))
             .overflow_hidden()
             .child(
-                v_flex()
+                h_flex()
                     .h(px(40.))
-                    .justify_center()
+                    .items_center()
+                    .gap_2()
                     .px_4()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
                     .child(
-                        Label::new(format!("{} {}", self.problem.id, self.problem.title))
-                            .size(LabelSize::Default),
+                        Label::new(format_problem_heading(
+                            &self.problem.id,
+                            &self.problem.title,
+                        ))
+                        .size(LabelSize::Default)
+                        .truncate(),
                     ),
             )
             .child(
@@ -3988,7 +4002,7 @@ impl RduelView {
             .bg(cx.theme().colors().editor_background)
             .child(
                 h_flex()
-                    .h(px(28.))
+                    .h(px(32.))
                     .items_center()
                     .px_3()
                     .gap_1p5()
@@ -4012,12 +4026,14 @@ impl RduelView {
                             .child(self.render_action_button(
                                 "rduel-run-samples",
                                 IconName::PlayFilled,
+                                "Run",
                                 is_command_running,
                                 cx,
                             ))
                             .child(self.render_action_button(
                                 "rduel-submit",
                                 IconName::Send,
+                                "Send",
                                 is_command_running,
                                 cx,
                             )),
@@ -4208,27 +4224,24 @@ impl RduelView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_selected = self.output_selection == OutputSelection::Step(index);
-        let border_color = if is_selected {
-            cx.theme().colors().text_accent
-        } else {
-            cx.theme().colors().border
-        };
-
         h_flex()
             .id(("rduel-step-chip", index))
-            .h(px(20.))
+            .h(px(24.))
             .flex_none()
-            .gap_1()
+            .gap_1p5()
             .items_center()
-            .px_2()
+            .justify_center()
+            .px_2p5()
             .rounded_sm()
-            .border_1()
-            .border_color(border_color)
-            .bg(cx.theme().colors().element_background)
+            .bg(if is_selected {
+                cx.theme().colors().ghost_element_selected
+            } else {
+                cx.theme().colors().ghost_element_hover
+            })
             .cursor_pointer()
             .child(
                 div()
-                    .size(px(7.))
+                    .size(px(8.))
                     .rounded_full()
                     .bg(status_dot_color(item.status, cx)),
             )
@@ -4246,31 +4259,28 @@ impl RduelView {
             .map(|result| result.status)
             .unwrap_or(CommandOutputItemStatus::Pending);
         let is_selected = self.output_selection == OutputSelection::Case(index);
-        let border_color = if is_selected {
-            cx.theme().colors().text_accent
-        } else {
-            cx.theme().colors().border
-        };
-
         h_flex()
             .id(("rduel-case-chip", index))
-            .h(px(20.))
+            .h(px(24.))
             .flex_none()
-            .gap_1()
+            .gap_1p5()
             .items_center()
-            .px_2()
+            .justify_center()
+            .px_2p5()
             .rounded_sm()
-            .border_1()
-            .border_color(border_color)
-            .bg(cx.theme().colors().element_background)
+            .bg(if is_selected {
+                cx.theme().colors().ghost_element_selected
+            } else {
+                cx.theme().colors().ghost_element_hover
+            })
             .cursor_pointer()
             .child(
                 div()
-                    .size(px(7.))
+                    .size(px(8.))
                     .rounded_full()
                     .bg(status_dot_color(status, cx)),
             )
-            .child(Label::new(format!("Case {index}")).size(LabelSize::Default))
+            .child(Label::new(format!("Input {}", index + 1)).size(LabelSize::Default))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.output_selection = OutputSelection::Case(index);
                 cx.notify();
@@ -4280,15 +4290,15 @@ impl RduelView {
     fn render_add_case_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .id("rduel-add-case")
-            .h(px(20.))
+            .h(px(24.))
             .flex_none()
-            .gap_1()
+            .gap_1p5()
             .items_center()
-            .px_2()
+            .justify_center()
+            .px_2p5()
             .rounded_sm()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().element_background)
+            .bg(cx.theme().colors().ghost_element_hover)
+            .hover(|this| this.bg(cx.theme().colors().ghost_element_selected))
             .cursor_pointer()
             .child(
                 Icon::new(IconName::Plus)
@@ -4296,7 +4306,7 @@ impl RduelView {
                     .color(Color::Muted),
             )
             .child(
-                Label::new("Case")
+                Label::new("Sample")
                     .size(LabelSize::Default)
                     .color(Color::Muted),
             )

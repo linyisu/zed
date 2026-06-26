@@ -804,6 +804,15 @@ fn format_relative(epoch_second: i64) -> String {
     }
 }
 
+fn format_problem_heading(problem_id: &str, title: &str) -> String {
+    let title = title.trim().trim_start_matches('「').trim_end_matches('」');
+    if title.is_empty() {
+        problem_id.to_string()
+    } else {
+        format!("{problem_id} 「{title}」")
+    }
+}
+
 impl RpracticeView {
     pub fn new(
         workspace: WeakEntity<Workspace>,
@@ -2202,7 +2211,7 @@ impl RpracticeView {
         let title = self
             .selected_problem
             .as_ref()
-            .map(|problem| format!("{} \u{300c}{}\u{300d}", problem.id, problem.title))
+            .map(|problem| format_problem_heading(&problem.id, &problem.title))
             .unwrap_or_else(|| "Select a problem".to_string());
 
         v_flex()
@@ -2696,13 +2705,13 @@ impl RpracticeView {
                 h_flex()
                     .gap_2()
                     .child(
-                        Label::new("- Expected")
-                            .size(LabelSize::Small)
+                        Label::new("− Expected")
+                            .size(LabelSize::XSmall)
                             .color(Color::Error),
                     )
                     .child(
-                        Label::new("+ Output")
-                            .size(LabelSize::Small)
+                        Label::new("＋ Output")
+                            .size(LabelSize::XSmall)
                             .color(Color::Success),
                     ),
             )
@@ -2749,7 +2758,7 @@ impl RpracticeView {
             .gap_1()
             .child(
                 Label::new(section.title.clone())
-                    .size(LabelSize::Small)
+                    .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
             .child(
@@ -2829,34 +2838,54 @@ impl RpracticeView {
         v_flex()
             .gap_2()
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(Label::new("Input").size(LabelSize::Default))
+                v_flex()
+                    .gap_1()
                     .child(
                         h_flex()
-                            .gap_1()
-                            .when(is_default, |this| {
-                                this.child(
-                                    Button::new(("rpractice-case-restore", index), "Restore")
-                                        .disabled(!can_restore)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.restore_test_case(index, window, cx)
-                                        })),
-                                )
-                            })
+                            .items_center()
+                            .justify_between()
                             .child(
-                                Button::new(("rpractice-case-delete", index), "Delete").on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.delete_test_case(index, cx)
-                                    }),
-                                ),
+                                Label::new("Input")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .when(is_default, |this| {
+                                        this.child(
+                                            Button::new(
+                                                ("rpractice-case-restore", index),
+                                                "Restore",
+                                            )
+                                            .disabled(!can_restore)
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.restore_test_case(index, window, cx)
+                                                }),
+                                            ),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new(("rpractice-case-delete", index), "Delete")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_test_case(index, cx)
+                                            })),
+                                    ),
                             ),
-                    ),
+                    )
+                    .child(self.render_case_editor(case.input.clone(), cx)),
             )
-            .child(self.render_case_editor(case.input.clone(), cx))
-            .child(Label::new("Expected").size(LabelSize::Default))
-            .child(self.render_case_editor(case.expected.clone(), cx))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("Expected")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(self.render_case_editor(case.expected.clone(), cx)),
+            )
             .when_some(case.result.as_ref(), |this, result| {
                 let color = match result.status {
                     CommandOutputItemStatus::Passed => Color::Success,
@@ -2891,7 +2920,7 @@ impl RpracticeView {
     ) -> impl IntoElement {
         div()
             .w_full()
-            .min_h(px(32.))
+            .min_h(px(24.))
             .rounded_sm()
             .border_1()
             .border_color(cx.theme().colors().border)
@@ -3091,15 +3120,7 @@ impl RpracticeView {
                     .px_3()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(
-                        Label::new(
-                            self.selected_files
-                                .as_ref()
-                                .map(|files| files.source_file_name.clone())
-                                .unwrap_or_else(|| "source.rs".to_string()),
-                        )
-                        .size(LabelSize::Default),
-                    ),
+                    .child(self.render_source_tab(cx)),
             )
             .child(div().flex_1().min_h_0().overflow_hidden().map(|this| {
                 if let Some(source_editor) = self.source_editor.as_ref() {
@@ -3113,6 +3134,39 @@ impl RpracticeView {
             }))
             .child(self.render_output_divider(cx))
             .child(self.render_command_output(cx))
+    }
+
+    fn render_source_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = self
+            .selected_files
+            .as_ref()
+            .map(|files| files.source_file_name.clone())
+            .unwrap_or_else(|| "source.rs".to_string());
+        let is_dirty = self
+            .source_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.read(cx).is_dirty());
+        let label = if is_dirty {
+            format!("{label} *").into()
+        } else {
+            SharedString::from(label)
+        };
+
+        h_flex()
+            .id("rpractice-source-tab")
+            .h(px(28.))
+            .items_center()
+            .px_2p5()
+            .rounded_sm()
+            .bg(cx.theme().colors().element_background)
+            .hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
+            .cursor_pointer()
+            .child(Label::new(label).size(LabelSize::Default))
+            .on_click(cx.listener(|this, _, window, cx| {
+                if let Some(source_editor) = this.source_editor.as_ref() {
+                    source_editor.read(cx).focus_handle(cx).focus(window, cx);
+                }
+            }))
     }
 
     fn render_command_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3157,7 +3211,7 @@ impl RpracticeView {
                             .child(self.render_action_button(
                                 "rpractice-run-samples",
                                 IconName::PlayFilled,
-                                "Play",
+                                "Run",
                                 is_command_running,
                                 cx,
                             ))
