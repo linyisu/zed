@@ -13,7 +13,6 @@ path = "src/rpractice.rs"
 
 [dependencies]
 anyhow.workspace = true
-async-compression.workspace = true
 editor.workspace = true
 fs.workspace = true
 futures.workspace = true
@@ -23,6 +22,7 @@ log.workspace = true
 markdown.workspace = true
 menu.workspace = true
 project.workspace = true
+rcontest.workspace = true
 schemars.workspace = true
 search.workspace = true
 serde.workspace = true
@@ -37,12 +37,7 @@ util.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 
-# Server dependencies (merged into same crate)
 axum = { version = "0.6", features = ["json"] }
 clap = { workspace = true, features = ["derive"] }
-html_to_markdown.workspace = true
-reqwest.workspace = true
-scraper.workspace = true
 sqlez.workspace = true
-time.workspace = true
 tokio = { workspace = true, features = ["full"] }

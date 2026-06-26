@@ -14878,6 +14878,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcontest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "futures 0.3.32",
+ "html_to_markdown",
+ "scraper",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "zed-reqwest",
+]
+
+[[package]]
 name = "rdrand"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14899,6 +14915,7 @@ dependencies = [
  "markdown",
  "menu",
  "project",
+ "rcontest",
  "schemars 1.0.4",
  "search",
  "serde",
@@ -14917,15 +14934,13 @@ name = "rduel_server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-compression",
  "axum",
  "clap",
  "env_logger 0.11.8",
  "futures-lite 1.13.0",
- "html_to_markdown",
  "log",
  "rand 0.9.4",
- "scraper",
+ "rcontest",
  "serde",
  "serde_json",
  "sqlez",
@@ -15637,21 +15652,19 @@ name = "rpractice"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-compression",
  "axum",
  "clap",
  "editor",
  "fs",
  "futures 0.3.32",
  "gpui",
- "html_to_markdown",
  "language",
  "log",
  "markdown",
  "menu",
  "project",
+ "rcontest",
  "schemars 1.0.4",
- "scraper",
  "search",
  "serde",
  "serde_json",
@@ -15660,13 +15673,11 @@ dependencies = [
  "smol",
  "sqlez",
  "text",
- "time",
  "tokio",
  "toml 0.8.23",
  "ui",
  "util",
  "workspace",
- "zed-reqwest",
  "zed_actions",
 ]
 

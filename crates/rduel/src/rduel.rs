@@ -1332,7 +1332,10 @@ impl RduelHistoryModal {
 
         // Find local player info for additional stats
         let local_player = self.atcoder_user.as_deref().and_then(|atcoder_user| {
-            entry.players.iter().find(|p| p.atcoder_user == atcoder_user)
+            entry
+                .players
+                .iter()
+                .find(|p| p.atcoder_user == atcoder_user)
         });
 
         // Build stats string (attempts, duration, verdict)
@@ -1347,7 +1350,8 @@ impl RduelHistoryModal {
             }
         }
 
-        if let (Some(start), Some(end)) = (Some(entry.started_at_second), entry.finished_at_second) {
+        if let (Some(start), Some(end)) = (Some(entry.started_at_second), entry.finished_at_second)
+        {
             let duration_sec = (end - start).max(0);
             let minutes = duration_sec / 60;
             let seconds = duration_sec % 60;
@@ -1418,11 +1422,11 @@ impl Render for RduelHistoryModal {
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(
-                        v_flex().gap_1().children(
-                            self.matches.iter().enumerate().map(|(index, entry)| {
+                        v_flex()
+                            .gap_1()
+                            .children(self.matches.iter().enumerate().map(|(index, entry)| {
                                 self.render_entry(index, entry, cx).into_any_element()
-                            }),
-                        ),
+                            })),
                     ),
             )
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
@@ -1696,7 +1700,8 @@ async fn run_rduel_submit(
     let source_code = std::fs::read_to_string(&source_path)?;
     let problem_url = read_problem_url(&cargo_toml_path)
         .ok_or_else(|| anyhow::anyhow!("problem_url was not found in Cargo.toml"))?;
-    let submit_url = atcoder_submit_url(&problem_url).unwrap_or_else(|| problem_url.clone());
+    let submit_url =
+        rcontest::atcoder_submit_url(&problem_url).unwrap_or_else(|| problem_url.clone());
     Ok(RduelCommandOutput {
         success: true,
         rendered: test_output.rendered,
@@ -1721,17 +1726,6 @@ fn read_problem_url(cargo_toml_path: &Path) -> Option<String> {
             .strip_suffix('"')
             .map(str::to_string)
     })
-}
-
-fn atcoder_submit_url(problem_url: &str) -> Option<String> {
-    let (contest_url, task_screen_name) = problem_url.split_once("/tasks/")?;
-    let task_screen_name = task_screen_name
-        .split(['?', '#'])
-        .next()
-        .filter(|task_screen_name| !task_screen_name.is_empty())?;
-    Some(format!(
-        "{contest_url}/submit?taskScreenName={task_screen_name}"
-    ))
 }
 
 impl RduelMatchCommand {
@@ -1919,11 +1913,10 @@ where
     B: Serialize,
     R: for<'de> Deserialize<'de>,
 {
-    let endpoint = parse_local_http_endpoint(server_url, path)
-        .context("Failed to parse server URL")?;
+    let endpoint =
+        parse_local_http_endpoint(server_url, path).context("Failed to parse server URL")?;
     let body_str = match body {
-        Some(body) => serde_json::to_string(body)
-            .context("Failed to serialize request body")?,
+        Some(body) => serde_json::to_string(body).context("Failed to serialize request body")?,
         None => String::new(),
     };
     let request = format!(
@@ -1942,19 +1935,23 @@ where
 
     let mut stream = TcpStream::connect_timeout(&socket_address, Duration::from_secs(5))
         .context("Failed to connect to server")?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .context("Failed to set read timeout")?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
         .context("Failed to set write timeout")?;
-    stream.write_all(request.as_bytes())
+    stream
+        .write_all(request.as_bytes())
         .context("Failed to send request to server")?;
 
     let mut response = String::new();
-    stream.read_to_string(&mut response)
+    stream
+        .read_to_string(&mut response)
         .context("Failed to read response from server")?;
-    let (head, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("Server returned invalid HTTP response (missing header/body separator)"))?;
+    let (head, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
+        anyhow::anyhow!("Server returned invalid HTTP response (missing header/body separator)")
+    })?;
     let status = head
         .lines()
         .next()
@@ -1965,8 +1962,12 @@ where
         return Err(anyhow::anyhow!("Server returned HTTP {status}: {body}"));
     }
 
-    serde_json::from_str(body)
-        .with_context(|| format!("Failed to parse server response: {}", body.chars().take(200).collect::<String>()))
+    serde_json::from_str(body).with_context(|| {
+        format!(
+            "Failed to parse server response: {}",
+            body.chars().take(200).collect::<String>()
+        )
+    })
 }
 
 struct LocalHttpEndpoint {
@@ -3752,7 +3753,10 @@ impl RduelView {
                     .px_4()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(Label::new(format!("{} {}", self.problem.id, self.problem.title)).size(LabelSize::Default)),
+                    .child(
+                        Label::new(format!("{} {}", self.problem.id, self.problem.title))
+                            .size(LabelSize::Default),
+                    ),
             )
             .child(
                 h_flex()
@@ -4882,17 +4886,17 @@ mod tests {
     #[test]
     fn atcoder_submit_url_preselects_language_and_task() {
         assert_eq!(
-            atcoder_submit_url("https://atcoder.jp/contests/abc073/tasks/abc073_c"),
+            rcontest::atcoder_submit_url("https://atcoder.jp/contests/abc073/tasks/abc073_c"),
             Some("https://atcoder.jp/contests/abc073/submit?taskScreenName=abc073_c".to_string())
         );
     }
 
     #[test]
     fn atcoder_submit_url_handles_invalid_urls() {
-        assert_eq!(atcoder_submit_url("not a url"), None);
-        assert_eq!(atcoder_submit_url("https://example.com"), None);
+        assert_eq!(rcontest::atcoder_submit_url("not a url"), None);
+        assert_eq!(rcontest::atcoder_submit_url("https://example.com"), None);
         assert_eq!(
-            atcoder_submit_url("https://atcoder.jp/contests/abc073"),
+            rcontest::atcoder_submit_url("https://atcoder.jp/contests/abc073"),
             None
         );
     }
@@ -5014,7 +5018,10 @@ mod tests {
             winner_player_id: None,
             ..entry_won.clone()
         };
-        assert_eq!(history_outcome(&entry_unfinished, Some("user1")), "Finished");
+        assert_eq!(
+            history_outcome(&entry_unfinished, Some("user1")),
+            "Finished"
+        );
     }
 
     #[test]
@@ -5024,12 +5031,10 @@ mod tests {
             title: "Test Problem".to_string(),
             url: "https://atcoder.jp/contests/abc001/tasks/abc001_a".to_string(),
             statement_markdown: "# Problem".to_string(),
-            samples: vec![
-                ServerSample {
-                    input: "1 2".to_string(),
-                    output: "3".to_string(),
-                },
-            ],
+            samples: vec![ServerSample {
+                input: "1 2".to_string(),
+                output: "3".to_string(),
+            }],
         };
 
         let problem = RduelProblem::from_server(&server_problem);

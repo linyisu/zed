@@ -28,6 +28,7 @@ use project::{Project, ProjectItem, ProjectPath};
 use schemars::JsonSchema;
 use search::BufferSearchBar;
 use serde::Deserialize;
+use settings::SettingsStore;
 use smallvec::SmallVec;
 use ui::{
     Button, Icon, IconName, IconSize, IndentGuideColors, Label, LabelSize, ListItem,
@@ -55,6 +56,7 @@ const MIN_OUTPUT_HEIGHT: f32 = 28.0;
 const CODE_AREA_TOP_RESERVE: f32 = 50.0;
 const PROBLEM_MARKDOWN_FONT_SCALE: f32 = 1.12;
 const SAMPLE_TEST_TIMEOUT: Duration = Duration::from_secs(3);
+const SUBMISSION_FETCH_LIMIT: usize = 10;
 const STARTER_CARGO_TOML_DEPENDENCIES: &str = r#"[dependencies]
 num = "0.4.3"
 proconio = { version = "0.5.0", features = ["derive"] }
@@ -67,6 +69,10 @@ pub struct RunSamples;
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = rpractice)]
 pub struct SubmitSolution;
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = rpractice)]
+pub struct RefreshSubmissions;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = rpractice)]
@@ -113,6 +119,7 @@ pub struct RpracticeView {
     command_output: CommandOutputState,
     test_cases: Vec<PracticeTestCase>,
     output_selection: OutputSelection,
+    is_fetching_submissions: bool,
     search_target_editor: Option<Entity<Editor>>,
     search_bar_subscriptions: Option<(EntityId, Vec<Subscription>)>,
     status: SharedString,
@@ -305,6 +312,11 @@ struct PracticeSubmitReady {
     submit_url: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct LocalRduelConfig {
+    atcoder_user: Option<String>,
+}
+
 impl PracticeCommand {
     async fn run(self) -> anyhow::Result<PracticeCommandOutput> {
         match self {
@@ -349,24 +361,13 @@ async fn run_practice_submit(
     let mut output = run_practice_test(files.clone(), cases).await?;
     let source_code = std::fs::read_to_string(&files.source_path)
         .with_context(|| format!("reading {}", files.source_path.display()))?;
-    let submit_url = atcoder_submit_url(&problem_url).unwrap_or(problem_url);
+    let submit_url = rcontest::atcoder_submit_url(&problem_url).unwrap_or(problem_url);
     output.submit_ready = Some(PracticeSubmitReady {
         source_code,
         source_path: files.source_path,
         submit_url,
     });
     Ok(output)
-}
-
-fn atcoder_submit_url(problem_url: &str) -> Option<String> {
-    let (contest_url, task_screen_name) = problem_url.split_once("/tasks/")?;
-    let task_screen_name = task_screen_name
-        .split(['?', '#'])
-        .next()
-        .filter(|task_screen_name| !task_screen_name.is_empty())?;
-    Some(format!(
-        "{contest_url}/submit?taskScreenName={task_screen_name}"
-    ))
 }
 
 async fn run_practice_sample_tests(
@@ -677,6 +678,132 @@ fn single_command_output_state(
     }
 }
 
+fn submissions_output_item(
+    atcoder_user: &str,
+    problem: &Problem,
+    result: anyhow::Result<Vec<fetcher::ProblemSubmission>>,
+) -> CommandOutputItem {
+    match result {
+        Ok(submissions) if submissions.is_empty() => CommandOutputItem {
+            label: "Submissions".into(),
+            status: CommandOutputItemStatus::Warning,
+            detail: Some(CommandOutputDetail::new(format!(
+                "No recent submissions found for {atcoder_user} on {}.",
+                problem.id
+            ))),
+        },
+        Ok(submissions) => {
+            let has_ac = submissions
+                .iter()
+                .any(|submission| submission.verdict.trim() == "AC");
+            CommandOutputItem {
+                label: "Submissions".into(),
+                status: if has_ac {
+                    CommandOutputItemStatus::Passed
+                } else {
+                    CommandOutputItemStatus::Warning
+                },
+                detail: Some(CommandOutputDetail::with_sections(
+                    format!(
+                        "Fetched {} recent submission{} for {atcoder_user} on {}.",
+                        submissions.len(),
+                        if submissions.len() == 1 { "" } else { "s" },
+                        problem.id
+                    ),
+                    vec![CommandOutputDetailSection {
+                        title: "Recent submissions".into(),
+                        body: format_submission_rows(&submissions).into(),
+                    }],
+                )),
+            }
+        }
+        Err(error) => CommandOutputItem {
+            label: "Submissions".into(),
+            status: CommandOutputItemStatus::Failed,
+            detail: Some(CommandOutputDetail::new(format!(
+                "Could not fetch submissions:\n{error:#}"
+            ))),
+        },
+    }
+}
+
+fn format_submission_rows(submissions: &[fetcher::ProblemSubmission]) -> String {
+    submissions
+        .iter()
+        .map(|submission| {
+            let verdict = if submission.verdict.trim().is_empty() {
+                "Unknown"
+            } else {
+                submission.verdict.trim()
+            };
+            format!(
+                "{verdict:<8} {:<8} #{}  {}",
+                format_relative(submission.epoch_second),
+                submission.id,
+                submission.url
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn configured_atcoder_user(cx: &App) -> Option<String> {
+    if let Ok(atcoder_user) = std::env::var("ATCODER_USER")
+        && !atcoder_user.trim().is_empty()
+    {
+        return Some(atcoder_user.trim().to_string());
+    }
+
+    if let Some(atcoder_user) = cx
+        .try_global::<SettingsStore>()
+        .and_then(|store| store.raw_user_settings())
+        .and_then(|settings| settings.content.rduel.as_ref())
+        .and_then(|rduel| rduel.atcoder_user.clone())
+        .filter(|atcoder_user| !atcoder_user.trim().is_empty())
+    {
+        return Some(atcoder_user.trim().to_string());
+    }
+
+    let path = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?
+        .join(".rduel")
+        .join("config.json");
+    let config = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<LocalRduelConfig>(&text).ok())?;
+    config
+        .atcoder_user
+        .filter(|atcoder_user| !atcoder_user.trim().is_empty())
+        .map(|atcoder_user| atcoder_user.trim().to_string())
+}
+
+fn format_relative(epoch_second: i64) -> String {
+    let delta = (unix_now() - epoch_second).max(0);
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+
+    if delta < MINUTE {
+        format!("{}s ago", delta)
+    } else if delta < HOUR {
+        format!("{}m ago", delta / MINUTE)
+    } else if delta < DAY {
+        format!("{}h ago", delta / HOUR)
+    } else if delta < WEEK {
+        format!("{}d ago", delta / DAY)
+    } else if delta < MONTH {
+        format!("{}w ago", delta / WEEK)
+    } else if delta < YEAR {
+        format!("{}mo ago", delta / MONTH)
+    } else {
+        format!("{}y ago", delta / YEAR)
+    }
+}
+
 impl RpracticeView {
     pub fn new(
         workspace: WeakEntity<Workspace>,
@@ -719,6 +846,7 @@ impl RpracticeView {
             command_output: CommandOutputState::empty(),
             test_cases: Vec::new(),
             output_selection: OutputSelection::Step(0),
+            is_fetching_submissions: false,
             search_target_editor: None,
             search_bar_subscriptions: None,
             status: "Loading problem list...".into(),
@@ -1012,6 +1140,7 @@ impl RpracticeView {
         } else {
             OutputSelection::Case(0)
         };
+        self.is_fetching_submissions = false;
         self.command_output = CommandOutputState::empty();
         self.command_status = CommandStatus::Idle;
         self.is_loading_problem = false;
@@ -1183,10 +1312,15 @@ impl RpracticeView {
                                 "prepared Rpractice submit for {}",
                                 submit_ready.source_path.display()
                             );
+                            this.command_output = CommandOutputState {
+                                items: output.items,
+                            };
+                            this.fetch_submissions(cx);
+                        } else {
+                            this.command_output = CommandOutputState {
+                                items: output.items,
+                            };
                         }
-                        this.command_output = CommandOutputState {
-                            items: output.items,
-                        };
                     }
                     Err(error) => {
                         this.command_status = CommandStatus::Failed;
@@ -1203,6 +1337,121 @@ impl RpracticeView {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn upsert_submissions_item(
+        &mut self,
+        item: CommandOutputItem,
+        select_item: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let index = match self
+            .command_output
+            .items
+            .iter()
+            .position(|existing| existing.label.as_ref() == "Submissions")
+        {
+            Some(index) => {
+                self.command_output.items[index] = item;
+                index
+            }
+            None => {
+                self.command_output.items.push(item);
+                self.command_output.items.len().saturating_sub(1)
+            }
+        };
+        if select_item {
+            self.output_selection = OutputSelection::Step(index);
+        }
+        cx.notify();
+    }
+
+    fn fetch_submissions(&mut self, cx: &mut Context<Self>) {
+        if self.is_fetching_submissions {
+            return;
+        }
+
+        let Some(problem) = self.selected_problem.clone() else {
+            self.upsert_submissions_item(
+                CommandOutputItem {
+                    label: "Submissions".into(),
+                    status: CommandOutputItemStatus::Failed,
+                    detail: Some(CommandOutputDetail::new(
+                        "Open a problem before fetching submissions.",
+                    )),
+                },
+                true,
+                cx,
+            );
+            return;
+        };
+        let Some(atcoder_user) = configured_atcoder_user(cx) else {
+            self.upsert_submissions_item(
+                CommandOutputItem {
+                    label: "Submissions".into(),
+                    status: CommandOutputItemStatus::Failed,
+                    detail: Some(CommandOutputDetail::new(
+                        "AtCoder user is not configured. Set it in Rduel first.",
+                    )),
+                },
+                true,
+                cx,
+            );
+            return;
+        };
+
+        self.is_fetching_submissions = true;
+        self.upsert_submissions_item(
+            CommandOutputItem {
+                label: "Submissions".into(),
+                status: CommandOutputItemStatus::Pending,
+                detail: Some(CommandOutputDetail::new("Fetching AtCoder submissions...")),
+            },
+            true,
+            cx,
+        );
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let atcoder_user = atcoder_user.clone();
+                    let problem = problem.clone();
+                    async move {
+                        fetcher::fetch_problem_submissions(
+                            &atcoder_user,
+                            &problem,
+                            SUBMISSION_FETCH_LIMIT,
+                        )
+                    }
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                this.is_fetching_submissions = false;
+                let has_ac = result.as_ref().is_ok_and(|submissions| {
+                    submissions
+                        .iter()
+                        .any(|submission| submission.verdict.trim() == "AC")
+                });
+                let item = submissions_output_item(&atcoder_user, &problem, result);
+                this.upsert_submissions_item(item, true, cx);
+                if has_ac {
+                    this.finish_practice_session(cx);
+                }
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn refresh_submissions(
+        &mut self,
+        _: &RefreshSubmissions,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fetch_submissions(cx);
     }
 
     fn run_samples(&mut self, _: &RunSamples, window: &mut Window, cx: &mut Context<Self>) {
@@ -1335,6 +1584,9 @@ impl RpracticeView {
                 match id {
                     "rpractice-run-samples" => this.run_samples(&RunSamples, window, cx),
                     "rpractice-submit" => this.submit_solution(&SubmitSolution, window, cx),
+                    "rpractice-submissions" => {
+                        this.refresh_submissions(&RefreshSubmissions, window, cx)
+                    }
                     _ => {}
                 }
             }))
@@ -2865,6 +3117,7 @@ impl RpracticeView {
 
     fn render_command_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_command_running = self.command_status.is_running();
+        let is_submissions_running = self.is_fetching_submissions;
         let mut chips = Vec::new();
         for (index, item) in self.command_output.items.iter().enumerate() {
             chips.push(self.render_step_chip(index, item, cx).into_any_element());
@@ -2913,6 +3166,13 @@ impl RpracticeView {
                                 IconName::Send,
                                 "Send",
                                 is_command_running,
+                                cx,
+                            ))
+                            .child(self.render_action_button(
+                                "rpractice-submissions",
+                                IconName::RotateCw,
+                                "Submissions",
+                                is_command_running || is_submissions_running,
                                 cx,
                             )),
                     ),
@@ -3300,6 +3560,7 @@ impl Render for RpracticeView {
             .bg(cx.theme().colors().editor_background)
             .on_action(cx.listener(Self::run_samples))
             .on_action(cx.listener(Self::submit_solution))
+            .on_action(cx.listener(Self::refresh_submissions))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::confirm_rename))

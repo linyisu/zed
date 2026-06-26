@@ -21,6 +21,7 @@ log.workspace = true
 markdown.workspace = true
 menu.workspace = true
 project.workspace = true
+rcontest.workspace = true
 schemars.workspace = true
 search.workspace = true
 serde.workspace = true

@@ -14,16 +14,14 @@ path = "src/rduel_server.rs"
 
 [dependencies]
 anyhow.workspace = true
-async-compression.workspace = true
 axum = { version = "0.6", features = ["json"] }
 clap = { workspace = true, features = ["derive"] }
 env_logger.workspace = true
 futures-lite.workspace = true
-html_to_markdown.workspace = true
 log.workspace = true
 rand.workspace = true
+rcontest.workspace = true
 reqwest.workspace = true
-scraper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlez.workspace = true

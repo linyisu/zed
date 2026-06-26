@@ -14,18 +14,10 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use html_to_markdown::{
-    HandleTag, HtmlElement, MarkdownWriter, StartTagOutcome, TagHandler, convert_html_to_markdown,
-    markdown,
-};
 use rand::prelude::IndexedRandom;
 use reqwest::header::COOKIE;
-use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection};
-use std::cell::RefCell;
-use std::rc::Rc;
-use time::{OffsetDateTime, format_description::FormatItem};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, interval, sleep_until};
 use uuid::Uuid;
@@ -378,7 +370,9 @@ fn normalized_history_limit(limit: usize) -> usize {
 fn history_entry_from_room(room: Room) -> MatchHistoryEntry {
     let [player1, player2] = room.players.clone();
     // Store clean title without problem_id prefix and without 「」 symbols
-    let clean_title = room.problem.title
+    let clean_title = room
+        .problem
+        .title
         .strip_prefix(&format!("{} ", room.problem.id))
         .unwrap_or(&room.problem.title)
         .trim_start_matches('「')
@@ -1521,7 +1515,7 @@ async fn fetch_user_submissions(
         ),
     };
 
-    let contest_id = contest_id_from_problem_id(&problem.id)
+    let contest_id = rcontest::contest_id_from_problem_id(&problem.id)
         .with_context(|| format!("deriving AtCoder contest from problem {}", problem.id))?;
     let client = reqwest::Client::builder()
         .redirect_policy(reqwest::redirect::Policy::none())
@@ -1560,7 +1554,8 @@ async fn fetch_user_submissions(
             .text()
             .await
             .context("reading AtCoder submissions page")?;
-        let page_submissions = parse_atcoder_submissions_page(&html, &problem.id)?;
+        let page_submissions =
+            rcontest::parse_atcoder_submissions_page(&html, &contest_id, &problem.id)?;
         if page_submissions.is_empty() {
             break;
         }
@@ -1569,70 +1564,20 @@ async fn fetch_user_submissions(
         let page_is_all_old = page_submissions
             .iter()
             .all(|submission| submission.epoch_second < started_at_second);
-        submissions.extend(page_submissions);
+        submissions.extend(
+            page_submissions
+                .into_iter()
+                .map(|submission| AtCoderSubmission {
+                    id: submission.id,
+                    epoch_second: submission.epoch_second,
+                    problem_id: problem.id.clone(),
+                    result: submission.verdict,
+                    source_code: None,
+                }),
+        );
         if page_is_all_old {
             break;
         }
-    }
-
-    Ok(submissions)
-}
-
-fn contest_id_from_problem_id(problem_id: &str) -> Option<&str> {
-    problem_id.split_once('_').map(|(contest_id, _)| contest_id)
-}
-
-fn parse_atcoder_submissions_page(
-    html: &str,
-    problem_id: &str,
-) -> anyhow::Result<Vec<AtCoderSubmission>> {
-    let document = Html::parse_document(html);
-    let row_selector = html_selector("table.table-bordered tbody tr")?;
-    let time_selector = html_selector("td:first-child time")?;
-    let result_selector = html_selector("td:nth-child(7) span")?;
-    let details_selector = html_selector("td:last-child a.submission-details-link")?;
-    let time_format = time::format_description::parse(
-        "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour][offset_minute]",
-    )
-    .context("building AtCoder submission time parser")?;
-
-    let mut submissions = Vec::new();
-    for row in document.select(&row_selector) {
-        let Some(details) = row.select(&details_selector).next() else {
-            continue;
-        };
-        let Some(href) = details.value().attr("href") else {
-            continue;
-        };
-        let Ok(id) = href
-            .split('/')
-            .next_back()
-            .unwrap_or_default()
-            .parse::<i64>()
-        else {
-            continue;
-        };
-
-        let Some(time) = row.select(&time_selector).next() else {
-            continue;
-        };
-        let time_text = time.text().collect::<String>();
-        let Ok(epoch_second) = parse_atcoder_submission_time(time_text.trim(), &time_format) else {
-            continue;
-        };
-        let result = row
-            .select(&result_selector)
-            .next()
-            .map(|element| element.text().collect::<String>())
-            .unwrap_or_default();
-
-        submissions.push(AtCoderSubmission {
-            id,
-            epoch_second,
-            problem_id: problem_id.to_string(),
-            result,
-            source_code: None,
-        });
     }
 
     Ok(submissions)
@@ -1644,71 +1589,11 @@ async fn fetch_submission_source(
     atcoder_revel_session: Option<&str>,
     rate_limiter: &RateLimiter,
 ) -> anyhow::Result<String> {
-    let revel_session = match atcoder_revel_session {
-        Some(revel_session) if !revel_session.trim().is_empty() => revel_session,
-        _ => anyhow::bail!(
-            "AtCoder REVEL_SESSION is not configured; skipping AtCoder submission source fetch"
-        ),
-    };
-    let contest_id = contest_id_from_problem_id(&problem.id)
+    let contest_id = rcontest::contest_id_from_problem_id(&problem.id)
         .with_context(|| format!("deriving AtCoder contest from problem {}", problem.id))?;
-    let url = format!("https://atcoder.jp/contests/{contest_id}/submissions/{submission_id}");
-    let client = reqwest::Client::builder()
-        .redirect_policy(reqwest::redirect::Policy::none())
-        .user_agent("rduel-server/0.1")
-        .timeout(Duration::from_secs(8))
-        .build()
-        .context("building AtCoder submission source HTTP client")?;
-
     rate_limiter.acquire().await;
-    let response = client
-        .get(&url)
-        .header(COOKIE, format!("REVEL_SESSION={}", revel_session.trim()))
-        .send()
+    rcontest::fetch_atcoder_submission_source(contest_id, submission_id, atcoder_revel_session)
         .await
-        .with_context(|| format!("requesting AtCoder submission page {url}"))?;
-    if response.status().is_redirection() {
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("unknown");
-        anyhow::bail!(
-            "AtCoder redirected submission source request to {location}; login session may be invalid"
-        );
-    }
-    let response = response
-        .error_for_status()
-        .context("AtCoder submission source page returned an error status")?;
-    let html = response
-        .text()
-        .await
-        .context("reading AtCoder submission source page")?;
-    parse_atcoder_submission_source_page(&html)
-}
-
-fn parse_atcoder_submission_source_page(html: &str) -> anyhow::Result<String> {
-    let document = Html::parse_document(html);
-    let selector = html_selector("#submission-code")?;
-    let source = document
-        .select(&selector)
-        .next()
-        .map(|element| element.text().collect::<String>())
-        .filter(|source| !source.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("AtCoder submission source block was not found"))?;
-    Ok(source)
-}
-
-fn parse_atcoder_submission_time(
-    time_text: &str,
-    time_format: &[FormatItem],
-) -> anyhow::Result<i64> {
-    Ok(OffsetDateTime::parse(time_text, time_format)?.unix_timestamp())
-}
-
-fn html_selector(selector: &str) -> anyhow::Result<Selector> {
-    Selector::parse(selector)
-        .map_err(|error| anyhow::anyhow!("invalid selector {selector}: {error}"))
 }
 
 enum ApiError {
@@ -1787,45 +1672,21 @@ async fn select_problem(problems: &[Problem]) -> anyhow::Result<Problem> {
 }
 
 async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
-    let statement_url = english_problem_url(&fallback.url);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .build()
-        .context("building AtCoder problem HTTP client")?;
-    let html = client
-        .get(&statement_url)
-        .send()
-        .await
-        .with_context(|| format!("requesting AtCoder problem statement {statement_url}"))?
-        .error_for_status()
-        .context("AtCoder returned an error status")?
-        .text()
-        .await
-        .context("reading AtCoder problem HTML")?;
+    let detail = rcontest::fetch_problem_detail_async(&fallback.url).await?;
 
-    let statement_html =
-        extract_task_statement_html(&html).context("AtCoder task statement was not found")?;
-    let statement_html = rewrite_math_pre_blocks(&statement_html);
-    let statement_html = wrap_var_tags_as_math(&statement_html);
-    let mut handlers = markdown_handlers();
-    let statement_markdown = convert_html_to_markdown(statement_html.as_bytes(), &mut handlers)
-        .context("converting AtCoder statement to Markdown")?;
-    let statement_markdown = prefer_english_statement(statement_markdown);
-    let statement_markdown = repair_empty_markdown_list_items(&statement_markdown);
-    let statement_markdown = trim_code_fence_trailing_blanks(&statement_markdown);
-    let samples = extract_markdown_samples(&statement_markdown);
-    let samples = if samples.is_empty() {
-        extract_html_samples(&statement_html)
-    } else {
-        samples
-    };
-
-    if let Some(title) = extract_problem_title(&html) {
+    if let Some(title) = detail.title {
         fallback.title = format_problem_display_title(&fallback.id, &title);
     }
-    fallback.statement_markdown = statement_markdown;
-    if !samples.is_empty() {
-        fallback.samples = samples;
+    fallback.statement_markdown = detail.statement_markdown;
+    if !detail.samples.is_empty() {
+        fallback.samples = detail
+            .samples
+            .into_iter()
+            .map(|sample| Sample {
+                input: sample.input,
+                output: sample.output,
+            })
+            .collect();
     }
     Ok(fallback)
 }
@@ -1833,400 +1694,31 @@ async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
 fn fallback_statement_markdown(problem: &Problem) -> String {
     format!(
         "## Problem Statement\n\nCould not fetch the AtCoder statement before matchmaking completed.\n\n[Open the problem on AtCoder]({})\n",
-        english_problem_url(&problem.url)
+        rcontest::english_problem_url(&problem.url)
     )
-}
-
-fn english_problem_url(problem_url: &str) -> String {
-    if problem_url.contains('?') {
-        format!("{problem_url}&lang=en")
-    } else {
-        format!("{problem_url}?lang=en")
-    }
-}
-
-fn prefer_english_statement(markdown: String) -> String {
-    for marker in ["Score :", "### Problem Statement", "## Problem Statement"] {
-        if let Some(index) = markdown.find(marker) {
-            return markdown[index..].trim_start().to_string();
-        }
-    }
-    markdown
-}
-
-fn repair_empty_markdown_list_items(markdown: &str) -> String {
-    let lines = markdown.lines().collect::<Vec<_>>();
-    let mut output = Vec::with_capacity(lines.len());
-    let mut index = 0;
-
-    while index < lines.len() {
-        if lines[index].trim() == "-"
-            && index + 2 < lines.len()
-            && lines[index + 1].trim().is_empty()
-            && !lines[index + 2].trim().is_empty()
-        {
-            output.push(format!("- {}", lines[index + 2].trim_start()));
-            index += 3;
-        } else {
-            output.push(lines[index].to_string());
-            index += 1;
-        }
-    }
-
-    let mut repaired = output.join("\n");
-    if markdown.ends_with('\n') {
-        repaired.push('\n');
-    }
-    repaired
-}
-
-fn extract_problem_title(html: &str) -> Option<String> {
-    let title = extract_html_title(html)?;
-    let title = html_unescape(title.trim());
-    let title = title
-        .split_once(" - ")
-        .map_or(title.as_str(), |(_, title)| title)
-        .trim()
-        .to_string();
-    if title.is_empty() { None } else { Some(title) }
 }
 
 fn format_problem_display_title(_problem_id: &str, title: &str) -> String {
     format!("「{title}」")
 }
 
-fn extract_html_title(html: &str) -> Option<&str> {
-    let title_start = html.find("<title>")? + "<title>".len();
-    let title_end = html[title_start..].find("</title>")? + title_start;
-    Some(&html[title_start..title_end])
-}
-
-fn wrap_var_tags_as_math(html: &str) -> String {
-    let mut output = String::with_capacity(html.len());
-    let mut remaining = html;
-
-    while let Some(open_start) = remaining.find("<var") {
-        output.push_str(&remaining[..open_start]);
-        let after_open_start = &remaining[open_start..];
-        let Some(open_end) = after_open_start.find('>') else {
-            output.push_str(after_open_start);
-            return output;
-        };
-        let content_start = open_start + open_end + 1;
-        let after_content_start = &remaining[content_start..];
-        let Some(close_start) = after_content_start.find("</var>") else {
-            output.push_str(after_open_start);
-            return output;
-        };
-
-        let raw_math = &remaining[content_start..content_start + close_start];
-        let math = html_unescape(raw_math);
-        output.push('$');
-        output.push_str(&math.trim().replace('$', "\\$"));
-        output.push('$');
-        remaining = &after_content_start[close_start + "</var>".len()..];
-    }
-
-    output.push_str(remaining);
-    output
-}
-
-fn rewrite_math_pre_blocks(html: &str) -> String {
-    let mut output = String::with_capacity(html.len());
-    let mut remaining = html;
-
-    while let Some(pre_start) = remaining.find("<pre") {
-        output.push_str(&remaining[..pre_start]);
-        let pre_block = &remaining[pre_start..];
-        let Some(open_end) = pre_block.find('>') else {
-            output.push_str(pre_block);
-            return output;
-        };
-        let after_open = &pre_block[open_end + 1..];
-        let Some(close_start) = after_open.find("</pre>") else {
-            output.push_str(pre_block);
-            return output;
-        };
-
-        let raw_content = &after_open[..close_start];
-        let block_end = open_end + 1 + close_start + "</pre>".len();
-        if raw_content.contains("<var") {
-            for line in raw_content.trim_matches('\n').lines() {
-                let line = line.trim_end();
-                if line.is_empty() {
-                    continue;
-                }
-                output.push_str("<p>");
-                output.push_str(line);
-                output.push_str("</p>");
-            }
-        } else {
-            output.push_str(&pre_block[..block_end]);
-        }
-        remaining = &pre_block[block_end..];
-    }
-
-    output.push_str(remaining);
-    output
-}
-
-fn markdown_handlers() -> Vec<TagHandler> {
-    vec![
-        Rc::new(RefCell::new(markdown::WebpageChromeRemover)),
-        Rc::new(RefCell::new(markdown::ParagraphHandler)),
-        Rc::new(RefCell::new(markdown::HeadingHandler)),
-        Rc::new(RefCell::new(markdown::ListHandler)),
-        Rc::new(RefCell::new(markdown::StyledTextHandler)),
-        Rc::new(RefCell::new(markdown::CodeHandler)),
-        Rc::new(RefCell::new(markdown::TableHandler::new())),
-        Rc::new(RefCell::new(ImageHandler)),
-    ]
-}
-
-/// Emits `<img>` tags as Markdown images; the built-in handlers drop them, which
-/// is why AtCoder statement figures were disappearing.
-struct ImageHandler;
-
-impl HandleTag for ImageHandler {
-    fn should_handle(&self, tag: &str) -> bool {
-        tag == "img"
-    }
-
-    fn handle_tag_start(
-        &mut self,
-        tag: &HtmlElement,
-        writer: &mut MarkdownWriter,
-    ) -> StartTagOutcome {
-        if let Some(src) = tag.attr("src") {
-            let src = absolutize_atcoder_url(src.trim());
-            let alt = tag.attr("alt").unwrap_or_default();
-            writer.push_str(&format!("![{}]({})", alt.trim(), src));
-        }
-        StartTagOutcome::Continue
-    }
-}
-
-/// Resolves AtCoder statement image URLs (often protocol-relative or root-relative)
-/// to absolute URLs the client can fetch.
-fn absolutize_atcoder_url(src: &str) -> String {
-    if src.starts_with("http://") || src.starts_with("https://") {
-        src.to_string()
-    } else if let Some(rest) = src.strip_prefix("//") {
-        format!("https://{rest}")
-    } else if src.starts_with('/') {
-        format!("https://atcoder.jp{src}")
-    } else {
-        format!("https://atcoder.jp/{src}")
-    }
-}
-
-fn extract_task_statement_html(html: &str) -> Option<String> {
-    let marker = "id=\"task-statement\"";
-    let marker_index = html.find(marker)?;
-    let section_start = html[..marker_index].rfind("<div")?;
-    extract_balanced_element(html, section_start)
-}
-
-fn extract_balanced_element(html: &str, start: usize) -> Option<String> {
-    let tag_end = html[start..].find('>').map(|offset| start + offset)?;
-    let tag = &html[start + 1..tag_end];
-    let tag_name = tag.split_whitespace().next()?;
-    let open_tag = format!("<{tag_name}");
-    let close_tag = format!("</{tag_name}>");
-    let mut depth = 1usize;
-    let mut cursor = tag_end + 1;
-
-    while depth > 0 {
-        let next_open = html[cursor..].find(&open_tag).map(|offset| cursor + offset);
-        let next_close = html[cursor..]
-            .find(&close_tag)
-            .map(|offset| cursor + offset)?;
-        match next_open {
-            Some(next_open) if next_open < next_close => {
-                depth += 1;
-                cursor = next_open + open_tag.len();
-            }
-            _ => {
-                depth -= 1;
-                cursor = next_close + close_tag.len();
-            }
-        }
-    }
-
-    Some(html[start..cursor].to_string())
-}
-
-fn extract_markdown_samples(markdown: &str) -> Vec<Sample> {
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-    let mut lines = markdown.lines();
-
-    while let Some(line) = lines.next() {
-        let is_input = line.contains("Sample Input") || line.contains("入力例");
-        let is_output = line.contains("Sample Output") || line.contains("出力例");
-        if !is_input && !is_output {
-            continue;
-        }
-
-        let Some(block) = next_fenced_code_block(&mut lines) else {
-            continue;
-        };
-        if is_input {
-            inputs.push(block);
-        } else {
-            outputs.push(block);
-        }
-    }
-
-    let mut samples = inputs
-        .into_iter()
-        .zip(outputs)
-        .map(|(input, output)| Sample {
-            input: normalize_sample(input),
-            output: normalize_sample(output),
-        })
-        .collect::<Vec<_>>();
-    samples.dedup_by(|left, right| left.input == right.input && left.output == right.output);
-    samples
-}
-
-/// Drops the blank lines AtCoder leaves before a closing ``` fence so sample
-/// blocks in the rendered statement don't show a trailing empty line.
-fn trim_code_fence_trailing_blanks(markdown: &str) -> String {
-    let had_trailing_newline = markdown.ends_with('\n');
-    let mut output: Vec<String> = Vec::new();
-    let mut in_fence = false;
-    for line in markdown.lines() {
-        let is_fence = line.trim_start().starts_with("```");
-        if is_fence && in_fence {
-            while output.last().is_some_and(|last| last.trim().is_empty()) {
-                output.pop();
-            }
-            in_fence = false;
-        } else if is_fence {
-            in_fence = true;
-        }
-        output.push(line.to_string());
-    }
-    let mut result = output.join("\n");
-    if had_trailing_newline {
-        result.push('\n');
-    }
-    result
-}
-
-fn next_fenced_code_block<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Option<String> {
-    for line in lines.by_ref() {
-        if line.trim_start().starts_with("```") {
-            break;
-        }
-    }
-
-    let mut block = String::new();
-    for line in lines.by_ref() {
-        if line.trim_start().starts_with("```") {
-            return Some(block);
-        }
-        block.push_str(line);
-        block.push('\n');
-    }
-    None
-}
-
-fn extract_html_samples(statement_html: &str) -> Vec<Sample> {
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-    let mut remaining = statement_html;
-
-    while let Some(pre_start) = remaining.find("<pre") {
-        remaining = &remaining[pre_start..];
-        let Some(tag_end) = remaining.find('>') else {
-            break;
-        };
-        let after_tag = &remaining[tag_end + 1..];
-        let Some(pre_end) = after_tag.find("</pre>") else {
-            break;
-        };
-        let value = html_unescape(after_tag[..pre_end].trim());
-        let before_pre = &statement_html[..statement_html.len() - remaining.len()];
-        let context = before_pre
-            .chars()
-            .rev()
-            .take(240)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
-        if context.contains("Sample Input") || context.contains("入力例") {
-            inputs.push(value);
-        } else if context.contains("Sample Output") || context.contains("出力例") {
-            outputs.push(value);
-        }
-        remaining = &after_tag[pre_end + "</pre>".len()..];
-    }
-
-    let mut samples = inputs
-        .into_iter()
-        .zip(outputs)
-        .map(|(input, output)| Sample {
-            input: normalize_sample(input),
-            output: normalize_sample(output),
-        })
-        .collect::<Vec<_>>();
-    samples.dedup_by(|left, right| left.input == right.input && left.output == right.output);
-    samples
-}
-
-/// Trims trailing whitespace/newlines from a sample so editors and on-disk test
-/// files don't carry the stray blank lines AtCoder's `<pre>` blocks include.
-fn normalize_sample(text: String) -> String {
-    text.trim_end().to_string()
-}
-
-fn html_unescape(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-}
-
 fn load_atcoder_revel_session(session_file: Option<&FsPath>) -> anyhow::Result<Option<String>> {
-    if let Ok(revel_session) = std::env::var("ATCODER_REVEL_SESSION")
-        && !revel_session.trim().is_empty()
-    {
-        return Ok(Some(revel_session.trim().to_string()));
-    }
-
-    let path = match session_file {
-        Some(path) => path.to_path_buf(),
-        None => default_atcoder_revel_session_path()
-            .context("could not resolve default AtCoder session file path")?,
-    };
-    if !path.exists() {
+    let revel_session = rcontest::load_atcoder_revel_session(session_file)?;
+    if revel_session.is_none() {
+        let path_hint = session_file
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| {
+                rcontest::default_atcoder_revel_session_paths()
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
         log::warn!(
-            "AtCoder session file {} does not exist; submission polling will be disabled",
-            path.display()
+            "AtCoder session is not configured in {path_hint}; submission polling will be disabled"
         );
-        return Ok(None);
     }
-
-    let revel_session = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading AtCoder session file {}", path.display()))?
-        .trim()
-        .to_string();
-    if revel_session.is_empty() {
-        log::warn!(
-            "AtCoder session file {} is empty; submission polling will be disabled",
-            path.display()
-        );
-        return Ok(None);
-    }
-    Ok(Some(revel_session))
-}
-
-fn default_atcoder_revel_session_path() -> Option<PathBuf> {
-    Some(PathBuf::from("crates/rduel_server/atcoder_revel_session"))
+    Ok(revel_session)
 }
 
 fn load_problem_pool(path: &PathBuf) -> anyhow::Result<Vec<Problem>> {
@@ -2431,7 +1923,7 @@ mod tests {
                     <tr>
                         <td><time>2026-06-22 01:20:03+0900</time></td>
                         <td>user</td>
-                        <td>task</td>
+                        <td><a href="/contests/abc001/tasks/abc001_a">A - Test</a></td>
                         <td><a>Rust</a></td>
                         <td>200</td>
                         <td>1024 Byte</td>
@@ -2443,57 +1935,13 @@ mod tests {
             </table>
         "#;
 
-        let submissions = parse_atcoder_submissions_page(html, "abc001_a").unwrap();
+        let submissions =
+            rcontest::parse_atcoder_submissions_page(html, "abc001", "abc001_a").unwrap();
 
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].id, 12345);
-        assert_eq!(submissions[0].problem_id, "abc001_a");
-        assert_eq!(submissions[0].result, "AC");
+        assert_eq!(submissions[0].verdict, "AC");
         assert_eq!(submissions[0].epoch_second, 1782058803);
-    }
-
-    #[test]
-    fn repairs_empty_markdown_list_items() {
-        let markdown = [
-            "The game proceeds as follows:",
-            "- ",
-            "",
-            "$6$ is not written on the sheet.",
-            "- ",
-            "",
-            "$2$ is not written on the sheet.",
-            "",
-        ]
-        .join("\n");
-
-        assert_eq!(
-            repair_empty_markdown_list_items(&markdown),
-            [
-                "The game proceeds as follows:",
-                "- $6$ is not written on the sheet.",
-                "- $2$ is not written on the sheet.",
-                "",
-            ]
-            .join("\n")
-        );
-    }
-
-    #[test]
-    fn trims_var_math_before_wrapping_as_markdown_math() {
-        let html = "<p>For the first query, <var>S_3S_4\\ldots S_9 = </var> ssissip.</p>";
-
-        assert_eq!(
-            wrap_var_tags_as_math(html),
-            "<p>For the first query, $S_3S_4\\ldots S_9 =$ ssissip.</p>"
-        );
-    }
-
-    #[test]
-    fn extracts_problem_title() {
-        assert_eq!(
-            extract_problem_title("<html><head><title>C - Write and Erase</title></head></html>"),
-            Some("Write and Erase".to_string())
-        );
     }
 
     #[test]

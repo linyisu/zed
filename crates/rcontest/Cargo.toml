@@ -1,0 +1,24 @@
+[package]
+name = "rcontest"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/rcontest.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-compression.workspace = true
+futures.workspace = true
+html_to_markdown.workspace = true
+reqwest.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["full"] }
