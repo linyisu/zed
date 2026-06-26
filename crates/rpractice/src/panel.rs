@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use gpui::{prelude::*, actions, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render, WeakEntity};
+use std::path::PathBuf;
 use ui::prelude::*;
 use workspace::{Workspace, dock::{Panel, PanelEvent, DockPosition}};
 
@@ -68,13 +69,21 @@ impl RpracticePanel {
         ]
     }
 
-    fn render_problem_item(&self, problem: &Problem) -> impl IntoElement {
+    fn render_problem_item(&self, problem: &Problem, cx: &Context<Self>) -> impl IntoElement {
+        let problem_id = problem.id.clone();
+        let problem_url = problem.url.clone();
+        let element_id = format!("problem-item-{}", problem.id);
+
         h_flex()
+            .id(element_id)
             .w_full()
             .p_2()
             .gap_2()
             .hover(|style| style.bg(gpui::rgb(0x2a2a2a)))
             .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_problem(problem_id.clone(), problem_url.clone(), window, cx);
+            }))
             .child(
                 div()
                     .w_8()
@@ -91,6 +100,89 @@ impl RpracticePanel {
                             .color(Color::Muted)
                     )
             )
+    }
+
+    fn open_problem(
+        &mut self,
+        problem_id: String,
+        _problem_url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!("Opening problem: {}", problem_id);
+
+        // Parse problem_id (e.g., "abc001_a" -> contest="abc001", task="a")
+        let parts: Vec<&str> = problem_id.split('_').collect();
+        if parts.len() != 2 {
+            log::error!("Invalid problem_id format: {}", problem_id);
+            return;
+        }
+        let contest_id = parts[0];
+        let task_id = parts[1];
+
+        // Create directory structure: ~/.rpractice/{contest}/{task}/
+        let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+            log::error!("Could not determine HOME directory");
+            return;
+        };
+
+        let problem_dir = PathBuf::from(home)
+            .join(".rpractice")
+            .join(contest_id)
+            .join(task_id);
+
+        if let Err(e) = std::fs::create_dir_all(&problem_dir) {
+            log::error!("Failed to create problem directory: {}", e);
+            return;
+        }
+
+        // Create main.rs if it doesn't exist
+        let main_rs = problem_dir.join("main.rs");
+        if !main_rs.exists() {
+            let template = r#"fn main() {
+    // TODO: Implement solution
+}
+"#;
+            if let Err(e) = std::fs::write(&main_rs, template) {
+                log::error!("Failed to create main.rs: {}", e);
+                return;
+            }
+        }
+
+        // Create Cargo.toml if it doesn't exist
+        let cargo_toml = problem_dir.join("Cargo.toml");
+        if !cargo_toml.exists() {
+            let cargo_content = format!(
+                r#"[package]
+name = "{contest_id}-{task_id}"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "{task_id}"
+path = "main.rs"
+"#
+            );
+            if let Err(e) = std::fs::write(&cargo_toml, cargo_content) {
+                log::error!("Failed to create Cargo.toml: {}", e);
+                return;
+            }
+        }
+
+        // Open workspace for this problem directory
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_workspace_for_paths(
+                    workspace::OpenMode::Activate,
+                    vec![problem_dir],
+                    window,
+                    cx,
+                )
+            })
+            .ok();
+
+        // Close the panel
+        cx.emit(PanelEvent::Close);
     }
 }
 
@@ -168,7 +260,7 @@ impl Render for RpracticePanel {
                     .children(
                         self.problems
                             .iter()
-                            .map(|problem| self.render_problem_item(problem))
+                            .map(|problem| self.render_problem_item(problem, _cx))
                     )
             )
     }

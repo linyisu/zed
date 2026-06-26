@@ -7,8 +7,9 @@
 // - fetcher.rs: Problem fetching from AtCoder
 // - storage.rs: SQLite database for progress tracking
 
-use gpui::{actions, App, Context, Window};
+use gpui::{App, Context, Window};
 use workspace::Workspace;
+use zed_actions::rpractice::OpenRpractice;
 
 mod panel;
 // mod view;  // TODO: Fix view.rs (copied from rduel, needs simplification)
@@ -17,8 +18,6 @@ mod storage;
 
 pub use panel::RpracticePanel;
 // pub use view::RpracticeView;
-
-actions!(rpractice, [OpenRpractice]);
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, cx| {
