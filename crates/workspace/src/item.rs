@@ -277,6 +277,9 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     fn is_dirty(&self, _: &App) -> bool {
         false
     }
+    fn confirm_close(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Task<bool> {
+        Task::ready(true)
+    }
     fn capability(&self, _: &App) -> Capability {
         Capability::ReadWrite
     }
@@ -529,6 +532,7 @@ pub trait ItemHandle: 'static + Send {
     fn item_id(&self) -> EntityId;
     fn to_any_view(&self) -> AnyView;
     fn is_dirty(&self, cx: &App) -> bool;
+    fn confirm_close(&self, window: &mut Window, cx: &mut App) -> Task<bool>;
     fn capability(&self, cx: &App) -> Capability;
     fn toggle_read_only(&self, window: &mut Window, cx: &mut App);
     fn has_deleted_file(&self, cx: &App) -> bool;
@@ -1040,6 +1044,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn is_dirty(&self, cx: &App) -> bool {
         self.read(cx).is_dirty(cx)
+    }
+
+    fn confirm_close(&self, window: &mut Window, cx: &mut App) -> Task<bool> {
+        self.update(cx, |item, cx| item.confirm_close(window, cx))
     }
 
     fn capability(&self, cx: &App) -> Capability {

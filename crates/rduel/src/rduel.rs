@@ -168,6 +168,19 @@ fn open_rduel(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
     });
 }
 
+fn open_rduel_rematch(
+    workspace: &mut Workspace,
+    target: WeakEntity<RduelView>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    cleanup_legacy_rduel_worktree(workspace, cx);
+    let workspace_handle = cx.entity().downgrade();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        RduelMatchModal::new_for_rematch(workspace_handle, target, window, cx)
+    });
+}
+
 fn open_rduel_history(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let workspace_handle = cx.entity().downgrade();
     workspace.toggle_modal(window, cx, |_, cx| {
@@ -231,6 +244,26 @@ fn hide_modal(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Ap
 fn open_rduel_session(
     workspace: WeakEntity<Workspace>,
     session: RduelSession,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_rduel_session_with_target(workspace, session, None, window, cx);
+}
+
+fn open_rduel_session_replacing(
+    workspace: WeakEntity<Workspace>,
+    target: WeakEntity<RduelView>,
+    session: RduelSession,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_rduel_session_with_target(workspace, session, Some(target), window, cx);
+}
+
+fn open_rduel_session_with_target(
+    workspace: WeakEntity<Workspace>,
+    session: RduelSession,
+    target: Option<WeakEntity<RduelView>>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -301,6 +334,87 @@ fn open_rduel_session(
             };
             let fallback_rust = language_registry.language_for_name("Rust").await.log_err();
             let fallback_toml = language_registry.language_for_name("TOML").await.log_err();
+
+            if let Some(target) = target.as_ref() {
+                target
+                    .update(cx, |this, cx| {
+                        this.leave_active_match(cx);
+                    })
+                    .log_err();
+            }
+
+            let mut open_buffers: collections::HashSet<Entity<Buffer>> = Default::default();
+            if let Some(buffer) = main_rs_buffer.clone() {
+                open_buffers.insert(buffer);
+            }
+            if let Some(buffer) = cargo_toml_buffer.clone() {
+                open_buffers.insert(buffer);
+            }
+            if !open_buffers.is_empty() {
+                let reload_task = project.update(cx, |project, cx| {
+                    project.reload_buffers(open_buffers, false, cx)
+                });
+                if let Err(error) = reload_task.await {
+                    log::warn!("failed to reload Rduel buffers for new session: {error:#}");
+                }
+            }
+
+            if let Some(target) = target {
+                let session_for_view = session.clone();
+                let workspace_for_view = workspace.clone();
+                let workspace_for_editors = workspace.clone();
+                target
+                    .update_in(cx, |this, window, cx| {
+                        let main_rs_buffer = main_rs_buffer.unwrap_or_else(|| {
+                            let buffer = cx.new(|cx| Buffer::local("", cx));
+                            buffer.update(cx, |buffer, cx| {
+                                if let Some(language) = fallback_rust {
+                                    buffer.set_language(Some(language), cx);
+                                }
+                                buffer.edit([(0..0, STARTER_CODE.to_string())], None, cx);
+                            });
+                            buffer
+                        });
+                        let cargo_toml_buffer = cargo_toml_buffer.unwrap_or_else(|| {
+                            let buffer = cx.new(|cx| Buffer::local("", cx));
+                            buffer.update(cx, |buffer, cx| {
+                                if let Some(language) = fallback_toml {
+                                    buffer.set_language(Some(language), cx);
+                                }
+                                buffer.edit(
+                                    [(0..0, STARTER_ACR_PROBLEM_TOML.to_string())],
+                                    None,
+                                    cx,
+                                );
+                            });
+                            buffer
+                        });
+                        *this = RduelView::new(
+                            workspace_for_view,
+                            project,
+                            rduel_project,
+                            language_registry,
+                            session_for_view,
+                            main_rs_buffer,
+                            cargo_toml_buffer,
+                            window,
+                            cx,
+                        );
+                        workspace_for_editors
+                            .update(cx, |workspace, cx| {
+                                this.main_rs_editor.update(cx, |editor, cx| {
+                                    editor.added_to_workspace(workspace, window, cx);
+                                });
+                                this.cargo_toml_editor.update(cx, |editor, cx| {
+                                    editor.added_to_workspace(workspace, window, cx);
+                                });
+                            })
+                            .log_err();
+                        cx.notify();
+                    })
+                    .log_err();
+                return;
+            }
 
             let session_for_view = session.clone();
             let workspace_for_view = workspace.clone();
@@ -1136,6 +1250,7 @@ impl CommandStatus {
 struct RduelMatchModal {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    rematch_target: Option<WeakEntity<RduelView>>,
     atcoder_user_editor: Entity<Editor>,
     server_url: String,
     player_id: Option<String>,
@@ -1146,6 +1261,24 @@ struct RduelMatchModal {
 
 impl RduelMatchModal {
     fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_target(workspace, None, window, cx)
+    }
+
+    fn new_for_rematch(
+        workspace: WeakEntity<Workspace>,
+        target: WeakEntity<RduelView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_target(workspace, Some(target), window, cx)
+    }
+
+    fn new_with_target(
+        workspace: WeakEntity<Workspace>,
+        rematch_target: Option<WeakEntity<RduelView>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let settings = RduelSettings::get_global(cx);
         let editor_atcoder_user = settings.atcoder_user.trim().to_string();
         let configured_server_url = settings.server_url.trim().to_string();
@@ -1163,6 +1296,7 @@ impl RduelMatchModal {
         Self {
             focus_handle: cx.focus_handle(),
             workspace,
+            rematch_target,
             atcoder_user_editor,
             server_url: configured_server_url,
             player_id: None,
@@ -1303,8 +1437,13 @@ impl RduelMatchModal {
                     is_history: false,
                 };
                 let workspace = self.workspace.clone();
+                let rematch_target = self.rematch_target.clone();
                 hide_modal_and_then(workspace, window, cx, |workspace, window, cx| {
-                    open_rduel_session(workspace, session, window, cx);
+                    if let Some(target) = rematch_target {
+                        open_rduel_session_replacing(workspace, target, session, window, cx);
+                    } else {
+                        open_rduel_session(workspace, session, window, cx);
+                    }
                 });
             }
             Ok(RduelMatchOutput::RoomStatus { .. }) => {}
@@ -3612,9 +3751,6 @@ impl RduelView {
     }
 
     fn start_server_submission_watch(&mut self, cx: &mut Context<Self>) {
-        if self.room.match_state.room_status != ServerRoomStatus::Playing {
-            return;
-        }
         let (Some(room_id), Some(player_id), Some(token), server_url) = (
             self.room.match_state.room_id.clone(),
             self.room.match_state.player_id.clone(),
@@ -3691,7 +3827,7 @@ impl RduelView {
                         detected_submission,
                     }) => {
                         this.update_room_presence(&room);
-                        let is_finished = this.handle_room_status(room, window, cx);
+                        this.handle_room_status(room, window, cx);
                         if let Some(submission) = detected_submission {
                             this.submission_watch_started_at = None;
                             this.upsert_submission_output_item(
@@ -3699,7 +3835,7 @@ impl RduelView {
                                 true,
                                 cx,
                             );
-                        } else if !is_finished {
+                        } else {
                             this.poll_submission_after_delay(
                                 room_id,
                                 player_id,
@@ -3939,6 +4075,12 @@ impl RduelView {
             && self.opponent_main_rs_editor.is_some()
     }
 
+    fn focus_opponent_code_if_available(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.opponent_main_rs_editor.is_some() {
+            self.select_opponent_main_rs(&SelectOpponentMainRs, window, cx);
+        }
+    }
+
     /// Re-renders once per second so the elapsed-time clock advances and a stale
     /// opponent flash is cleared. Stops when the match finishes.
     fn tick_match_timer(&self, cx: &mut Context<Self>) {
@@ -4045,12 +4187,26 @@ impl RduelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let local_won =
+            room.winner_player_id.as_deref() == self.room.match_state.player_id.as_deref();
         self.update_opponent_code_snapshot(&room, window, cx);
         self.add_opponent_solution_if_lost(&room, window, cx);
         self.ensure_opponent_code_editor(&room, window, cx);
         if let Some(message) = self.apply_room_status(room) {
             self.force_upload_code_snapshot(cx);
-            drop(window.prompt(gpui::PromptLevel::Info, &message, None, &["OK"], cx));
+            let answer = window.prompt(gpui::PromptLevel::Info, &message, None, &["OK"], cx);
+            if local_won {
+                cx.spawn_in(window, async move |this, cx| {
+                    answer.await.log_err();
+                    this.update_in(cx, |this, window, cx| {
+                        this.focus_opponent_code_if_available(window, cx);
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            } else {
+                drop(answer);
+            }
         }
         self.room.match_state.room_status == ServerRoomStatus::Finished
     }
@@ -5166,8 +5322,11 @@ impl RduelView {
     }
 
     fn open_rematch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = cx.entity().downgrade();
         self.workspace
-            .update(cx, |workspace, cx| open_rduel(workspace, window, cx))
+            .update(cx, |workspace, cx| {
+                open_rduel_rematch(workspace, target, window, cx)
+            })
             .log_err();
     }
 
@@ -5374,10 +5533,24 @@ impl Item for RduelView {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        // Consider the item dirty if match is still playing to prevent accidental close
-        (self.room.match_state.room_status == ServerRoomStatus::Playing
-            && self.room.match_state.room_id.is_some())
-            || self.has_unsaved_solution_buffers(cx)
+        self.has_unsaved_solution_buffers(cx)
+    }
+
+    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Task<bool> {
+        if self.room.match_state.room_status != ServerRoomStatus::Playing
+            || self.room.match_state.room_id.is_none()
+        {
+            return gpui::Task::ready(true);
+        }
+
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            "Leave this Rduel match?",
+            Some("If you leave now, your opponent may be notified and the match may be recorded as a loss."),
+            &["Leave", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, _| matches!(answer.await, Ok(0)))
     }
 
     fn can_save(&self, _cx: &App) -> bool {

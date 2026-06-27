@@ -1435,9 +1435,7 @@ async fn watch_room_submissions(
         room
     };
 
-    if !matches!(room.status, RoomStatus::Playing)
-        || !room.active_player_ids.contains(&request.player_id)
-    {
+    if !room.active_player_ids.contains(&request.player_id) {
         return Ok(Json(SubmissionCheckResponse {
             room,
             detected_submission: None,
@@ -1462,7 +1460,7 @@ async fn watch_room_submissions(
             .clone()
             .map(PlayerSubmissionRecord::from);
         let room = if let Some(submission) = poll.detected_submission {
-            if submission.result == "AC" {
+            if matches!(room.status, RoomStatus::Playing) && submission.result == "AC" {
                 rooms
                     .apply_submission_ac(&room_id, &request.player_id, submission)
                     .ok_or(ApiError::NotFound("room or player was not found"))?

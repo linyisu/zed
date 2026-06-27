@@ -1979,6 +1979,16 @@ impl Pane {
             return Task::ready(Ok(()));
         };
         cx.spawn_in(window, async move |pane, cx| {
+            let mut confirmed_items_to_close = Vec::new();
+            for item in items_to_close {
+                let should_close =
+                    pane.update_in(cx, |_, window, cx| item.confirm_close(window, cx))?;
+                if should_close.await {
+                    confirmed_items_to_close.push(item);
+                }
+            }
+            let items_to_close = confirmed_items_to_close;
+
             let dirty_items = workspace.update(cx, |workspace, cx| {
                 items_to_close
                     .iter()
