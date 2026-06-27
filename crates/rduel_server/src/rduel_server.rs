@@ -1086,6 +1086,7 @@ struct PlayerSubmissionRecord {
 #[derive(Clone, Deserialize, Serialize)]
 struct PlayerCodeSnapshot {
     captured_at_second: i64,
+    #[serde(default)]
     captured_at_millis: i64,
     main_rs: String,
     cargo_toml: String,
