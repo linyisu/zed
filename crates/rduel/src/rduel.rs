@@ -508,9 +508,16 @@ struct RduelView {
     opponent_flash: Option<OpponentFlash>,
     last_snapshot_upload: Option<Instant>,
     pending_snapshot_upload_started_at: Option<Instant>,
+    last_uploaded_code_snapshot: Option<LocalCodeSnapshot>,
     last_observed_opponent_snapshot_millis: Option<i64>,
     local_code_is_watched: bool,
     submission_watch_started_at: Option<i64>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct LocalCodeSnapshot {
+    main_rs: String,
+    cargo_toml: String,
 }
 
 /// A live snapshot of both players used to render the versus header.
@@ -3040,6 +3047,7 @@ impl RduelView {
             opponent_flash: None,
             last_snapshot_upload: None,
             pending_snapshot_upload_started_at: None,
+            last_uploaded_code_snapshot: None,
             last_observed_opponent_snapshot_millis: None,
             local_code_is_watched: false,
             submission_watch_started_at: None,
@@ -3781,7 +3789,9 @@ impl RduelView {
     }
 
     fn should_keep_polling_room(&self, room: &ServerRoom) -> bool {
-        room.status == ServerRoomStatus::Playing || self.opponent_is_active(room)
+        room.status == ServerRoomStatus::Playing
+            || self.opponent_is_active(room)
+            || self.is_watching_opponent_code()
     }
 
     fn update_local_code_watch_state(&mut self, room: &ServerRoom, cx: &mut Context<Self>) {
@@ -3791,11 +3801,19 @@ impl RduelView {
             .player_id
             .as_ref()
             .is_some_and(|player_id| room.code_watched_player_ids.contains(player_id));
-        let became_watched = is_watched && !self.local_code_is_watched;
         self.local_code_is_watched = is_watched;
-        if became_watched {
+        if is_watched && self.local_code_snapshot_has_changed(cx) {
             self.upload_code_snapshot(cx);
         }
+    }
+
+    fn local_code_snapshot_has_changed(&self, cx: &App) -> bool {
+        self.last_uploaded_code_snapshot
+            .as_ref()
+            .is_none_or(|snapshot| {
+                snapshot.main_rs != self.main_rs_buffer.read(cx).text()
+                    || snapshot.cargo_toml != self.cargo_toml_buffer.read(cx).text()
+            })
     }
 
     fn update_opponent_code_snapshot(
@@ -3842,12 +3860,6 @@ impl RduelView {
             );
             self.opponent_main_rs_buffer = Some(buffer);
             self.opponent_main_rs_editor = Some(editor);
-        }
-    }
-
-    fn focus_opponent_code_if_available(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.opponent_main_rs_editor.is_some() {
-            self.select_opponent_main_rs(&SelectOpponentMainRs, window, cx);
         }
     }
 
@@ -4038,15 +4050,7 @@ impl RduelView {
         self.ensure_opponent_code_editor(&room, window, cx);
         if let Some(message) = self.apply_room_status(room) {
             self.force_upload_code_snapshot(cx);
-            let answer = window.prompt(gpui::PromptLevel::Info, &message, None, &["OK"], cx);
-            cx.spawn_in(window, async move |this, cx| {
-                answer.await.log_err();
-                this.update_in(cx, |this, window, cx| {
-                    this.focus_opponent_code_if_available(window, cx);
-                })?;
-                anyhow::Ok(())
-            })
-            .detach_and_log_err(cx);
+            drop(window.prompt(gpui::PromptLevel::Info, &message, None, &["OK"], cx));
         }
         self.room.match_state.room_status == ServerRoomStatus::Finished
     }
@@ -4208,17 +4212,27 @@ impl RduelView {
             return;
         };
 
-        if let Some(last_upload) = self.last_snapshot_upload {
+        let main_rs = self.main_rs_buffer.read(cx).text();
+        let cargo_toml = self.cargo_toml_buffer.read(cx).text();
+        let snapshot = LocalCodeSnapshot {
+            main_rs: main_rs.clone(),
+            cargo_toml: cargo_toml.clone(),
+        };
+        if !force && self.last_uploaded_code_snapshot.as_ref() == Some(&snapshot) {
+            self.pending_snapshot_upload_started_at = None;
+            return;
+        }
+
+        if !force && let Some(last_upload) = self.last_snapshot_upload {
             if last_upload.elapsed() < CODE_SNAPSHOT_MIN_INTERVAL {
                 return;
             }
         }
 
         self.last_snapshot_upload = Some(Instant::now());
+        self.last_uploaded_code_snapshot = Some(snapshot);
         self.pending_snapshot_upload_started_at = None;
         let server_url = self.room.match_state.server_url.clone();
-        let main_rs = self.main_rs_buffer.read(cx).text();
-        let cargo_toml = self.cargo_toml_buffer.read(cx).text();
         cx.spawn(async move |_, cx| {
             let result = cx
                 .background_spawn(async move {
