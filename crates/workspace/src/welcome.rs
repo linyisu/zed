@@ -193,7 +193,7 @@ const CONTENT: (Section<7>, Section<3>) = (
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
-                icon: IconName::Code,
+                icon: IconName::ListTodo,
                 title: "Open Rpractice",
                 action: &OpenRpractice,
                 visibility_guard: SectionVisibility::Always,
