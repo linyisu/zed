@@ -1105,6 +1105,8 @@ struct Problem {
     url: String,
     statement_markdown: String,
     samples: Vec<Sample>,
+    #[serde(default)]
+    source_key: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1143,11 +1145,30 @@ impl From<AtCoderSubmission> for PlayerSubmissionRecord {
 }
 
 #[derive(Deserialize)]
-struct ProblemConfig {
+#[serde(untagged)]
+enum ProblemConfigFile {
+    Single(ContestProblemConfig),
+    Multiple { contests: Vec<ContestProblemConfig> },
+    List(Vec<ContestProblemConfig>),
+}
+
+#[derive(Deserialize)]
+struct ContestProblemConfig {
     contest_prefix: String,
-    contest_start: u32,
-    contest_end: u32,
+    #[serde(default)]
+    contest_range: Option<String>,
+    #[serde(default)]
+    contest_start: Option<ContestNumberEndpoint>,
+    #[serde(default)]
+    contest_end: Option<ContestNumberEndpoint>,
     tasks: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ContestNumberEndpoint {
+    Number(u32),
+    Text(String),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1726,9 +1747,7 @@ async fn select_problem(problems: &[Problem]) -> anyhow::Result<Problem> {
     let mut last_error = None;
     let mut fallback_problem = None;
     for _ in 0..attempts {
-        let problem_seed = problems
-            .choose(&mut rand::rng())
-            .cloned()
+        let problem_seed = choose_problem_seed(problems)
             .context("Rduel server must have at least one configured problem")?;
         fallback_problem = Some(problem_seed.clone());
         match fetch_problem(problem_seed.clone()).await {
@@ -1759,6 +1778,31 @@ async fn select_problem(problems: &[Problem]) -> anyhow::Result<Problem> {
     }
     problem.statement_markdown = fallback_statement_markdown(&problem);
     Ok(problem)
+}
+
+fn choose_problem_seed(problems: &[Problem]) -> Option<Problem> {
+    let mut problem_sources: HashMap<&str, Vec<&Problem>> = HashMap::new();
+    for problem in problems {
+        if problem.source_key.trim().is_empty() {
+            continue;
+        }
+        problem_sources
+            .entry(problem.source_key.as_str())
+            .or_default()
+            .push(problem);
+    }
+
+    let mut rng = rand::rng();
+    if problem_sources.is_empty() {
+        return problems.choose(&mut rng).cloned();
+    }
+
+    problem_sources
+        .values()
+        .collect::<Vec<_>>()
+        .choose(&mut rng)
+        .and_then(|source_problems| source_problems.choose(&mut rng))
+        .map(|problem| (*problem).clone())
 }
 
 async fn fetch_problem(mut fallback: Problem) -> anyhow::Result<Problem> {
@@ -1814,22 +1858,16 @@ fn load_atcoder_revel_session(session_file: Option<&FsPath>) -> anyhow::Result<O
 fn load_problem_pool(path: &PathBuf) -> anyhow::Result<Vec<Problem>> {
     let config_text = std::fs::read_to_string(path)
         .with_context(|| format!("reading Rduel problem config {}", path.display()))?;
-    let config: ProblemConfig = serde_json::from_str(&config_text)
-        .with_context(|| format!("parsing Rduel problem config {}", path.display()))?;
+    load_problem_pool_from_config(&config_text)
+        .with_context(|| format!("parsing Rduel problem config {}", path.display()))
+}
+
+fn load_problem_pool_from_config(config_text: &str) -> anyhow::Result<Vec<Problem>> {
+    let config: ProblemConfigFile = serde_json::from_str(config_text)?;
     let mut problems = Vec::new();
 
-    for contest_number in config.contest_start..=config.contest_end {
-        let contest_id = format!("{}{:03}", config.contest_prefix, contest_number);
-        for task in &config.tasks {
-            let problem_id = format!("{contest_id}_{task}");
-            problems.push(Problem {
-                id: problem_id.clone(),
-                title: problem_id.clone(),
-                url: format!("https://atcoder.jp/contests/{contest_id}/tasks/{problem_id}"),
-                statement_markdown: String::new(),
-                samples: Vec::new(),
-            });
-        }
+    for contest_config in config.contests() {
+        append_contest_problem_pool(&mut problems, contest_config)?;
     }
 
     anyhow::ensure!(
@@ -1837,6 +1875,123 @@ fn load_problem_pool(path: &PathBuf) -> anyhow::Result<Vec<Problem>> {
         "Rduel problem config produced no problems"
     );
     Ok(problems)
+}
+
+impl ProblemConfigFile {
+    fn contests(&self) -> &[ContestProblemConfig] {
+        match self {
+            Self::Single(config) => std::slice::from_ref(config),
+            Self::Multiple { contests } | Self::List(contests) => contests,
+        }
+    }
+}
+
+fn append_contest_problem_pool(
+    problems: &mut Vec<Problem>,
+    config: &ContestProblemConfig,
+) -> anyhow::Result<()> {
+    let contest_prefix = config.contest_prefix.trim();
+    anyhow::ensure!(
+        !contest_prefix.is_empty(),
+        "contest_prefix must not be empty"
+    );
+    anyhow::ensure!(!config.tasks.is_empty(), "tasks must not be empty");
+
+    let (contest_start, contest_end, contest_number_width) = contest_number_range(config)?;
+    let source_key = format!(
+        "{}:{:0width$}-{:0width$}",
+        contest_prefix,
+        contest_start,
+        contest_end,
+        width = contest_number_width
+    );
+    for contest_number in contest_start..=contest_end {
+        let contest_id = format!(
+            "{}{:0width$}",
+            contest_prefix,
+            contest_number,
+            width = contest_number_width
+        );
+        for task in &config.tasks {
+            let task = task.trim();
+            anyhow::ensure!(!task.is_empty(), "task name must not be empty");
+            let problem_id = format!("{contest_id}_{task}");
+            problems.push(Problem {
+                id: problem_id.clone(),
+                title: problem_id.clone(),
+                url: format!("https://atcoder.jp/contests/{contest_id}/tasks/{problem_id}"),
+                statement_markdown: String::new(),
+                samples: Vec::new(),
+                source_key: source_key.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn contest_number_range(config: &ContestProblemConfig) -> anyhow::Result<(u32, u32, usize)> {
+    if let Some(contest_range) = config.contest_range.as_deref() {
+        return parse_contest_range(contest_range);
+    }
+
+    let start = config
+        .contest_start
+        .as_ref()
+        .context("contest_start is required when contest_range is not set")?;
+    let end = config
+        .contest_end
+        .as_ref()
+        .context("contest_end is required when contest_range is not set")?;
+    let (contest_start, start_width) = parse_contest_endpoint(start, "contest_start")?;
+    let (contest_end, end_width) = parse_contest_endpoint(end, "contest_end")?;
+    anyhow::ensure!(
+        contest_start <= contest_end,
+        "contest_start must be less than or equal to contest_end"
+    );
+    Ok((
+        contest_start,
+        contest_end,
+        start_width.max(end_width).max(3),
+    ))
+}
+
+fn parse_contest_range(contest_range: &str) -> anyhow::Result<(u32, u32, usize)> {
+    let (start, end) = contest_range.split_once('-').with_context(|| {
+        format!("contest_range must be formatted like 042-459: {contest_range}")
+    })?;
+    let start = start.trim();
+    let end = end.trim();
+    let contest_start = parse_contest_number_text(start, "contest_range start")?;
+    let contest_end = parse_contest_number_text(end, "contest_range end")?;
+    anyhow::ensure!(
+        contest_start <= contest_end,
+        "contest_range start must be less than or equal to contest_range end"
+    );
+    Ok((contest_start, contest_end, start.len().max(end.len())))
+}
+
+fn parse_contest_endpoint(
+    endpoint: &ContestNumberEndpoint,
+    field_name: &str,
+) -> anyhow::Result<(u32, usize)> {
+    match endpoint {
+        ContestNumberEndpoint::Number(number) => Ok((*number, 3)),
+        ContestNumberEndpoint::Text(text) => {
+            let text = text.trim();
+            Ok((parse_contest_number_text(text, field_name)?, text.len()))
+        }
+    }
+}
+
+fn parse_contest_number_text(text: &str, field_name: &str) -> anyhow::Result<u32> {
+    anyhow::ensure!(!text.is_empty(), "{field_name} must not be empty");
+    anyhow::ensure!(
+        text.chars().all(|character| character.is_ascii_digit()),
+        "{field_name} must contain only ASCII digits"
+    );
+    text.parse::<u32>()
+        .with_context(|| format!("parsing {field_name} as a contest number"))
 }
 
 #[cfg(test)]
@@ -1850,7 +2005,74 @@ mod tests {
             url: "https://atcoder.jp/contests/abc001/tasks/abc001_a".to_string(),
             statement_markdown: String::new(),
             samples: Vec::new(),
+            source_key: "abc:001-001".to_string(),
         }])
+    }
+
+    #[test]
+    fn problem_config_supports_legacy_single_contest() {
+        let problems = load_problem_pool_from_config(
+            r#"{
+                "contest_prefix": "abc",
+                "contest_start": 42,
+                "contest_end": 43,
+                "tasks": ["a"]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            problems
+                .iter()
+                .map(|problem| problem.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abc042_a", "abc043_a"]
+        );
+    }
+
+    #[test]
+    fn problem_config_supports_multiple_contests_with_range_widths() {
+        let problems = load_problem_pool_from_config(
+            r#"{
+                "contests": [
+                    {
+                        "contest_prefix": "abc",
+                        "contest_range": "042-043",
+                        "tasks": ["a"]
+                    },
+                    {
+                        "contest_prefix": "awc",
+                        "contest_range": "0098-0099",
+                        "tasks": ["a"]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            problems
+                .iter()
+                .map(|problem| problem.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abc042_a", "abc043_a", "awc0098_a", "awc0099_a"]
+        );
+        assert_eq!(
+            problems.last().map(|problem| problem.url.as_str()),
+            Some("https://atcoder.jp/contests/awc0099/tasks/awc0099_a")
+        );
+        assert_eq!(
+            problems
+                .iter()
+                .map(|problem| problem.source_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "abc:042-043",
+                "abc:042-043",
+                "awc:0098-0099",
+                "awc:0098-0099"
+            ]
+        );
     }
 
     fn join_request(player_id: &str, name: &str) -> JoinRequest {

@@ -1,6 +1,14 @@
 {
-  "contest_prefix": "abc",
-  "contest_start": 42,
-  "contest_end": 463,
-  "tasks": ["a", "b"]
+  "contests": [
+    {
+      "contest_prefix": "abc",
+      "contest_range": "042-464",
+      "tasks": ["a", "b"]
+    },
+    {
+      "contest_prefix": "awc",
+      "contest_range": "0001-0099",
+      "tasks": ["a", "b"]
+    }
+  ]
 }

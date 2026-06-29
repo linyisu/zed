@@ -645,9 +645,8 @@ fn wrap_var_tags_as_math(html: &str) -> String {
         };
 
         let raw_math = &remaining[content_start..content_start + close_start];
-        let math = html_unescape(raw_math);
         output.push('$');
-        output.push_str(&math.trim().replace('$', "\\$"));
+        output.push_str(&raw_math.trim().replace('$', "\\$"));
         output.push('$');
         remaining = &after_content_start[close_start + "</var>".len()..];
     }
@@ -1295,6 +1294,25 @@ mod tests {
         assert!(markdown.contains("- この問題には部分点が設定されている。"));
         assert!(!markdown.contains("$R$ $G$ $B$        $1$"));
         assert!(!markdown.contains("            - "));
+    }
+
+    #[test]
+    fn atcoder_var_math_preserves_less_than_entities() {
+        let html = r#"
+<div id="task-statement">
+<div class="part">
+    <h3>Constraints</h3>
+    <section>
+        <ul>
+            <li><var>1\leq A_1&lt;A_2&lt;\dots&lt;A_K\leq N</var></li>
+        </ul>
+    </section>
+</div>
+</div>
+"#;
+        let markdown = convert_statement_html_to_markdown(html).unwrap();
+
+        assert!(markdown.contains("$1\\leq A_1<A_2<\\dots<A_K\\leq N$"));
     }
 
     #[test]
