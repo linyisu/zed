@@ -11,14 +11,21 @@ workspace = true
 [lib]
 path = "src/rcontest.rs"
 
+[features]
+output-ui = ["dep:gpui", "dep:ui"]
+
 [dependencies]
 anyhow.workspace = true
 async-compression.workspace = true
 futures.workspace = true
+gpui = { workspace = true, optional = true }
 html_to_markdown.workspace = true
+log.workspace = true
 reqwest.workspace = true
 scraper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smol.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["full"] }
+ui = { workspace = true, optional = true }

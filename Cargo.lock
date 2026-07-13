@@ -14884,12 +14884,16 @@ dependencies = [
  "anyhow",
  "async-compression",
  "futures 0.3.32",
+ "gpui",
  "html_to_markdown",
+ "log",
  "scraper",
  "serde",
  "serde_json",
+ "smol",
  "time",
  "tokio",
+ "ui",
  "zed-reqwest",
 ]
 

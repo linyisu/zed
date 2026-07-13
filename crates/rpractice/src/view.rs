@@ -2,7 +2,6 @@ use std::{
     any::TypeId,
     collections::HashSet,
     path::{Path, PathBuf},
-    process::ExitStatus,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -25,6 +24,11 @@ use markdown::{
     MarkdownOptions, MarkdownStyle, WrapButtonVisibility,
 };
 use project::{Project, ProjectItem, ProjectPath};
+use rcontest::output::{
+    CaseResult, CommandOutputDetail, CommandOutputDetailSection, CommandOutputItem,
+    CommandOutputItemStatus, CommandOutputState, OutputDiff, OutputSelection, sample_test_summary,
+    single_command_output_state, status_dot_color,
+};
 use schemars::JsonSchema;
 use search::BufferSearchBar;
 use serde::Deserialize;
@@ -146,45 +150,6 @@ impl CommandStatus {
     }
 }
 
-#[derive(Clone)]
-struct CommandOutputState {
-    items: Vec<CommandOutputItem>,
-}
-
-#[derive(Clone)]
-struct CommandOutputItem {
-    label: SharedString,
-    status: CommandOutputItemStatus,
-    detail: Option<CommandOutputDetail>,
-}
-
-#[derive(Clone)]
-struct CommandOutputDetail {
-    heading: SharedString,
-    diff: Option<OutputDiff>,
-    sections: Vec<CommandOutputDetailSection>,
-}
-
-#[derive(Clone)]
-struct OutputDiff {
-    expected: SharedString,
-    actual: SharedString,
-}
-
-#[derive(Clone)]
-struct CommandOutputDetailSection {
-    title: SharedString,
-    body: SharedString,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CommandOutputItemStatus {
-    Pending,
-    Passed,
-    Warning,
-    Failed,
-}
-
 struct PracticeTestCase {
     input: Entity<Editor>,
     expected: Entity<Editor>,
@@ -231,20 +196,6 @@ impl StickyCandidate for ProblemListStickyCandidate {
 }
 
 #[derive(Clone)]
-struct CaseResult {
-    status: CommandOutputItemStatus,
-    heading: SharedString,
-    actual: Option<String>,
-    stderr: Option<String>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OutputSelection {
-    Step(usize),
-    Case(usize),
-}
-
-#[derive(Clone)]
 struct DraggedProblemDivider;
 
 impl Render for DraggedProblemDivider {
@@ -269,25 +220,6 @@ impl Render for DraggedOutputDivider {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
-}
-
-#[derive(Debug)]
-enum PracticeCommandResult {
-    Ac { actual: String },
-    Wa { actual: String },
-    Re { stderr: String },
-    Tle,
-}
-
-enum SampleProcessWait {
-    Finished(std::io::Result<SampleProcessOutput>),
-    TimedOut,
-}
-
-struct SampleProcessOutput {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
 }
 
 enum PracticeCommand {
@@ -337,23 +269,18 @@ async fn run_practice_test(
     files: RpracticeProblemFiles,
     cases: Vec<(String, String)>,
 ) -> anyhow::Result<PracticeCommandOutput> {
-    let build_args = ["build", "--release", "--bin", files.bin_name.as_str()];
-    let build_step = run_practice_process(
-        "cargo build",
-        &files.root_path,
-        "cargo",
-        &build_args,
-        Some(&files.target_path),
-    )
-    .await?;
-    let build_succeeded = build_step.status.success();
-    let steps = vec![build_step];
-    if !build_succeeded {
-        return Ok(render_practice_test_steps(steps, Vec::new()));
-    }
-
-    let results = run_practice_sample_tests(files, cases).await;
-    Ok(render_practice_test_steps(steps, results))
+    let solution = rcontest::runner::RustSolution {
+        root_path: files.root_path,
+        target_path: files.target_path,
+        bin_name: Some(files.bin_name),
+    };
+    let cases = cases
+        .into_iter()
+        .map(|(input, expected)| rcontest::runner::SampleCase { input, expected })
+        .collect();
+    let report =
+        rcontest::runner::run_rust_sample_tests(solution, cases, SAMPLE_TEST_TIMEOUT).await?;
+    Ok(render_practice_test_report(report))
 }
 
 async fn run_practice_submit(
@@ -362,169 +289,42 @@ async fn run_practice_submit(
     problem_url: String,
 ) -> anyhow::Result<PracticeCommandOutput> {
     let mut output = run_practice_test(files.clone(), cases).await?;
-    let source_code = std::fs::read_to_string(&files.source_path)
-        .with_context(|| format!("reading {}", files.source_path.display()))?;
-    let submit_url = rcontest::atcoder_submit_url(&problem_url).unwrap_or(problem_url);
+    let submission = rcontest::prepare_atcoder_submission(files.source_path, &problem_url)?;
     output.submit_ready = Some(PracticeSubmitReady {
-        source_code,
-        source_path: files.source_path,
-        submit_url,
+        source_code: submission.source_code,
+        source_path: submission.source_path,
+        submit_url: submission.submit_url,
     });
     Ok(output)
 }
 
-async fn run_practice_sample_tests(
-    files: RpracticeProblemFiles,
-    cases: Vec<(String, String)>,
-) -> Vec<(usize, PracticeCommandResult)> {
-    let mut results = Vec::with_capacity(cases.len());
-    for (index, (input, expected)) in cases.into_iter().enumerate() {
-        let result = run_practice_sample_test(&files, input, expected).await;
-        results.push((index, result));
-    }
-    results
-}
-
-async fn run_practice_sample_test(
-    files: &RpracticeProblemFiles,
-    input: String,
-    expected: String,
-) -> PracticeCommandResult {
-    let Some(cargo) = resolve_practice_executable("cargo") else {
-        return PracticeCommandResult::Re {
-            stderr: "could not find `cargo` in PATH or common user bin directories".into(),
-        };
-    };
-    let args = ["run", "--release", "-q", "--bin", files.bin_name.as_str()];
-    let mut child = match smol::process::Command::new(cargo)
-        .args(args)
-        .current_dir(&files.root_path)
-        .env("CARGO_TARGET_DIR", &files.target_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            return PracticeCommandResult::Re {
-                stderr: error.to_string(),
-            };
-        }
-    };
-
-    use smol::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stdin = child.stdin.take();
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let input_bytes = input.into_bytes();
-    let write_input = async move {
-        if let Some(stdin) = stdin.as_mut()
-            && let Err(error) = stdin.write_all(&input_bytes).await
-            && error.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            log::debug!("failed to write Rpractice sample input to stdin: {error}");
-        }
-        drop(stdin);
-    };
-    let read_stdout = async move {
-        let mut stdout_text = String::new();
-        if let Some(stdout) = stdout.as_mut() {
-            stdout.read_to_string(&mut stdout_text).await?;
-        }
-        std::io::Result::Ok(stdout_text)
-    };
-    let read_stderr = async move {
-        let mut stderr_text = String::new();
-        if let Some(stderr) = stderr.as_mut() {
-            stderr.read_to_string(&mut stderr_text).await?;
-        }
-        std::io::Result::Ok(stderr_text)
-    };
-
-    let output = smol::future::race(
-        async {
-            let (status, (_, (stdout, stderr))) = smol::future::zip(
-                child.status(),
-                smol::future::zip(write_input, smol::future::zip(read_stdout, read_stderr)),
-            )
-            .await;
-            SampleProcessWait::Finished(status.and_then(|status| {
-                Ok(SampleProcessOutput {
-                    status,
-                    stdout: stdout?,
-                    stderr: stderr?,
-                })
-            }))
-        },
-        async {
-            smol::Timer::after(SAMPLE_TEST_TIMEOUT).await;
-            SampleProcessWait::TimedOut
-        },
-    )
-    .await;
-    let output = match output {
-        SampleProcessWait::Finished(output) => output,
-        SampleProcessWait::TimedOut => {
-            if let Err(error) = child.kill() {
-                log::debug!("failed to kill timed out Rpractice sample process: {error}");
-            }
-            return PracticeCommandResult::Tle;
-        }
-    };
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            return PracticeCommandResult::Re {
-                stderr: error.to_string(),
-            };
-        }
-    };
-
-    if !output.status.success() {
-        return PracticeCommandResult::Re {
-            stderr: output.stderr,
-        };
-    }
-
-    if output.stdout.trim_end() == expected.trim_end() {
-        PracticeCommandResult::Ac {
-            actual: output.stdout,
-        }
-    } else {
-        PracticeCommandResult::Wa {
-            actual: output.stdout,
-        }
-    }
-}
-
-fn render_practice_test_steps(
-    steps: Vec<PracticeProcessOutput>,
-    results: Vec<(usize, PracticeCommandResult)>,
+fn render_practice_test_report(
+    report: rcontest::runner::SampleTestReport,
 ) -> PracticeCommandOutput {
-    let Some(build_step) = steps.iter().find(|step| step.label == "cargo build") else {
-        return render_practice_command_steps(steps);
-    };
-    let mut build_item = process_output_item(build_step);
-    if build_step.status.success() && build_step.stderr.contains("warning") {
-        build_item.status = CommandOutputItemStatus::Warning;
-    }
-    if !build_step.status.success() {
+    let code = report
+        .build
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| code.to_string());
+    let heading = format!(
+        "{} finished with exit {code}\n{} {}",
+        report.build.label,
+        report.build.executable.display(),
+        report.build.args.join(" ")
+    );
+    let summary = sample_test_summary(report, heading);
+    if !summary.build_succeeded {
         return PracticeCommandOutput {
             success: false,
-            items: vec![build_item],
+            items: vec![summary.build_item],
             case_results: Vec::new(),
             submit_ready: None,
         };
     }
 
-    let passed = results
-        .iter()
-        .filter(|(_, result)| matches!(result, PracticeCommandResult::Ac { .. }))
-        .count();
-    let success = passed == results.len();
-    let mut items = vec![build_item];
-    if results.is_empty() {
+    let success = summary.passed_cases == summary.total_cases;
+    let mut items = vec![summary.build_item];
+    if summary.total_cases == 0 {
         items.push(CommandOutputItem {
             label: "Samples".into(),
             status: CommandOutputItemStatus::Warning,
@@ -535,149 +335,8 @@ fn render_practice_test_steps(
     PracticeCommandOutput {
         success,
         items,
-        case_results: practice_case_results(&results),
+        case_results: summary.case_results,
         submit_ready: None,
-    }
-}
-
-fn render_practice_command_steps(steps: Vec<PracticeProcessOutput>) -> PracticeCommandOutput {
-    PracticeCommandOutput {
-        success: steps.iter().all(|step| step.status.success()),
-        items: steps.iter().map(process_output_item).collect(),
-        case_results: Vec::new(),
-        submit_ready: None,
-    }
-}
-
-fn practice_case_results(results: &[(usize, PracticeCommandResult)]) -> Vec<(usize, CaseResult)> {
-    results
-        .iter()
-        .map(|(index, result)| {
-            let case = match result {
-                PracticeCommandResult::Ac { actual } => CaseResult {
-                    status: CommandOutputItemStatus::Passed,
-                    heading: "Accepted".into(),
-                    actual: Some(actual.clone()),
-                    stderr: None,
-                },
-                PracticeCommandResult::Wa { actual, .. } => CaseResult {
-                    status: CommandOutputItemStatus::Failed,
-                    heading: "Wrong Answer".into(),
-                    actual: Some(actual.clone()),
-                    stderr: None,
-                },
-                PracticeCommandResult::Re { stderr } => CaseResult {
-                    status: CommandOutputItemStatus::Failed,
-                    heading: "Runtime Error".into(),
-                    actual: None,
-                    stderr: Some(stderr.clone()),
-                },
-                PracticeCommandResult::Tle => CaseResult {
-                    status: CommandOutputItemStatus::Failed,
-                    heading: "Time Limit Exceeded".into(),
-                    actual: None,
-                    stderr: None,
-                },
-            };
-            (*index, case)
-        })
-        .collect()
-}
-
-fn process_output_item(step: &PracticeProcessOutput) -> CommandOutputItem {
-    let mut sections = Vec::new();
-    if !step.stdout.trim().is_empty() {
-        sections.push(CommandOutputDetailSection {
-            title: "stdout".into(),
-            body: step.stdout.trim_end().to_string().into(),
-        });
-    }
-    if !step.stderr.trim().is_empty() {
-        sections.push(CommandOutputDetailSection {
-            title: "stderr".into(),
-            body: step.stderr.trim_end().to_string().into(),
-        });
-    }
-    let code = step
-        .status
-        .code()
-        .map_or_else(|| "signal".to_string(), |code| code.to_string());
-    CommandOutputItem {
-        label: step.label.into(),
-        status: if step.status.success() {
-            CommandOutputItemStatus::Passed
-        } else {
-            CommandOutputItemStatus::Failed
-        },
-        detail: Some(CommandOutputDetail::with_sections(
-            format!(
-                "{} finished with exit {code}\n{} {}",
-                step.label,
-                step.executable.display(),
-                step.args.join(" ")
-            ),
-            sections,
-        )),
-    }
-}
-
-fn status_dot_color(status: CommandOutputItemStatus, cx: &App) -> gpui::Hsla {
-    match status {
-        CommandOutputItemStatus::Pending => cx.theme().colors().border_variant,
-        CommandOutputItemStatus::Passed => cx.theme().status().success,
-        CommandOutputItemStatus::Warning => cx.theme().status().warning,
-        CommandOutputItemStatus::Failed => cx.theme().status().error,
-    }
-}
-
-impl CommandOutputState {
-    fn empty() -> Self {
-        Self { items: Vec::new() }
-    }
-
-    fn running(label: &'static str) -> Self {
-        Self {
-            items: vec![CommandOutputItem {
-                label: label.into(),
-                status: CommandOutputItemStatus::Pending,
-                detail: Some(CommandOutputDetail::new("Waiting for command output...")),
-            }],
-        }
-    }
-}
-
-impl CommandOutputDetail {
-    fn new(heading: impl Into<SharedString>) -> Self {
-        Self {
-            heading: heading.into(),
-            diff: None,
-            sections: Vec::new(),
-        }
-    }
-
-    fn with_sections(
-        heading: impl Into<SharedString>,
-        sections: Vec<CommandOutputDetailSection>,
-    ) -> Self {
-        Self {
-            heading: heading.into(),
-            diff: None,
-            sections,
-        }
-    }
-}
-
-fn single_command_output_state(
-    label: impl Into<SharedString>,
-    status: CommandOutputItemStatus,
-    detail: impl Into<SharedString>,
-) -> CommandOutputState {
-    CommandOutputState {
-        items: vec![CommandOutputItem {
-            label: label.into(),
-            status,
-            detail: Some(CommandOutputDetail::new(detail)),
-        }],
     }
 }
 
@@ -3830,73 +3489,4 @@ impl Render for RpracticeView {
             .child(self.render_split_divider(cx))
             .child(self.render_editor_panel(cx))
     }
-}
-
-struct PracticeProcessOutput {
-    label: &'static str,
-    executable: PathBuf,
-    args: Vec<String>,
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-async fn run_practice_process(
-    label: &'static str,
-    current_dir: &Path,
-    program: &str,
-    args: &[&str],
-    target_path: Option<&Path>,
-) -> anyhow::Result<PracticeProcessOutput> {
-    let executable = resolve_practice_executable(program).ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not find `{}` in PATH or common user bin directories. PATH={}",
-            program,
-            std::env::var("PATH").unwrap_or_default()
-        )
-    })?;
-    let mut command = smol::process::Command::new(&executable);
-    command.args(args).current_dir(current_dir);
-    if let Some(target_path) = target_path {
-        command.env("CARGO_TARGET_DIR", target_path);
-    }
-    let output = command.output().await?;
-
-    Ok(PracticeProcessOutput {
-        label,
-        executable,
-        args: args.iter().map(|arg| (*arg).to_string()).collect(),
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
-
-fn resolve_practice_executable(program: &str) -> Option<PathBuf> {
-    let program_path = Path::new(program);
-    if program_path.components().count() > 1 && program_path.is_file() {
-        return Some(program_path.to_path_buf());
-    }
-
-    executable_search_paths()
-        .into_iter()
-        .map(|path| path.join(program))
-        .find(|path| path.is_file())
-}
-
-fn executable_search_paths() -> Vec<PathBuf> {
-    let mut paths = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let home = PathBuf::from(home);
-        paths.push(home.join(".cargo").join("bin"));
-        paths.push(home.join(".local").join("bin"));
-    }
-
-    paths.push(PathBuf::from("/usr/local/bin"));
-    paths.push(PathBuf::from("/usr/bin"));
-
-    paths
 }

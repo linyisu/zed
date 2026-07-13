@@ -4,7 +4,6 @@ use std::{
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    process::ExitStatus,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,6 +26,11 @@ use markdown::{
 };
 use menu::{Cancel, Confirm};
 use project::{Project, ProjectItem, ProjectPath};
+use rcontest::output::{
+    CaseResult, CommandOutputDetail, CommandOutputDetailSection, CommandOutputItem,
+    CommandOutputItemStatus, CommandOutputState, OutputDiff, OutputSelection, sample_test_summary,
+    single_command_output_state, status_dot_color,
+};
 use schemars::JsonSchema;
 use search::BufferSearchBar;
 use serde::{Deserialize, Serialize};
@@ -735,46 +739,6 @@ fn resolve_local_player_id(
     player_id
 }
 
-#[derive(Clone)]
-struct CommandOutputState {
-    items: Vec<CommandOutputItem>,
-}
-
-#[derive(Clone)]
-struct CommandOutputItem {
-    label: SharedString,
-    status: CommandOutputItemStatus,
-    detail: Option<CommandOutputDetail>,
-}
-
-#[derive(Clone)]
-struct CommandOutputDetail {
-    heading: SharedString,
-    diff: Option<OutputDiff>,
-    sections: Vec<CommandOutputDetailSection>,
-}
-
-/// Expected vs. actual program output, rendered as a git-style line diff.
-#[derive(Clone)]
-struct OutputDiff {
-    expected: SharedString,
-    actual: SharedString,
-}
-
-#[derive(Clone)]
-struct CommandOutputDetailSection {
-    title: SharedString,
-    body: SharedString,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CommandOutputItemStatus {
-    Pending,
-    Passed,
-    Warning,
-    Failed,
-}
-
 /// An editable test case: input/expected are live editors so the user can
 /// select, copy, and edit them; `default` keeps the provided values for restore.
 struct RduelTestCase {
@@ -782,52 +746,6 @@ struct RduelTestCase {
     expected: Entity<Editor>,
     default: Option<RduelSample>,
     result: Option<CaseResult>,
-}
-
-/// The most recent run outcome for a single test case.
-#[derive(Clone)]
-struct CaseResult {
-    status: CommandOutputItemStatus,
-    heading: SharedString,
-    actual: Option<String>,
-    stderr: Option<String>,
-}
-
-/// Which chip in the output toolbar is selected: a run step or a test case.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OutputSelection {
-    Step(usize),
-    Case(usize),
-}
-
-impl CommandOutputState {
-    fn empty() -> Self {
-        Self { items: Vec::new() }
-    }
-
-    fn running(label: &'static str) -> Self {
-        Self {
-            items: vec![CommandOutputItem {
-                label: label.into(),
-                status: CommandOutputItemStatus::Pending,
-                detail: Some(CommandOutputDetail::new("Waiting for command output...")),
-            }],
-        }
-    }
-}
-
-fn single_command_output_state(
-    label: impl Into<SharedString>,
-    status: CommandOutputItemStatus,
-    detail: impl Into<SharedString>,
-) -> CommandOutputState {
-    CommandOutputState {
-        items: vec![CommandOutputItem {
-            label: label.into(),
-            status,
-            detail: Some(CommandOutputDetail::new(detail)),
-        }],
-    }
 }
 
 fn submission_output_item(submission: &ServerPlayerSubmissionRecord) -> CommandOutputItem {
@@ -856,27 +774,6 @@ fn submission_output_item(submission: &ServerPlayerSubmissionRecord) -> CommandO
                 .into(),
             }],
         )),
-    }
-}
-
-impl CommandOutputDetail {
-    fn new(heading: impl Into<SharedString>) -> Self {
-        Self {
-            heading: heading.into(),
-            diff: None,
-            sections: Vec::new(),
-        }
-    }
-
-    fn with_sections(
-        heading: impl Into<SharedString>,
-        sections: Vec<CommandOutputDetailSection>,
-    ) -> Self {
-        Self {
-            heading: heading.into(),
-            diff: None,
-            sections,
-        }
     }
 }
 
@@ -1902,15 +1799,6 @@ struct RduelCommandOutput {
     submit_ready: Option<RduelSubmitReady>,
 }
 
-struct RduelProcessOutput {
-    label: &'static str,
-    executable: PathBuf,
-    args: Vec<String>,
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
 struct RduelSubmitReady {
     source_code: String,
     source_path: PathBuf,
@@ -1950,24 +1838,18 @@ async fn run_rduel_test(
     test_path: PathBuf,
     target_path: PathBuf,
 ) -> anyhow::Result<RduelCommandOutput> {
-    let mut steps = Vec::new();
-    steps.push(
-        run_process(
-            "cargo build",
-            &root_path,
-            "cargo",
-            &["build", "--release"],
-            Some(&target_path),
-        )
-        .await?,
-    );
-
-    if !steps.last().is_some_and(|step| step.status.success()) {
-        return Ok(render_embedded_test_steps(steps, Vec::new()));
-    }
-
-    let test_results = run_embedded_sample_tests(root_path, test_path, target_path).await;
-    Ok(render_embedded_test_steps(steps, test_results))
+    let cases = load_rduel_sample_cases(&test_path)?;
+    let report = rcontest::runner::run_rust_sample_tests(
+        rcontest::runner::RustSolution {
+            root_path,
+            target_path,
+            bin_name: None,
+        },
+        cases,
+        SAMPLE_TEST_TIMEOUT,
+    )
+    .await?;
+    Ok(render_embedded_test_report(report))
 }
 
 async fn run_rduel_submit(
@@ -1993,21 +1875,18 @@ async fn run_rduel_submit(
         }
     }
 
-    let source_path = problem_rs_path;
-    let source_code = std::fs::read_to_string(&source_path)?;
     let problem_url = read_problem_url(&cargo_toml_path)
         .ok_or_else(|| anyhow::anyhow!("problem_url was not found in Cargo.toml"))?;
-    let submit_url =
-        rcontest::atcoder_submit_url(&problem_url).unwrap_or_else(|| problem_url.clone());
+    let submission = rcontest::prepare_atcoder_submission(problem_rs_path, &problem_url)?;
     Ok(RduelCommandOutput {
         success: true,
         rendered: test_output.rendered,
         items: test_output.items,
         case_results: test_output.case_results,
         submit_ready: Some(RduelSubmitReady {
-            source_code,
-            source_path,
-            submit_url,
+            source_code: submission.source_code,
+            source_path: submission.source_path,
+            submit_url: submission.submit_url,
         }),
     })
 }
@@ -2484,37 +2363,6 @@ fn format_problem_heading(problem_id: &str, title: &str) -> String {
     }
 }
 
-async fn run_process(
-    label: &'static str,
-    current_dir: &Path,
-    program: &str,
-    args: &[&str],
-    target_path: Option<&Path>,
-) -> anyhow::Result<RduelProcessOutput> {
-    let executable = resolve_rduel_executable(program).ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not find `{}` in PATH or common user bin directories. PATH={}",
-            program,
-            std::env::var("PATH").unwrap_or_default()
-        )
-    })?;
-    let mut command = smol::process::Command::new(&executable);
-    command.args(args).current_dir(current_dir);
-    if let Some(target_path) = target_path {
-        command.env("CARGO_TARGET_DIR", target_path);
-    }
-    let output = command.output().await?;
-
-    Ok(RduelProcessOutput {
-        label,
-        executable,
-        args: args.iter().map(|arg| (*arg).to_string()).collect(),
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
-
 fn write_server_problem_to_project(
     rduel_project: &RduelProjectFiles,
     problem: &ServerProblem,
@@ -2554,7 +2402,7 @@ fn write_server_problem_to_project(
 }
 
 /// Rewrites the test directory from the current (edited/added) cases, 0-based and
-/// contiguous, so `run_embedded_sample_tests` picks them up.
+/// contiguous, matching the shared runner's sample-file layout.
 fn write_test_case_files(
     rduel_project: &RduelProjectFiles,
     cases: &[(String, String)],
@@ -2601,427 +2449,71 @@ fn replace_problem_url(cargo_toml: &str, problem_url: &str) -> String {
     output
 }
 
-fn resolve_rduel_executable(program: &str) -> Option<PathBuf> {
-    let program_path = Path::new(program);
-    if program_path.components().count() > 1 && program_path.is_file() {
-        return Some(program_path.to_path_buf());
-    }
-
-    executable_search_paths()
-        .into_iter()
-        .map(|path| path.join(program))
-        .find(|path| path.is_file())
-}
-
-fn executable_search_paths() -> Vec<PathBuf> {
-    let mut paths = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let home = PathBuf::from(home);
-        paths.push(home.join(".cargo").join("bin"));
-        paths.push(home.join(".local").join("bin"));
-    }
-
-    paths.push(PathBuf::from("/usr/local/bin"));
-    paths.push(PathBuf::from("/usr/bin"));
-
-    paths
-}
-
-// Adapted from t-seki/acr (MIT): workspace/testcase.rs and runner/tester.rs.
-// Rduel vendors the runner behavior so users do not need an external `acr` binary.
-#[derive(Debug)]
-enum EmbeddedAcrTestResult {
-    Ac { actual: String },
-    Wa { actual: String, expected: String },
-    Re { stderr: String },
-    Tle,
-}
-
-enum SampleProcessWait {
-    Finished(std::io::Result<SampleProcessOutput>),
-    TimedOut,
-}
-
-struct SampleProcessOutput {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-async fn run_embedded_sample_tests(
-    root_path: PathBuf,
-    test_path: PathBuf,
-    target_path: PathBuf,
-) -> Vec<(usize, EmbeddedAcrTestResult)> {
-    let mut results = Vec::new();
-    let mut index = 0;
-
-    loop {
+fn load_rduel_sample_cases(test_path: &Path) -> anyhow::Result<Vec<rcontest::runner::SampleCase>> {
+    let mut cases = Vec::new();
+    for index in 0.. {
         let input_path = test_path.join(format!("{index}.in"));
         let output_path = test_path.join(format!("{index}.out"));
         if !input_path.exists() || !output_path.exists() {
             break;
         }
-
-        let input = match std::fs::read_to_string(&input_path) {
-            Ok(input) => input,
-            Err(error) => {
-                results.push((
-                    index,
-                    EmbeddedAcrTestResult::Re {
-                        stderr: format!("Failed to read {}: {error}", input_path.display()),
-                    },
-                ));
-                index += 1;
-                continue;
-            }
-        };
-        let expected = match std::fs::read_to_string(&output_path) {
-            Ok(expected) => expected,
-            Err(error) => {
-                results.push((
-                    index,
-                    EmbeddedAcrTestResult::Re {
-                        stderr: format!("Failed to read {}: {error}", output_path.display()),
-                    },
-                ));
-                index += 1;
-                continue;
-            }
-        };
-
-        results.push((
-            index,
-            run_embedded_sample_test(&root_path, &target_path, input, expected).await,
-        ));
-        index += 1;
+        let input = std::fs::read_to_string(&input_path)
+            .with_context(|| format!("reading {}", input_path.display()))?;
+        let expected = std::fs::read_to_string(&output_path)
+            .with_context(|| format!("reading {}", output_path.display()))?;
+        cases.push(rcontest::runner::SampleCase { input, expected });
     }
-
-    results
+    Ok(cases)
 }
 
-async fn run_embedded_sample_test(
-    root_path: &Path,
-    target_path: &Path,
-    input: String,
-    expected: String,
-) -> EmbeddedAcrTestResult {
-    let Some(cargo) = resolve_rduel_executable("cargo") else {
-        return EmbeddedAcrTestResult::Re {
-            stderr: "could not find `cargo` in PATH or common user bin directories".into(),
-        };
-    };
-    let mut child = match smol::process::Command::new(cargo)
-        .args(["run", "--release", "-q"])
-        .current_dir(root_path)
-        .env("CARGO_TARGET_DIR", target_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            return EmbeddedAcrTestResult::Re {
-                stderr: error.to_string(),
-            };
-        }
-    };
-
-    use smol::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stdin = child.stdin.take();
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let input_bytes = input.clone().into_bytes();
-    // Feed stdin concurrently with draining stdout/stderr. Writing all input
-    // before reading output deadlocks once a solution fills the stdout pipe
-    // buffer (it blocks on write while we block on our stdin write).
-    let write_input = async move {
-        if let Some(stdin) = stdin.as_mut() {
-            // A solution that consumes only part of its input closes the pipe
-            // early, surfacing as BrokenPipe — that is not a failure of the run.
-            if let Err(error) = stdin.write_all(&input_bytes).await {
-                if error.kind() != std::io::ErrorKind::BrokenPipe {
-                    log::debug!("failed to write Rduel sample input to stdin: {error}");
-                }
-            }
-        }
-        // Drop the handle to signal EOF to the child.
-        drop(stdin);
-    };
-    let read_stdout = async move {
-        let mut stdout_text = String::new();
-        if let Some(stdout) = stdout.as_mut() {
-            stdout.read_to_string(&mut stdout_text).await?;
-        }
-        std::io::Result::Ok(stdout_text)
-    };
-    let read_stderr = async move {
-        let mut stderr_text = String::new();
-        if let Some(stderr) = stderr.as_mut() {
-            stderr.read_to_string(&mut stderr_text).await?;
-        }
-        std::io::Result::Ok(stderr_text)
-    };
-
-    let output = smol::future::race(
-        async {
-            let (status, (_, (stdout, stderr))) = smol::future::zip(
-                child.status(),
-                smol::future::zip(write_input, smol::future::zip(read_stdout, read_stderr)),
-            )
-            .await;
-            SampleProcessWait::Finished(status.and_then(|status| {
-                Ok(SampleProcessOutput {
-                    status,
-                    stdout: stdout?,
-                    stderr: stderr?,
-                })
-            }))
-        },
-        async {
-            smol::Timer::after(SAMPLE_TEST_TIMEOUT).await;
-            SampleProcessWait::TimedOut
-        },
-    )
-    .await;
-    let output = match output {
-        SampleProcessWait::Finished(output) => output,
-        SampleProcessWait::TimedOut => {
-            if let Err(error) = child.kill() {
-                log::debug!("failed to kill timed out Rduel sample process: {error}");
-            }
-            return EmbeddedAcrTestResult::Tle;
-        }
-    };
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            return EmbeddedAcrTestResult::Re {
-                stderr: error.to_string(),
-            };
-        }
-    };
-
-    if !output.status.success() {
-        return EmbeddedAcrTestResult::Re {
-            stderr: output.stderr,
-        };
-    }
-
-    if output.stdout.trim_end() == expected.trim_end() {
-        EmbeddedAcrTestResult::Ac {
-            actual: output.stdout,
-        }
+fn render_embedded_test_report(report: rcontest::runner::SampleTestReport) -> RduelCommandOutput {
+    let code = report
+        .build
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| code.to_string());
+    let heading = if report.build.status.success() {
+        format!("{} succeeded", report.build.label)
     } else {
-        EmbeddedAcrTestResult::Wa {
-            actual: output.stdout,
-            expected,
-        }
-    }
-}
-
-fn render_embedded_test_steps(
-    steps: Vec<RduelProcessOutput>,
-    results: Vec<(usize, EmbeddedAcrTestResult)>,
-) -> RduelCommandOutput {
-    let success = steps.iter().all(|step| step.status.success());
-    let Some(build_step) = steps.iter().find(|step| step.label == "cargo build") else {
-        return render_command_steps(steps);
+        format!("{} failed (exit {code})", report.build.label)
     };
-    let mut build_item = process_output_item(build_step);
-    // A successful build that still emits warnings is flagged yellow rather than
-    // green, without failing the run.
-    if build_step.status.success() && build_step.stderr.contains("warning") {
-        build_item.status = CommandOutputItemStatus::Warning;
-    }
-
-    if !build_step.status.success() {
+    let rendered_build_failure = (!report.build.status.success()).then(|| {
         let mut rendered = String::from("Build failed.\n\n");
-        rendered.push_str(build_step.stderr.trim());
-        if !build_step.stdout.trim().is_empty() {
+        rendered.push_str(report.build.stderr.trim());
+        if !report.build.stdout.trim().is_empty() {
             rendered.push_str("\n\n[stdout]\n");
-            rendered.push_str(build_step.stdout.trim());
+            rendered.push_str(report.build.stdout.trim());
         }
+        rendered
+    });
+    let summary = sample_test_summary(report, heading);
+    if !summary.build_succeeded {
         return RduelCommandOutput {
-            success,
-            rendered,
-            items: vec![build_item],
+            success: false,
+            rendered: rendered_build_failure.unwrap_or_else(|| "Build failed.".to_string()),
+            items: vec![summary.build_item],
             case_results: Vec::new(),
             submit_ready: None,
         };
     }
 
-    let passed = results
-        .iter()
-        .filter(|(_, result)| matches!(result, EmbeddedAcrTestResult::Ac { .. }))
-        .count();
-    let success = success && passed == results.len();
-
-    let rendered = if results.is_empty() {
+    let success = summary.passed_cases == summary.total_cases;
+    let rendered = if summary.total_cases == 0 {
         "Build: OK\nTest: no sample cases.".to_string()
     } else if success {
-        format!("Build: OK\nTest: AC ({passed} cases)")
+        format!("Build: OK\nTest: AC ({} cases)", summary.passed_cases)
     } else {
-        let mut rendered = String::from("Build: OK\nTest: Failed\n");
-        rendered.push_str(&format!("{passed}/{} cases passed\n", results.len()));
-        for (index, result) in &results {
-            match result {
-                EmbeddedAcrTestResult::Ac { .. } => {}
-                EmbeddedAcrTestResult::Wa {
-                    actual, expected, ..
-                } => {
-                    rendered.push_str(&format!(
-                        "\nCase {index}: WA\nExpected:\n{}\n\nActual:\n{}\n",
-                        expected.trim_end(),
-                        actual.trim_end()
-                    ));
-                }
-                EmbeddedAcrTestResult::Re { stderr, .. } => {
-                    rendered.push_str(&format!("\nCase {index}: RE\n{}\n", stderr.trim_end()));
-                }
-                EmbeddedAcrTestResult::Tle => {
-                    rendered.push_str(&format!("\nCase {index}: TLE\n"));
-                }
-            }
-        }
-        rendered
+        format!(
+            "Build: OK\nTest: Failed\n{}/{} cases passed",
+            summary.passed_cases, summary.total_cases
+        )
     };
-
     RduelCommandOutput {
         success,
         rendered,
-        items: vec![build_item],
-        case_results: embedded_case_results(&results),
+        items: vec![summary.build_item],
+        case_results: summary.case_results,
         submit_ready: None,
-    }
-}
-
-fn render_command_steps(steps: Vec<RduelProcessOutput>) -> RduelCommandOutput {
-    let success = steps.iter().all(|step| step.status.success());
-    let mut rendered = String::new();
-
-    for step in &steps {
-        if !rendered.is_empty() {
-            rendered.push_str("\n\n");
-        }
-
-        let code = step
-            .status
-            .code()
-            .map_or_else(|| "signal".to_string(), |code| code.to_string());
-        rendered.push_str(&format!(
-            "$ {} (exit {code})\n{} {}\n",
-            step.label,
-            step.executable.display(),
-            step.args.join(" ")
-        ));
-
-        if !step.stdout.is_empty() {
-            rendered.push_str("\n[stdout]\n");
-            rendered.push_str(step.stdout.trim_end());
-            rendered.push('\n');
-        }
-
-        if !step.stderr.is_empty() {
-            rendered.push_str("\n[stderr]\n");
-            rendered.push_str(step.stderr.trim_end());
-            rendered.push('\n');
-        }
-    }
-
-    if rendered.is_empty() {
-        rendered.push_str("No command was run.");
-    }
-
-    RduelCommandOutput {
-        success,
-        rendered,
-        items: steps.iter().map(process_output_item).collect(),
-        case_results: Vec::new(),
-        submit_ready: None,
-    }
-}
-
-fn embedded_case_results(results: &[(usize, EmbeddedAcrTestResult)]) -> Vec<(usize, CaseResult)> {
-    results
-        .iter()
-        .map(|(index, result)| {
-            let case = match result {
-                EmbeddedAcrTestResult::Ac { actual, .. } => CaseResult {
-                    status: CommandOutputItemStatus::Passed,
-                    heading: "Accepted".into(),
-                    actual: Some(actual.clone()),
-                    stderr: None,
-                },
-                EmbeddedAcrTestResult::Wa { actual, .. } => CaseResult {
-                    status: CommandOutputItemStatus::Failed,
-                    heading: "Wrong Answer".into(),
-                    actual: Some(actual.clone()),
-                    stderr: None,
-                },
-                EmbeddedAcrTestResult::Re { stderr, .. } => CaseResult {
-                    status: CommandOutputItemStatus::Failed,
-                    heading: "Runtime Error".into(),
-                    actual: None,
-                    stderr: Some(stderr.clone()),
-                },
-                EmbeddedAcrTestResult::Tle => CaseResult {
-                    status: CommandOutputItemStatus::Failed,
-                    heading: "Time Limit Exceeded".into(),
-                    actual: None,
-                    stderr: None,
-                },
-            };
-            (*index, case)
-        })
-        .collect()
-}
-
-fn status_dot_color(status: CommandOutputItemStatus, cx: &App) -> gpui::Hsla {
-    match status {
-        CommandOutputItemStatus::Pending => cx.theme().colors().border_variant,
-        CommandOutputItemStatus::Passed => cx.theme().status().success,
-        CommandOutputItemStatus::Warning => cx.theme().status().warning,
-        CommandOutputItemStatus::Failed => cx.theme().status().error,
-    }
-}
-
-fn process_output_item(step: &RduelProcessOutput) -> CommandOutputItem {
-    let code = step
-        .status
-        .code()
-        .map_or_else(|| "signal".to_string(), |code| code.to_string());
-    let mut sections = Vec::new();
-    if !step.stdout.trim().is_empty() {
-        sections.push(CommandOutputDetailSection {
-            title: "stdout".into(),
-            body: step.stdout.trim_end().to_string().into(),
-        });
-    }
-    if !step.stderr.trim().is_empty() {
-        sections.push(CommandOutputDetailSection {
-            title: "stderr".into(),
-            body: step.stderr.trim_end().to_string().into(),
-        });
-    }
-    let heading = if step.status.success() {
-        format!("{} succeeded", step.label)
-    } else {
-        format!("{} failed (exit {code})", step.label)
-    };
-
-    CommandOutputItem {
-        label: step.label.into(),
-        status: if step.status.success() {
-            CommandOutputItemStatus::Passed
-        } else {
-            CommandOutputItemStatus::Failed
-        },
-        detail: Some(CommandOutputDetail::with_sections(heading, sections)),
     }
 }
 
@@ -5732,24 +5224,6 @@ proconio = { version = "0.5.0", features = ["derive"] }
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn atcoder_submit_url_preselects_language_and_task() {
-        assert_eq!(
-            rcontest::atcoder_submit_url("https://atcoder.jp/contests/abc073/tasks/abc073_c"),
-            Some("https://atcoder.jp/contests/abc073/submit?taskScreenName=abc073_c".to_string())
-        );
-    }
-
-    #[test]
-    fn atcoder_submit_url_handles_invalid_urls() {
-        assert_eq!(rcontest::atcoder_submit_url("not a url"), None);
-        assert_eq!(rcontest::atcoder_submit_url("https://example.com"), None);
-        assert_eq!(
-            rcontest::atcoder_submit_url("https://atcoder.jp/contests/abc073"),
-            None
-        );
-    }
 
     #[test]
     fn decode_http_body_returns_identity_body() {

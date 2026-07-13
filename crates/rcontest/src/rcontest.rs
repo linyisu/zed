@@ -18,6 +18,10 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::FormatItem};
 
+#[cfg(feature = "output-ui")]
+pub mod output;
+pub mod runner;
+
 const ATCODER_PROBLEMS_URL: &str = "https://kenkoooo.com/atcoder/resources/problems.json";
 const ATCODER_CONTESTS_URL: &str = "https://kenkoooo.com/atcoder/resources/contests.json";
 pub const DEFAULT_MAX_SUBMISSION_PAGES: u32 = 3;
@@ -409,6 +413,29 @@ pub fn atcoder_submit_url(problem_url: &str) -> Option<String> {
     Some(format!(
         "{contest_url}/submit?taskScreenName={task_screen_name}"
     ))
+}
+
+#[derive(Clone, Debug)]
+pub struct AtCoderSubmissionDraft {
+    pub source_code: String,
+    pub source_path: PathBuf,
+    pub submit_url: String,
+}
+
+pub fn prepare_atcoder_submission(
+    source_path: impl Into<PathBuf>,
+    problem_url: &str,
+) -> Result<AtCoderSubmissionDraft> {
+    let source_path = source_path.into();
+    let source_code = std::fs::read_to_string(&source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+    let submit_url = atcoder_submit_url(problem_url).unwrap_or_else(|| problem_url.to_string());
+
+    Ok(AtCoderSubmissionDraft {
+        source_code,
+        source_path,
+        submit_url,
+    })
 }
 
 pub fn contest_id_from_problem_id(problem_id: &str) -> Option<&str> {
