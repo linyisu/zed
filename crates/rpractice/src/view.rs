@@ -36,7 +36,8 @@ use settings::SettingsStore;
 use smallvec::SmallVec;
 use ui::{
     Button, Icon, IconName, IconSize, IndentGuideColors, Label, LabelSize, ListItem,
-    ListItemSpacing, RenderedIndentGuide, StickyCandidate, WithScrollbar, prelude::*, v_flex,
+    ListItemSpacing, RenderedIndentGuide, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    v_flex,
 };
 use util::{ResultExt, rel_path::RelPath};
 use workspace::{
@@ -1437,6 +1438,8 @@ impl RpracticeView {
             .gap_1()
             .px_2()
             .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().ghost_element_background)
             .when(!disabled, |this| {
                 this.hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
@@ -1452,9 +1455,6 @@ impl RpracticeView {
                 match id {
                     "rpractice-run-samples" => this.run_samples(&RunSamples, window, cx),
                     "rpractice-submit" => this.submit_solution(&SubmitSolution, window, cx),
-                    "rpractice-submissions" => {
-                        this.refresh_submissions(&RefreshSubmissions, window, cx)
-                    }
                     _ => {}
                 }
             }))
@@ -2384,6 +2384,11 @@ impl RpracticeView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_selected = self.output_selection == OutputSelection::Step(index);
+        let border_color = if is_selected {
+            cx.theme().colors().text_accent
+        } else {
+            cx.theme().colors().border
+        };
         h_flex()
             .id(("rpractice-step-chip", index))
             .h(px(24.))
@@ -2393,10 +2398,15 @@ impl RpracticeView {
             .justify_center()
             .px_2p5()
             .rounded_sm()
+            .border_1()
+            .border_color(border_color)
             .bg(if is_selected {
                 cx.theme().colors().ghost_element_selected
             } else {
-                cx.theme().colors().ghost_element_hover
+                cx.theme().colors().ghost_element_background
+            })
+            .when(!is_selected, |this| {
+                this.hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
             })
             .cursor_pointer()
             .child(
@@ -2419,28 +2429,41 @@ impl RpracticeView {
             .map(|result| result.status)
             .unwrap_or(CommandOutputItemStatus::Pending);
         let is_selected = self.output_selection == OutputSelection::Case(index);
+        let label_color = match status {
+            CommandOutputItemStatus::Pending if is_selected => Color::Accent,
+            CommandOutputItemStatus::Pending => Color::Muted,
+            CommandOutputItemStatus::Passed => Color::Success,
+            CommandOutputItemStatus::Warning => Color::Warning,
+            CommandOutputItemStatus::Failed => Color::Error,
+        };
+        let border_color = if is_selected {
+            cx.theme().colors().text_accent
+        } else {
+            cx.theme().colors().border
+        };
         h_flex()
             .id(("rpractice-case-chip", index))
-            .h(px(24.))
+            .size(px(24.))
             .flex_none()
-            .gap_1p5()
             .items_center()
             .justify_center()
-            .px_2p5()
             .rounded_sm()
+            .border_1()
+            .border_color(border_color)
             .bg(if is_selected {
                 cx.theme().colors().ghost_element_selected
             } else {
-                cx.theme().colors().ghost_element_hover
+                cx.theme().colors().ghost_element_background
+            })
+            .when(!is_selected, |this| {
+                this.hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
             })
             .cursor_pointer()
             .child(
-                div()
-                    .size(px(8.))
-                    .rounded_full()
-                    .bg(status_dot_color(status, cx)),
+                Label::new(index.to_string())
+                    .size(LabelSize::Default)
+                    .color(label_color),
             )
-            .child(Label::new(format!("Input {}", index + 1)).size(LabelSize::Default))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.output_selection = OutputSelection::Case(index);
                 cx.notify();
@@ -2450,24 +2473,20 @@ impl RpracticeView {
     fn render_add_case_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .id("rpractice-add-case")
-            .h(px(24.))
+            .size(px(24.))
             .flex_none()
-            .gap_1p5()
             .items_center()
             .justify_center()
-            .px_2p5()
             .rounded_sm()
-            .bg(cx.theme().colors().ghost_element_hover)
-            .hover(|this| this.bg(cx.theme().colors().ghost_element_selected))
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().ghost_element_background)
+            .hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
             .cursor_pointer()
+            .tooltip(Tooltip::text("Add sample"))
             .child(
                 Icon::new(IconName::Plus)
                     .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new("Sample")
-                    .size(LabelSize::Default)
                     .color(Color::Muted),
             )
             .on_click(
@@ -2492,15 +2511,34 @@ impl RpracticeView {
         selected_item: Option<&CommandOutputItem>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(detail) = selected_item.and_then(|item| item.detail.as_ref()) else {
+        let Some(selected_item) = selected_item else {
             return Empty.into_any_element();
         };
+        let Some(detail) = selected_item.detail.as_ref() else {
+            return Empty.into_any_element();
+        };
+        let is_submissions = selected_item.label.as_ref() == "Submissions";
+        let show_heading = selected_item.label.as_ref() != "cargo build";
 
         v_flex()
             .gap_2()
-            .when(!detail.heading.is_empty(), |this| {
-                this.child(Label::new(detail.heading.clone()).size(LabelSize::Default))
-            })
+            .child(
+                h_flex()
+                    .justify_between()
+                    .when(show_heading && !detail.heading.is_empty(), |this| {
+                        this.child(Label::new(detail.heading.clone()).size(LabelSize::Default))
+                    })
+                    .when(is_submissions, |this| {
+                        this.child(
+                            Button::new("rpractice-submissions-refresh", "Refresh")
+                                .size(ButtonSize::Compact)
+                                .disabled(self.is_fetching_submissions)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.refresh_submissions(&RefreshSubmissions, window, cx)
+                                })),
+                        )
+                    }),
+            )
             .when_some(detail.diff.as_ref(), |this, diff| {
                 this.child(self.render_output_diff(diff, cx))
             })
@@ -3030,10 +3068,15 @@ impl RpracticeView {
 
     fn render_command_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_command_running = self.command_status.is_running();
-        let is_submissions_running = self.is_fetching_submissions;
         let mut chips = Vec::new();
+        let mut submission_chips = Vec::new();
         for (index, item) in self.command_output.items.iter().enumerate() {
-            chips.push(self.render_step_chip(index, item, cx).into_any_element());
+            let chip = self.render_step_chip(index, item, cx).into_any_element();
+            if item.label.as_ref() == "Submissions" {
+                submission_chips.push(chip);
+            } else {
+                chips.push(chip);
+            }
         }
         for index in 0..self.test_cases.len() {
             chips.push(self.render_case_chip(index, cx).into_any_element());
@@ -3081,13 +3124,7 @@ impl RpracticeView {
                                 is_command_running,
                                 cx,
                             ))
-                            .child(self.render_action_button(
-                                "rpractice-submissions",
-                                IconName::RotateCw,
-                                "Submissions",
-                                is_command_running || is_submissions_running,
-                                cx,
-                            )),
+                            .children(submission_chips),
                     ),
             )
             .child(

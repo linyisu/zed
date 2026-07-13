@@ -36,7 +36,7 @@ use search::BufferSearchBar;
 use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings};
 use text::{LineEnding, Rope};
-use ui::{Button, ButtonSize, ButtonStyle, prelude::*};
+use ui::{Button, ButtonSize, ButtonStyle, Tooltip, prelude::*};
 use util::{ResultExt, rel_path::RelPath};
 use workspace::{
     Item, ModalView, ToolbarItemEvent, ToolbarItemView, Workspace,
@@ -4048,6 +4048,8 @@ impl RduelView {
             .gap_1()
             .px_2()
             .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().ghost_element_background)
             .when(!disabled, |this| {
                 this.hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
@@ -4326,8 +4328,14 @@ impl RduelView {
         let is_command_running = self.command_status.is_running();
 
         let mut chips: Vec<AnyElement> = Vec::new();
+        let mut submission_chips: Vec<AnyElement> = Vec::new();
         for (index, item) in self.command_output.items.iter().enumerate() {
-            chips.push(self.render_step_chip(index, item, cx).into_any_element());
+            let chip = self.render_step_chip(index, item, cx).into_any_element();
+            if item.label.as_ref() == "Submissions" {
+                submission_chips.push(chip);
+            } else {
+                chips.push(chip);
+            }
         }
         for index in 0..self.test_cases.len() {
             chips.push(self.render_case_chip(index, cx).into_any_element());
@@ -4374,7 +4382,8 @@ impl RduelView {
                                 "Submit",
                                 is_command_running,
                                 cx,
-                            )),
+                            ))
+                            .children(submission_chips),
                     ),
             )
             .child(
@@ -4411,13 +4420,17 @@ impl RduelView {
         selected_item: Option<&CommandOutputItem>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(detail) = selected_item.and_then(|item| item.detail.as_ref()) else {
+        let Some(selected_item) = selected_item else {
             return Empty.into_any_element();
         };
+        let Some(detail) = selected_item.detail.as_ref() else {
+            return Empty.into_any_element();
+        };
+        let show_heading = selected_item.label.as_ref() != "cargo build";
 
         v_flex()
             .gap_2()
-            .when(!detail.heading.is_empty(), |this| {
+            .when(show_heading && !detail.heading.is_empty(), |this| {
                 this.child(Label::new(detail.heading.clone()).size(LabelSize::Default))
             })
             .when_some(detail.diff.as_ref(), |this, diff| {
@@ -4562,6 +4575,11 @@ impl RduelView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_selected = self.output_selection == OutputSelection::Step(index);
+        let border_color = if is_selected {
+            cx.theme().colors().text_accent
+        } else {
+            cx.theme().colors().border
+        };
         h_flex()
             .id(("rduel-step-chip", index))
             .h(px(24.))
@@ -4571,10 +4589,15 @@ impl RduelView {
             .justify_center()
             .px_2p5()
             .rounded_sm()
+            .border_1()
+            .border_color(border_color)
             .bg(if is_selected {
                 cx.theme().colors().ghost_element_selected
             } else {
-                cx.theme().colors().ghost_element_hover
+                cx.theme().colors().ghost_element_background
+            })
+            .when(!is_selected, |this| {
+                this.hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
             })
             .cursor_pointer()
             .child(
@@ -4597,28 +4620,41 @@ impl RduelView {
             .map(|result| result.status)
             .unwrap_or(CommandOutputItemStatus::Pending);
         let is_selected = self.output_selection == OutputSelection::Case(index);
+        let label_color = match status {
+            CommandOutputItemStatus::Pending if is_selected => Color::Accent,
+            CommandOutputItemStatus::Pending => Color::Muted,
+            CommandOutputItemStatus::Passed => Color::Success,
+            CommandOutputItemStatus::Warning => Color::Warning,
+            CommandOutputItemStatus::Failed => Color::Error,
+        };
+        let border_color = if is_selected {
+            cx.theme().colors().text_accent
+        } else {
+            cx.theme().colors().border
+        };
         h_flex()
             .id(("rduel-case-chip", index))
-            .h(px(24.))
+            .size(px(24.))
             .flex_none()
-            .gap_1p5()
             .items_center()
             .justify_center()
-            .px_2p5()
             .rounded_sm()
+            .border_1()
+            .border_color(border_color)
             .bg(if is_selected {
                 cx.theme().colors().ghost_element_selected
             } else {
-                cx.theme().colors().ghost_element_hover
+                cx.theme().colors().ghost_element_background
+            })
+            .when(!is_selected, |this| {
+                this.hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
             })
             .cursor_pointer()
             .child(
-                div()
-                    .size(px(8.))
-                    .rounded_full()
-                    .bg(status_dot_color(status, cx)),
+                Label::new(index.to_string())
+                    .size(LabelSize::Default)
+                    .color(label_color),
             )
-            .child(Label::new(format!("Input {}", index + 1)).size(LabelSize::Default))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.output_selection = OutputSelection::Case(index);
                 cx.notify();
@@ -4628,24 +4664,20 @@ impl RduelView {
     fn render_add_case_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .id("rduel-add-case")
-            .h(px(24.))
+            .size(px(24.))
             .flex_none()
-            .gap_1p5()
             .items_center()
             .justify_center()
-            .px_2p5()
             .rounded_sm()
-            .bg(cx.theme().colors().ghost_element_hover)
-            .hover(|this| this.bg(cx.theme().colors().ghost_element_selected))
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().ghost_element_background)
+            .hover(|this| this.bg(cx.theme().colors().ghost_element_hover))
             .cursor_pointer()
+            .tooltip(Tooltip::text("Add sample"))
             .child(
                 Icon::new(IconName::Plus)
                     .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new("Sample")
-                    .size(LabelSize::Default)
                     .color(Color::Muted),
             )
             .on_click(cx.listener(|this, _, window, cx| this.add_test_case(window, cx)))
