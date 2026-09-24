@@ -173,6 +173,13 @@ impl CursorGeometry {
     fn has_same_origin(self, other: Self) -> bool {
         nearly_equal(self.origin.x, other.origin.x) && nearly_equal(self.origin.y, other.origin.y)
     }
+
+    fn jump_to(self, other: Self) -> AnimationPoint {
+        AnimationPoint {
+            x: (other.origin.x - self.origin.x) / other.width.max(f32::EPSILON),
+            y: (other.origin.y - self.origin.y) / other.height.max(f32::EPSILON),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -268,22 +275,14 @@ impl Corner {
         self.vertical_animation.reset();
     }
 
-    fn retarget(&mut self, geometry: CursorGeometry, rank: usize) {
+    fn retarget(&mut self, geometry: CursorGeometry, jump: AnimationPoint, rank: usize) {
         let destination = self.destination(geometry);
-        let horizontal_jump =
-            (destination.x - self.target_position.x) / geometry.width.max(f32::EPSILON);
-        let vertical_jump =
-            (destination.y - self.target_position.y) / geometry.height.max(f32::EPSILON);
-        let normalized_jump = AnimationPoint {
-            x: horizontal_jump,
-            y: vertical_jump,
-        }
-        .normalized();
+        let normalized_jump = jump.normalized();
         let corner_direction = self.relative_position.normalized();
         let leading_alignment =
             normalized_jump.x * corner_direction.x + normalized_jump.y * corner_direction.y;
-        let is_short_jump = horizontal_jump.abs() <= SHORT_MOVE_THRESHOLD
-            && vertical_jump.abs() <= SPRING_RESET_EPSILON;
+        let is_short_jump =
+            jump.x.abs() <= SHORT_MOVE_THRESHOLD && jump.y.abs() <= SPRING_RESET_EPSILON;
 
         let base_animation_length = if is_short_jump {
             ANIMATION_LENGTH_SECONDS.min(SHORT_ANIMATION_LENGTH_SECONDS)
@@ -496,7 +495,7 @@ impl CursorAnimationState {
             } else {
                 Duration::ZERO
             };
-            self.retarget(target_geometry);
+            self.retarget(previous_geometry, target_geometry);
             self.advance(elapsed);
             self.last_frame_at = Some(now);
         } else if self.active {
@@ -550,7 +549,9 @@ impl CursorAnimationState {
         self.active = false;
     }
 
-    fn retarget(&mut self, geometry: CursorGeometry) {
+    fn retarget(&mut self, previous_geometry: CursorGeometry, geometry: CursorGeometry) {
+        let jump = previous_geometry.jump_to(geometry);
+
         let mut aligned_corners: [(usize, f32); 4] =
             std::array::from_fn(|index| (index, self.corners[index].direction_alignment(geometry)));
         aligned_corners.sort_by(|left, right| left.1.total_cmp(&right.1));
@@ -560,7 +561,7 @@ impl CursorAnimationState {
         }
 
         for (index, corner) in self.corners.iter_mut().enumerate() {
-            corner.retarget(geometry, ranks[index]);
+            corner.retarget(geometry, jump, ranks[index]);
         }
         self.active = self.corners.iter().any(|corner| {
             corner.horizontal_animation.position != 0.0 || corner.vertical_animation.position != 0.0
@@ -897,6 +898,75 @@ mod tests {
             viewport(0.0),
             now,
         );
+    }
+
+    #[test]
+    fn moving_vertically_between_different_width_cursors_keeps_leading_edge_together() {
+        let now = Instant::now();
+        let mut state = CursorAnimationState::default();
+        state.update(
+            logical_position(0, 0),
+            bounds_with_width(0.0, 0.0, 16.0),
+            viewport(0.0),
+            now,
+        );
+
+        assert!(
+            state
+                .update(
+                    logical_position(1, 0),
+                    bounds_with_width(0.0, 20.0, 8.0),
+                    viewport(0.0),
+                    now,
+                )
+                .is_some()
+        );
+        assert!(state.active);
+
+        // When moving vertically between cursors of different widths (e.g. wide CJK characters
+        // and narrow ASCII characters), both corners along the travel direction should form a
+        // unified leading edge without width differences skewing the jump vector.
+        assert!(
+            (state.corners[2].animation_length - SNAP_ANIMATION_LENGTH_SECONDS).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (state.corners[3].animation_length - SNAP_ANIMATION_LENGTH_SECONDS).abs()
+                < f32::EPSILON
+        );
+        assert!(state.corners[0].animation_length > SNAP_ANIMATION_LENGTH_SECONDS);
+        assert!(state.corners[1].animation_length > SNAP_ANIMATION_LENGTH_SECONDS);
+
+        assert_converges_to(
+            &mut state,
+            logical_position(1, 0),
+            bounds_with_width(0.0, 20.0, 8.0),
+            viewport(0.0),
+            now,
+        );
+
+        assert!(
+            state
+                .update(
+                    logical_position(0, 0),
+                    bounds_with_width(0.0, 0.0, 16.0),
+                    viewport(0.0),
+                    now + Duration::from_millis(500),
+                )
+                .is_some()
+        );
+        assert!(state.active);
+
+        assert!(
+            (state.corners[0].animation_length - SNAP_ANIMATION_LENGTH_SECONDS).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (state.corners[1].animation_length - SNAP_ANIMATION_LENGTH_SECONDS).abs()
+                < f32::EPSILON
+        );
+        assert!(state.corners[2].animation_length > SNAP_ANIMATION_LENGTH_SECONDS);
+        assert!(state.corners[3].animation_length > SNAP_ANIMATION_LENGTH_SECONDS);
     }
 
     #[test]
